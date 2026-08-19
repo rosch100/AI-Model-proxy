@@ -96,7 +96,9 @@ class AzureAdapter:
             "If the issue persists, report it with the details above."
         )
         console.rule(f"[red]Request failed with status code {resp.status_code}[/red]")
-        console.print(error_message)
+        from rich.markup import escape as rich_escape
+
+        console.print(rich_escape(error_message))
         return Response(
             error_message,
             status=resp.status_code if resp.status_code != 401 else 400,

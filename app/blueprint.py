@@ -79,7 +79,7 @@ def catch_all(path: str):
         init_last_recording()
         increment_last_recording()
         record_payload(request.get_json(silent=True), "downstream_request")
-    except (TypeError, ValueError):
+    except Exception:  # noqa: BLE001 - see comment above
         console.print_exception()
         console.print("[yellow]Logging failed but continuing with request[/yellow]")
 

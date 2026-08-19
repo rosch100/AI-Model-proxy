@@ -24,7 +24,7 @@ Cursor (BYOK) ──▶ Azure Container App (this proxy) ──▶ Azure OpenAI 
 | Public URL | `https://cursor-azure-proxy.kindsmoke-cdf27eec.eastus2.azurecontainerapps.io` |
 | Container App | `cursor-azure-proxy` (resource group `RG1`, eastus2) |
 | Environment | `cursor-proxy-env` |
-| Registry | `riphqcursorproxy.azurecr.io`, repo `cursor-azure-proxy` (currently tag `v4`) |
+| Registry | `riphqcursorproxy.azurecr.io`, repo `cursor-azure-proxy` (currently tag `v5`) |
 | Sizing | 2 vCPU / 4 GiB, min 1 replica (always warm), max 3 |
 | Azure OpenAI backend | `wymetyme-5999-resource` (eastus2), deployment `gpt-5.6-sol` |
 
@@ -71,6 +71,12 @@ This checkout diverges from `gabrii/Cursor-Azure-GPT-5` in four places:
   - `_safe_call_id`: hash-shorten tool-call IDs over 64 chars (bug 2 above).
 - `requirements/prod.txt` — added `packaging` (gunicorn's gevent worker
   imports it but doesn't declare it; the container crash-loops without it).
+- `app/blueprint.py` + `app/common/logging.py` + `app/azure/response_adapter.py`
+  + `app/azure/adapter.py` — request/response content (tool descriptions, error
+  messages) was passed to `rich` unescaped; bracketed text like `[/igp]` in
+  code raised `MarkupError` and 500'd the request, which Cursor surfaced as
+  "User API Key Rate limit exceeded". Dynamic strings are now escaped and the
+  logging guard catches all exceptions.
 - `.dockerignore` — created (upstream has none) to keep `.env`, `.venv`, etc.
   out of the image.
 

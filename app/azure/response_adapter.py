@@ -13,6 +13,7 @@ from typing import Any, Dict, Iterable, Optional
 
 from flask import Response, current_app, stream_with_context
 from rich.live import Live
+from rich.markup import escape as rich_escape
 
 from ..common.logging import console, create_message_panel
 from ..common.sse import chunks_to_sse, sse_to_events
@@ -365,7 +366,7 @@ class ResponseAdapter:
         from ..common.logging import console as _err_console
 
         _err_console.print(
-            f"[bold red]STREAM ERROR:[/bold red] code={code} message={message}"
+            f"[bold red]STREAM ERROR:[/bold red] {rich_escape(f'code={code} message={message}')}"
         )
         return None
 
@@ -439,7 +440,9 @@ class ResponseAdapter:
         """Handle response.mcp_call.failed — log MCP call failure."""
         from ..common.logging import console as _mcp_console
 
-        _mcp_console.print(f"[bold red]MCP CALL FAILED:[/bold red] {str(obj)[:300]}")
+        _mcp_console.print(
+            f"[bold red]MCP CALL FAILED:[/bold red] {rich_escape(str(obj)[:300])}"
+        )
         return None
 
     # ---- MCP list tools failure ----
@@ -450,7 +453,7 @@ class ResponseAdapter:
         from ..common.logging import console as _mcp_lt_console
 
         _mcp_lt_console.print(
-            f"[bold red]MCP LIST TOOLS FAILED:[/bold red] {str(obj)[:300]}"
+            f"[bold red]MCP LIST TOOLS FAILED:[/bold red] {rich_escape(str(obj)[:300])}"
         )
         return None
 
@@ -632,8 +635,7 @@ class ResponseAdapter:
                             if raw_event not in _SILENT_EVENTS:
                                 _evt_console.print(
                                     f"[bold yellow]UNHANDLED EVENT:[/bold yellow] "
-                                    f"{raw_event} → {handler_name} "
-                                    f"data={str(ev.json)[:300]}"
+                                    f"{rich_escape(f'{raw_event} → {handler_name} data={str(ev.json)[:300]}')}"
                                 )
                             continue
 

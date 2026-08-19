@@ -6,6 +6,7 @@ requests into Azure Responses API request parameters.
 
 from __future__ import annotations
 
+import hashlib
 from typing import Any, Dict, List
 
 from flask import Request, current_app
@@ -28,6 +29,18 @@ class RequestAdapter:
         self.adapter = adapter  # AzureAdapter instance for shared config/env
 
     # ---- Helpers (kept local to minimize cross-module coupling) ----
+
+    @staticmethod
+    def _safe_call_id(call_id: Any) -> Any:
+        """Shorten call ids over Azure's 64-char Responses API limit.
+
+        Cursor can send longer tool_call ids. Hashing deterministically keeps a
+        function_call and its function_call_output consistent within a request.
+        """
+        if not isinstance(call_id, str) or len(call_id) <= 64:
+            return call_id
+        digest = hashlib.sha256(call_id.encode()).hexdigest()[:24]
+        return f"{call_id[:39]}_{digest}"
     def _content_to_text(self, content: Any) -> str:
         """Convert message content (string or list of parts) to a string for Azure."""
         if content is None:
@@ -82,7 +95,7 @@ class RequestAdapter:
                 continue
             # For user/assistant/tools as inputs
             if role == "tool":
-                call_id = m.get("tool_call_id")
+                call_id = self._safe_call_id(m.get("tool_call_id"))
                 item = {
                     "type": "function_call_output",
                     "output": self._content_to_text(content),
@@ -108,7 +121,7 @@ class RequestAdapter:
                         if not isinstance(tool_call, dict):
                             continue
                         function = tool_call.get("function") or {}
-                        call_id = tool_call.get("id")
+                        call_id = self._safe_call_id(tool_call.get("id"))
                         item = {
                             "type": "function_call",
                             "name": function.get("name"),
@@ -202,6 +215,16 @@ class RequestAdapter:
         inbound_model = payload.get("model")
 
         model_key = (inbound_model or "").lower()
+        # Allow effort-suffixed names (e.g. gpt-5.6-sol-high) since Cursor only
+        # sends reasoning.effort for model names it recognizes.
+        suffix_effort = None
+        if model_key not in SUPPORTED_MODELS:
+            for effort in ("minimal", "low", "medium", "high"):
+                base = model_key.removesuffix(f"-{effort}")
+                if base != model_key and base in SUPPORTED_MODELS:
+                    model_key = base
+                    suffix_effort = effort
+                    break
         if model_key not in SUPPORTED_MODELS:
             raise CursorConfigurationError(
                 "Model name must be one of:\n"
@@ -225,13 +248,8 @@ class RequestAdapter:
             else None
         )
 
-        if inbound_effort is not None:
-            reasoning_effort = inbound_effort
-        else:
-            raise CursorConfigurationError(
-                "Cursor must send reasoning.effort when using bare model names like "
-                f"{inbound_model}."
-            )
+        # Precedence: explicit request field, then model-name suffix, then medium.
+        reasoning_effort = inbound_effort or suffix_effort or "medium"
 
         return {
             "azure_deployment": azure_deployment,

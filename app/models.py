@@ -22,6 +22,7 @@ SUPPORTED_MODELS: Final[tuple[str, ...]] = (
     "gpt-5.4",
     "gpt-5.4-mini",
     "gpt-5.4-nano",
+    "gpt-5.6-sol",
 )
 
 SUPPORTED_MODELS_TEXT: Final[str] = "\n".join(

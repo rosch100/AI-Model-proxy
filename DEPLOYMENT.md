@@ -45,8 +45,8 @@ In Cursor → Settings → Models → OpenAI API Key:
 - **Override OpenAI Base URL:** the public URL above + `/v1`
 - **API key:** the `SERVICE_API_KEY` value from `.env` (our own shared secret
   that the proxy checks — not an OpenAI or Azure key)
-- **Custom model names:** `gpt-5.6-sol` (defaults to medium reasoning effort),
-  plus optionally `gpt-5.6-sol-low` / `gpt-5.6-sol-high` to pick effort
+- **Custom model names:** `gpt-5.6-sol` (defaults to high reasoning effort),
+  plus optionally `gpt-5.6-sol-low` / `gpt-5.6-sol-medium` to pick effort
 
 ### Known Cursor BYOK bugs we work around
 
@@ -66,7 +66,7 @@ This checkout diverges from `gabrii/Cursor-Azure-GPT-5` in four places:
 - `app/models.py` — added `gpt-5.6-sol` to `SUPPORTED_MODELS`.
 - `app/azure/request_adapter.py` —
   - `_resolve_model_and_reasoning`: accept effort-suffixed model names
-    (`-minimal/-low/-medium/-high`) and default to `medium` instead of raising
+    (`-minimal/-low/-medium/-high`) and default to `high` instead of raising
     when Cursor omits `reasoning.effort` (bug 1 above).
   - `_safe_call_id`: hash-shorten tool-call IDs over 64 chars (bug 2 above).
 - `requirements/prod.txt` — added `packaging` (gunicorn's gevent worker

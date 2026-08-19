@@ -248,8 +248,8 @@ class RequestAdapter:
             else None
         )
 
-        # Precedence: explicit request field, then model-name suffix, then medium.
-        reasoning_effort = inbound_effort or suffix_effort or "medium"
+        # Precedence: explicit request field, then model-name suffix, then high.
+        reasoning_effort = inbound_effort or suffix_effort or "high"
 
         return {
             "azure_deployment": azure_deployment,

@@ -128,6 +128,6 @@ git diff --check
 
 Expected: 0 test failures, successful compile and targeted style checks, and no whitespace errors. The diff adds only model identifiers and tests; no complexity-bearing production function changes, so the CRAP gate is not applicable.
 
-- [ ] **Step 7: Review and publish**
+- [x] **Step 7: Review and publish**
 
 Review the current diff against the design, fix any concrete medium-or-higher findings, then re-review. Stage only the two design documents and six implementation/test files listed above, commit with `feat: expose configured Azure GPT-5.6 and GPT-6 deployments`, and push `feature/gpt-6-luna` to `origin`.

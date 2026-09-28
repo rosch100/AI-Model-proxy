@@ -256,7 +256,9 @@ def test_response_adapter_closes_visible_reasoning_before_failure_message(app):
                 "response.failed",
                 {
                     "type": "response.failed",
-                    "response": {"error": {"code": "bad", "message": "upstream failed"}},
+                    "response": {
+                        "error": {"code": "bad", "message": "upstream failed"}
+                    },
                 },
             ),
         ],

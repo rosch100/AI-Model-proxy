@@ -41,6 +41,7 @@ class RequestAdapter:
             return call_id
         digest = hashlib.sha256(call_id.encode()).hexdigest()[:24]
         return f"{call_id[:39]}_{digest}"
+
     def _content_to_text(self, content: Any) -> str:
         """Convert message content (string or list of parts) to a string for Azure."""
         if content is None:

@@ -43,21 +43,14 @@ jobs:
 
   dependency-vulnerabilities:
     name: Dependency vulnerabilities (OSV-Scanner)
-    runs-on: ubuntu-latest
-    timeout-minutes: 15
     permissions:
+      actions: read
       contents: read
-    steps:
-      - name: Check out code
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-
-      - name: Scan dependencies
-        uses: google/osv-scanner-action/osv-scanner-action@a345acffa64b0eaede81a3d9aae6141214d9c8fc # v2.6.0
-        with:
-          scan-args: |-
-            --lockfile
-            requirements.txt:requirements/prod.txt
-            --lockfile
-            requirements.txt:requirements/dev.txt
+      security-events: write
+    uses: google/osv-scanner-action/.github/workflows/osv-scanner-reusable.yml@a345acffa64b0eaede81a3d9aae6141214d9c8fc # v2.6.0
+    with:
+      scan-args: |-
+        --lockfile
+        requirements.txt:requirements/prod.txt
+        --lockfile
+        requirements.txt:requirements/dev.txt

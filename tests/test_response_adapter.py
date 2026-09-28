@@ -175,11 +175,7 @@ def test_response_adapter_emits_reasoning_content_separately(app):
     deltas = [msg["choices"][0]["delta"] for msg in messages[:-1]]
     assert deltas[0] == {
         "role": "assistant",
-        "content": "<details>\n<summary>Thought</summary>\n\n",
-    }
-    assert deltas[1] == {
-        "role": "assistant",
-        "content": "thinking",
+        "content": "<details>\n<summary>Thought</summary>\n\nthinking",
         "reasoning": "thinking",
         "reasoning_content": "thinking",
         "reasoning_details": [{"type": "reasoning.text", "text": "thinking"}],
@@ -188,8 +184,8 @@ def test_response_adapter_emits_reasoning_content_separately(app):
             "thinking_blocks": [{"type": "thinking", "thinking": "thinking"}]
         },
     }
-    assert deltas[2] == {"role": "assistant", "content": "\n\n</details>\n\n"}
-    assert deltas[3] == {"role": "assistant", "content": "answer"}
+    assert deltas[1] == {"role": "assistant", "content": "\n\n</details>\n\n"}
+    assert deltas[2] == {"role": "assistant", "content": "answer"}
     assert all("<think>" not in str(delta) for delta in deltas)
 
 
@@ -208,11 +204,123 @@ def test_response_adapter_can_render_reasoning_as_legacy_think_tags(app):
     messages = _reasoning_messages(app, "thinkblocks")
 
     deltas = [msg["choices"][0]["delta"] for msg in messages[:-1]]
-    assert deltas[0] == {"role": "assistant", "content": "<think>\n"}
-    assert deltas[1]["content"] == "thinking"
-    assert deltas[1]["reasoning_content"] == "thinking"
-    assert deltas[2] == {"role": "assistant", "content": "\n</think>\n\n"}
-    assert deltas[3] == {"role": "assistant", "content": "answer"}
+    assert deltas[0]["content"] == "<think>\nthinking"
+    assert deltas[0]["reasoning_content"] == "thinking"
+    assert deltas[1] == {"role": "assistant", "content": "\n</think>\n\n"}
+    assert deltas[2] == {"role": "assistant", "content": "answer"}
+
+
+def test_response_adapter_does_not_render_empty_reasoning_blocks(app):
+    """Do not emit visible Thought wrappers when Azure supplies no reasoning text."""
+    messages = _azure_messages(
+        app,
+        [
+            _sse(
+                "response.output_item.added",
+                {"type": "response.output_item.added", "item": {"type": "reasoning"}},
+            ),
+            _sse(
+                "response.output_item.done",
+                {"type": "response.output_item.done", "item": {"type": "reasoning"}},
+            ),
+            _sse(
+                "response.completed",
+                {"type": "response.completed", "response": {"usage": {}}},
+            ),
+        ],
+    )
+
+    content = [
+        message["choices"][0]["delta"].get("content") for message in messages[:-1]
+    ]
+    assert content == []
+
+
+def test_response_adapter_does_not_render_whitespace_only_reasoning(app):
+    """Whitespace alone must not create a visible Thought block."""
+    messages = _azure_messages(
+        app,
+        [
+            _sse(
+                "response.output_item.added",
+                {"type": "response.output_item.added", "item": {"type": "reasoning"}},
+            ),
+            _sse(
+                "response.reasoning_summary_text.delta",
+                {"type": "response.reasoning_summary_text.delta", "delta": " \n"},
+            ),
+            _sse(
+                "response.completed",
+                {"type": "response.completed", "response": {"usage": {}}},
+            ),
+        ],
+    )
+
+    content = [
+        message["choices"][0]["delta"].get("content") for message in messages[:-1]
+    ]
+    assert content == []
+
+
+def test_response_adapter_keeps_adjacent_reasoning_items_in_one_block(app):
+    """Render one non-empty block across adjacent Azure reasoning items."""
+    messages = _azure_messages(
+        app,
+        [
+            _sse(
+                "response.output_item.added",
+                {"type": "response.output_item.added", "item": {"type": "reasoning"}},
+            ),
+            _sse(
+                "response.reasoning_summary_text.delta",
+                {
+                    "type": "response.reasoning_summary_text.delta",
+                    "delta": " ",
+                },
+            ),
+            _sse(
+                "response.reasoning_summary_text.delta",
+                {
+                    "type": "response.reasoning_summary_text.delta",
+                    "delta": "first",
+                },
+            ),
+            _sse(
+                "response.output_item.done",
+                {"type": "response.output_item.done", "item": {"type": "reasoning"}},
+            ),
+            _sse(
+                "response.output_item.added",
+                {"type": "response.output_item.added", "item": {"type": "reasoning"}},
+            ),
+            _sse(
+                "response.reasoning_summary_text.delta",
+                {
+                    "type": "response.reasoning_summary_text.delta",
+                    "delta": " second",
+                },
+            ),
+            _sse(
+                "response.output_item.done",
+                {"type": "response.output_item.done", "item": {"type": "reasoning"}},
+            ),
+            _sse(
+                "response.completed",
+                {"type": "response.completed", "response": {"usage": {}}},
+            ),
+        ],
+    )
+
+    content = [
+        message["choices"][0]["delta"].get("content")
+        for message in messages[:-1]
+        if message["choices"][0]["delta"].get("content") is not None
+    ]
+    assert content == [
+        "<details>\n<summary>Thought</summary>\n\n first",
+        " second",
+        "\n\n</details>\n\n",
+    ]
 
 
 def test_response_adapter_closes_visible_reasoning_before_terminal_event(app):

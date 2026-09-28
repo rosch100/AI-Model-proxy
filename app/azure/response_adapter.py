@@ -74,6 +74,7 @@ class ResponseAdapter:
     # Per-request chat completion id (for streaming)
     _chat_completion_id: Optional[str]
     _reasoning_open: bool
+    _reasoning_pending_whitespace: str
     _reasoning_display_mode: str
     _tool_calls: int
     _usage: Optional[Dict[str, Any]]
@@ -242,13 +243,7 @@ class ResponseAdapter:
         item_type = item.get("type")
 
         if item_type == "reasoning":
-            start_delta = reasoning_start_delta(self._reasoning_display_mode)
-            self._reasoning_open = start_delta is not None
-            return (
-                self._build_completion_chunk(delta=start_delta)
-                if start_delta is not None
-                else None
-            )
+            return None
         if item_type == "function_call":
             self._tool_calls += 1
             name = item.get("name")
@@ -382,12 +377,33 @@ class ResponseAdapter:
             }
         )
 
-    def _build_reasoning_chunk(self, obj: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    def _build_reasoning_chunk(
+        self, obj: Optional[Dict[str, Any]]
+    ) -> Optional[Dict[str, Any]]:
         """Build a Chat Completions chunk with Cursor-native reasoning content."""
         delta = obj.get("delta", "") if isinstance(obj, dict) else ""
-        return self._build_completion_chunk(
-            delta=reasoning_content_delta(delta, self._reasoning_display_mode)
+        if not delta:
+            return None
+
+        start_delta = (
+            reasoning_start_delta(self._reasoning_display_mode)
+            if not self._reasoning_open
+            else None
         )
+        if start_delta is not None and not delta.strip():
+            self._reasoning_pending_whitespace += delta
+            return None
+
+        reasoning_text = self._reasoning_pending_whitespace + delta
+        self._reasoning_pending_whitespace = ""
+        reasoning_delta = reasoning_content_delta(
+            reasoning_text, self._reasoning_display_mode
+        )
+        if start_delta is not None:
+            reasoning_delta["content"] = start_delta["content"] + reasoning_text
+            self._reasoning_open = True
+
+        return self._build_completion_chunk(delta=reasoning_delta)
 
     def _close_reasoning_chunk(self) -> Optional[Dict[str, Any]]:
         """Close any visible reasoning wrapper before normal output resumes."""
@@ -592,6 +608,7 @@ class ResponseAdapter:
             self._chat_completion_id = self._create_chat_completion_id()
             # Initialize per-stream state on the instance
             self._reasoning_open = False
+            self._reasoning_pending_whitespace = ""
             self._reasoning_display_mode = parse_reasoning_display_mode(
                 current_app.config["REASONING_DISPLAY_MODE"]
             )
@@ -633,19 +650,38 @@ class ResponseAdapter:
 
                             # Suppress noisy lifecycle events we intentionally skip
                             if raw_event not in _SILENT_EVENTS:
+                                event_data = ev.json
                                 _evt_console.print(
                                     f"[bold yellow]UNHANDLED EVENT:[/bold yellow] "
-                                    f"{rich_escape(f'{raw_event} → {handler_name} data={str(ev.json)[:300]}')}"
+                                    f"{rich_escape(f'{raw_event} → {handler_name} data={str(event_data)[:300]}')}"
                                 )
                             continue
 
-                        if self._reasoning_open and raw_event in {
-                            "response.output_text.delta",
-                            "response.output_item.added",
-                            "response.completed",
-                            "response.failed",
-                            "response.incomplete",
-                        }:
+                        event_data = ev.json
+                        item = (
+                            event_data.get("item")
+                            if isinstance(event_data, dict)
+                            else None
+                        )
+                        is_reasoning_item_added = (
+                            raw_event == "response.output_item.added"
+                            and isinstance(item, dict)
+                            and item.get("type") == "reasoning"
+                        )
+                        closes_reasoning = (
+                            raw_event
+                            in {
+                                "response.output_text.delta",
+                                "response.output_item.added",
+                                "response.completed",
+                                "response.failed",
+                                "response.incomplete",
+                            }
+                            and not is_reasoning_item_added
+                        )
+                        if closes_reasoning:
+                            self._reasoning_pending_whitespace = ""
+                        if self._reasoning_open and closes_reasoning:
                             closing = self._close_reasoning_chunk()
                             if closing is not None:
                                 yield closing
@@ -658,7 +694,7 @@ class ResponseAdapter:
                                     if content is not None:
                                         completion_msg["content"] += content
 
-                        res = handler(ev.json)
+                        res = handler(event_data)
                         if res is not None:
                             yield res
 

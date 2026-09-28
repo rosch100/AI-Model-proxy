@@ -1,4 +1,4 @@
-# Cursor Azure and Codex GPT-5 Proxy
+# Cursor Azure and Codex Model Proxy
 
 > **This project is back and actively maintained.** After months of dependency-only updates, the proxy has been overhauled with a complete rewrite of the request/response layer, full Responses API support, prompt caching, native reasoning controls, and much more. It is being used daily in production with Cursor. **If you run into issues, please [open an issue](https://github.com/gabrii/Cursor-Azure-GPT-5/issues)** — bug reports and feedback are essential to keep this working well for everyone.
 
@@ -168,6 +168,7 @@ The Azure provider accepts these Cursor-facing model IDs in parallel. Configure 
 
 | Model | Status |
 |---|---|
+| `gpt-6-luna` | Expected to work (Azure Responses API; not yet verified end-to-end with this proxy) |
 | `gpt-5.5` | Verified |
 | `gpt-5.4` | Verified |
 | `gpt-5.4-mini` | Verified |
@@ -243,10 +244,14 @@ Both workarounds are stopgaps, not native `gpt-5.5` support. Cursor still builds
 cp .env.example .env
 ```
 
-Edit `.env` for the provider you want to use. For Codex/ChatGPT subscription:
+Edit `.env` for the provider you want to use. Generate a unique proxy key with
+`python3 -c 'import secrets; print(secrets.token_urlsafe(32))'` and set it as
+`SERVICE_API_KEY` in `.env`. The proxy refuses to start with an empty key or the
+sample values.
+
+For Codex/ChatGPT subscription:
 
 ```env
-SERVICE_API_KEY=choose-a-local-secret
 ENABLE_AZURE=false
 ENABLE_CODEX=true
 CODEX_AUTH_PATH=~/.codex/auth.json
@@ -258,7 +263,6 @@ Run `codex login` on the machine hosting the proxy before starting the service.
 For Azure:
 
 ```env
-SERVICE_API_KEY=choose-a-local-secret
 ENABLE_AZURE=true
 ENABLE_CODEX=false
 AZURE_BASE_URL=https://your-resource.openai.azure.com
@@ -367,18 +371,22 @@ Use `https://your-public-proxy-url/azure` for Azure clients and `https://your-pu
 | `CODEX_REQUEST_TIMEOUT_SECONDS` | `600` | Codex upstream read timeout |
 | `RECORD_TRAFFIC` | `off` | Write redacted request/response fixtures to `recordings/` |
 | `LOG_CONTEXT` | `off` | Log incoming request details. Enable only for debugging because Cursor agent requests can contain very large prompts and tool transcripts |
-| `LOG_COMPLETION` | `on` | Log streamed completion content |
+| `LOG_COMPLETION` | `off` | Log streamed completion content; enable only for debugging |
 | `LOG_REDACT` | `true` | Redact API keys and sensitive values in logs |
+
+`SERVICE_API_KEY` has no default. Generate a unique value with
+`python3 -c 'import secrets; print(secrets.token_urlsafe(32))'`; the proxy
+rejects missing, empty, and example values at startup.
 
 ### Deployment Mapping
 
 If your Azure deployment names match the Cursor model IDs, leave `AZURE_MODEL_DEPLOYMENTS` empty. Otherwise, map each Cursor model ID to the Azure deployment that should serve it:
 
 ```env
-AZURE_MODEL_DEPLOYMENTS={"gpt-5.5":"prod-gpt55","gpt-5.4":"prod-gpt54","gpt-5.4-mini":"team-mini"}
+AZURE_MODEL_DEPLOYMENTS={"gpt-6-luna":"your-luna-deployment","gpt-5.5":"prod-gpt55","gpt-5.4":"prod-gpt54"}
 ```
 
-Cursor still sees the native IDs (`gpt-5.5`, `gpt-5.4`, `gpt-5.4-mini`) and can switch between them normally. Azure receives the matching deployment name for the selected model.
+Cursor still sees the native IDs (`gpt-6-luna`, `gpt-5.5`, `gpt-5.4`) and can switch between them normally. Azure receives the matching deployment name for the selected model.
 
 ---
 

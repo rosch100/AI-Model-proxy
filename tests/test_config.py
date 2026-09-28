@@ -8,6 +8,10 @@ import json
 import sys
 
 import environs
+import pytest
+
+from app import create_app
+from app.exceptions import ServiceConfigurationError
 
 
 class TestConfig:
@@ -40,6 +44,8 @@ class TestConfig:
         )
         assert settings.AZURE_MODEL_DEPLOYMENTS["gpt-5"] == "gpt-5"
         assert settings.AZURE_MODEL_DEPLOYMENTS["gpt-5.5"] == "gpt-5.5"
+        assert settings.AZURE_MODEL_DEPLOYMENTS["gpt-6-luna"] == "gpt-6-luna"
+        assert settings.SERVICE_API_KEY in (None, "")
 
     def test_optional_azure_settings_use_defaults_when_missing(self, monkeypatch):
         """Import settings without optional Azure env vars."""
@@ -57,6 +63,28 @@ class TestConfig:
         assert settings.AZURE_SUMMARY_LEVEL == "detailed"
         assert settings.AZURE_VERBOSITY_LEVEL == "medium"
         assert settings.AZURE_TRUNCATION == "disabled"
+
+    def test_sensitive_request_logging_is_disabled_by_default(self, monkeypatch):
+        """Do not log request context or completion content by default."""
+        monkeypatch.setattr(environs.Env, "read_env", lambda *args, **kwargs: None)
+        for key in ("LOG_CONTEXT", "LOG_COMPLETION"):
+            monkeypatch.delenv(key, raising=False)
+
+        sys.modules.pop("app.settings", None)
+        settings = importlib.import_module("app.settings")
+
+        assert settings.LOG_CONTEXT is False
+        assert settings.LOG_COMPLETION is False
+
+    @pytest.mark.parametrize(
+        "service_api_key", (None, "", "change-me", "choose-a-local-secret")
+    )
+    def test_app_rejects_missing_or_placeholder_service_api_key(self, service_api_key):
+        """Require an explicitly configured, non-placeholder service key."""
+        config = type("ServiceKeyConfig", (), {"SERVICE_API_KEY": service_api_key})
+
+        with pytest.raises(ServiceConfigurationError, match="SERVICE_API_KEY"):
+            create_app(config)
 
     def test_responses_api_url_uses_v1_without_api_version(self, monkeypatch):
         """Build the modern Azure Responses endpoint without dated api-version."""
@@ -82,6 +110,7 @@ class TestConfig:
                     "gpt-5.4": "prod-gpt54",
                     "gpt-5.4-mini": "team-mini",
                     "gpt-5.5": "gpt-5.5-1",
+                    "gpt-6-luna": "luna-test-deployment",
                 }
             ),
         )
@@ -92,6 +121,7 @@ class TestConfig:
         assert settings.AZURE_MODEL_DEPLOYMENTS["gpt-5.4"] == "prod-gpt54"
         assert settings.AZURE_MODEL_DEPLOYMENTS["gpt-5.4-mini"] == "team-mini"
         assert settings.AZURE_MODEL_DEPLOYMENTS["gpt-5.5"] == "gpt-5.5-1"
+        assert settings.AZURE_MODEL_DEPLOYMENTS["gpt-6-luna"] == "luna-test-deployment"
         assert settings.AZURE_MODEL_DEPLOYMENTS["gpt-5"] == "gpt-5"
 
     def test_legacy_single_deployment_env_is_ignored(self, monkeypatch):

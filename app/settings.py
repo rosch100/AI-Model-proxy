@@ -18,13 +18,13 @@ env.read_env()
 ENV = env.str("FLASK_ENV", default="production")
 DEBUG = ENV == "development"
 RECORD_TRAFFIC = env.bool("RECORD_TRAFFIC", False)
-LOG_CONTEXT = env.bool("LOG_CONTEXT", True)
-LOG_COMPLETION = env.bool("LOG_COMPLETION", True)
+LOG_CONTEXT = env.bool("LOG_CONTEXT", False)
+LOG_COMPLETION = env.bool("LOG_COMPLETION", False)
 REASONING_DISPLAY_MODE = parse_reasoning_display_mode(
     env.str("REASONING_DISPLAY_MODE", DEFAULT_REASONING_DISPLAY_MODE)
 )
 
-SERVICE_API_KEY = env.str("SERVICE_API_KEY", "change-me")
+SERVICE_API_KEY = env.str("SERVICE_API_KEY", default=None)
 
 ENABLE_AZURE = env.bool("ENABLE_AZURE", True)
 ENABLE_CODEX = env.bool("ENABLE_CODEX", False)

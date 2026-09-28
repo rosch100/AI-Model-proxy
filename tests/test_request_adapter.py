@@ -3,7 +3,6 @@
 import pytest
 
 from app.azure.adapter import AzureAdapter
-from app.exceptions import CursorConfigurationError
 from app.models import SUPPORTED_MODELS
 
 
@@ -57,6 +56,30 @@ def test_request_adapter_accepts_supported_bare_models(app, model_name):
     assert request_kwargs["json"]["reasoning"]["effort"] == "medium"
 
 
+@pytest.mark.parametrize("effort", ("minimal", "low", "medium", "high"))
+def test_request_adapter_resolves_gpt6_luna_reasoning_suffix(app, effort):
+    """Resolve a Cursor effort suffix to the configured GPT-6 Luna deployment."""
+    app.config["AZURE_MODEL_DEPLOYMENTS"]["gpt-6-luna"] = "luna-test-deployment"
+    adapter = AzureAdapter().request_adapter
+    request = app.test_request_context(
+        "/chat/completions",
+        method="POST",
+        json={
+            "model": f"gpt-6-luna-{effort}",
+            "input": [
+                {"role": "user", "content": [{"type": "input_text", "text": "Hi"}]}
+            ],
+            "stream": True,
+        },
+        headers={"Authorization": "Bearer test-service-api-key"},
+    ).request
+
+    request_kwargs = adapter.adapt(request)
+
+    assert request_kwargs["json"]["model"] == "luna-test-deployment"
+    assert request_kwargs["json"]["reasoning"]["effort"] == effort
+
+
 def test_request_adapter_uses_configured_deployment_mapping(app):
     """Map public model ids to custom Azure deployment names."""
     app.config["AZURE_MODEL_DEPLOYMENTS"]["gpt-5.4"] = "my-custom-54-deployment"
@@ -107,8 +130,8 @@ def test_request_adapter_routes_gpt_55_to_configured_deployment(app):
     assert adapter.adapter.inbound_model == "gpt-5.5"
 
 
-def test_request_adapter_requires_reasoning_for_bare_model(app):
-    """Reject bare model names when Cursor omits native reasoning settings."""
+def test_request_adapter_defaults_reasoning_effort_to_high_when_missing(app):
+    """Use high reasoning effort when a bare model omits Cursor's setting."""
     adapter = AzureAdapter().request_adapter
     request = app.test_request_context(
         "/chat/completions",
@@ -124,10 +147,9 @@ def test_request_adapter_requires_reasoning_for_bare_model(app):
         headers={"Authorization": "Bearer test-service-api-key"},
     ).request
 
-    with pytest.raises(CursorConfigurationError) as exc_info:
-        adapter.adapt(request)
+    request_kwargs = adapter.adapt(request)
 
-    assert "Cursor must send reasoning.effort" in str(exc_info.value)
+    assert request_kwargs["json"]["reasoning"]["effort"] == "high"
 
 
 def test_request_adapter_strips_include_usage_for_azure(app):
@@ -161,13 +183,14 @@ def test_request_adapter_strips_include_usage_for_azure(app):
 
 
 def test_request_adapter_transforms_forced_function_tool_choice_for_responses(app):
-    """Convert Chat Completions forced tool choice to Responses API shape."""
+    """Adapt GPT-6 Luna function tools and forced choice to Responses API shape."""
+    app.config["AZURE_MODEL_DEPLOYMENTS"]["gpt-6-luna"] = "luna-test-deployment"
     adapter = AzureAdapter().request_adapter
     request = app.test_request_context(
         "/chat/completions",
         method="POST",
         json={
-            "model": "gpt-5.4",
+            "model": "gpt-6-luna",
             "input": [
                 {"role": "user", "content": [{"type": "input_text", "text": "Hi"}]}
             ],
@@ -190,6 +213,17 @@ def test_request_adapter_transforms_forced_function_tool_choice_for_responses(ap
 
     request_kwargs = adapter.adapt(request)
 
+    assert request_kwargs["json"]["model"] == "luna-test-deployment"
+    assert request_kwargs["json"]["reasoning"]["effort"] == "high"
+    assert request_kwargs["json"]["tools"] == [
+        {
+            "type": "function",
+            "name": "smoke_test",
+            "description": "Smoke test function call plumbing.",
+            "parameters": {"type": "object"},
+            "strict": False,
+        }
+    ]
     assert request_kwargs["json"]["tool_choice"] == {
         "type": "function",
         "name": "smoke_test",

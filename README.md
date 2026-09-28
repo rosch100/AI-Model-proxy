@@ -168,7 +168,12 @@ The Azure provider accepts these Cursor-facing model IDs in parallel. Configure 
 
 | Model | Status |
 |---|---|
-| `gpt-6-luna` | Expected to work (Azure Responses API; not yet verified end-to-end with this proxy) |
+| `gpt-6-astra` | Azure Responses API enabled; proxy end-to-end not yet verified |
+| `gpt-6-luna` | Azure Responses API enabled; proxy end-to-end not yet verified |
+| `gpt-6-sol` | Azure Responses API enabled; proxy end-to-end not yet verified |
+| `gpt-5.6-luna` | Azure Responses API enabled; proxy end-to-end not yet verified |
+| `gpt-5.6-sol` | Azure Responses API enabled; proxy end-to-end not yet verified |
+| `gpt-5.6-terra` | Azure Responses API enabled; proxy end-to-end not yet verified |
 | `gpt-5.5` | Verified |
 | `gpt-5.4` | Verified |
 | `gpt-5.4-mini` | Verified |
@@ -184,7 +189,20 @@ The Azure provider accepts these Cursor-facing model IDs in parallel. Configure 
 | `gpt-5-mini` | Verified |
 | `gpt-5-codex` | Expected to work (same Responses API) |
 
-**Verified** = manually tested end-to-end with a real Cursor client through the proxy to Azure. **Expected to work** = these models use the same Azure Responses API surface, but have not been individually verified. If you test one and it works (or doesn't), please [open an issue](https://github.com/gabrii/Cursor-Azure-GPT-5/issues) so we can update this table.
+The Azure deployment metadata for the six GPT-5.6/GPT-6 models above reports `responses=true`. Their account-specific deployment names are:
+
+| Cursor model ID | Azure deployment name |
+|---|---|
+| `gpt-5.6-luna` | `gpt-5-6-luna-api` |
+| `gpt-5.6-sol` | `gpt-5-6-sol-api` |
+| `gpt-5.6-terra` | `gpt-5-6-terra-api` |
+| `gpt-6-astra` | `gpt-6-astra-api` |
+| `gpt-6-luna` | `gpt-6-luna-api` |
+| `gpt-6-sol` | `gpt-6-sol-api` |
+
+These mappings reflect the `AzureOpenAI-Instanz2` inventory as of 2026-09-28. Set that account's `AZURE_BASE_URL` and `AZURE_API_KEY` separately in your local `.env`; update the mapping if its deployment names change.
+
+**Verified** = manually tested end-to-end with a real Cursor client through the proxy to Azure. **Expected to work** = these models use the same Azure Responses API surface, but have not been individually verified. Azure deployment metadata confirms the six GPT-5.6/GPT-6 deployment capabilities, but this fork has not verified their full Cursor-to-Azure path. If you test one and it works (or doesn't), please [open an issue](https://github.com/gabrii/Cursor-Azure-GPT-5/issues) so we can update this table.
 
 The Codex provider defaults to:
 

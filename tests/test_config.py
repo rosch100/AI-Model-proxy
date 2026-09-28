@@ -44,7 +44,16 @@ class TestConfig:
         )
         assert settings.AZURE_MODEL_DEPLOYMENTS["gpt-5"] == "gpt-5"
         assert settings.AZURE_MODEL_DEPLOYMENTS["gpt-5.5"] == "gpt-5.5"
-        assert settings.AZURE_MODEL_DEPLOYMENTS["gpt-6-luna"] == "gpt-6-luna"
+        expected_azure_deployments = {
+            "gpt-5.6-luna": "gpt-5-6-luna-api",
+            "gpt-5.6-sol": "gpt-5-6-sol-api",
+            "gpt-5.6-terra": "gpt-5-6-terra-api",
+            "gpt-6-astra": "gpt-6-astra-api",
+            "gpt-6-luna": "gpt-6-luna-api",
+            "gpt-6-sol": "gpt-6-sol-api",
+        }
+        for model_name, deployment_name in expected_azure_deployments.items():
+            assert settings.AZURE_MODEL_DEPLOYMENTS.get(model_name) == deployment_name
         assert settings.SERVICE_API_KEY in (None, "")
 
     def test_optional_azure_settings_use_defaults_when_missing(self, monkeypatch):

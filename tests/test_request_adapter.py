@@ -5,6 +5,15 @@ import pytest
 from app.azure.adapter import AzureAdapter
 from app.models import SUPPORTED_MODELS
 
+DEPLOYED_MODEL_ROUTES = (
+    ("gpt-5.6-luna", "gpt-5-6-luna-api"),
+    ("gpt-5.6-sol", "gpt-5-6-sol-api"),
+    ("gpt-5.6-terra", "gpt-5-6-terra-api"),
+    ("gpt-6-astra", "gpt-6-astra-api"),
+    ("gpt-6-luna", "gpt-6-luna-api"),
+    ("gpt-6-sol", "gpt-6-sol-api"),
+)
+
 
 def test_request_adapter_prefers_inbound_reasoning_effort(app):
     """Use the inbound reasoning effort for bare Cursor model names."""
@@ -78,6 +87,35 @@ def test_request_adapter_resolves_gpt6_luna_reasoning_suffix(app, effort):
 
     assert request_kwargs["json"]["model"] == "luna-test-deployment"
     assert request_kwargs["json"]["reasoning"]["effort"] == effort
+
+
+@pytest.mark.parametrize(
+    ("model_name", "deployment_name"),
+    DEPLOYED_MODEL_ROUTES,
+)
+def test_request_adapter_routes_deployed_models_with_reasoning_suffix(
+    app, model_name, deployment_name
+):
+    """Route each Azure model ID and Cursor reasoning suffix to its deployment."""
+    app.config["AZURE_MODEL_DEPLOYMENTS"][model_name] = deployment_name
+    adapter = AzureAdapter().request_adapter
+    request = app.test_request_context(
+        "/chat/completions",
+        method="POST",
+        json={
+            "model": f"{model_name}-high",
+            "input": [
+                {"role": "user", "content": [{"type": "input_text", "text": "Hi"}]}
+            ],
+            "stream": True,
+        },
+        headers={"Authorization": "Bearer test-service-api-key"},
+    ).request
+
+    request_kwargs = adapter.adapt(request)
+
+    assert request_kwargs["json"]["model"] == deployment_name
+    assert request_kwargs["json"]["reasoning"]["effort"] == "high"
 
 
 def test_request_adapter_uses_configured_deployment_mapping(app):

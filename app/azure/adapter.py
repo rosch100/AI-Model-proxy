@@ -7,7 +7,8 @@ import math
 import random
 import re
 import time
-from typing import Optional
+from dataclasses import dataclass
+from typing import Any, Optional
 
 import requests
 from flask import Request, Response
@@ -19,8 +20,16 @@ from ..common.recording import record_payload
 from .request_adapter import RequestAdapter
 from .response_adapter import ResponseAdapter
 
-MAX_AZURE_RATE_LIMIT_RETRIES = 2
-MAX_AZURE_RETRY_DELAY_SECONDS = 30.0
+MAX_AZURE_RATE_LIMIT_RETRIES = 5
+MAX_AZURE_RETRY_DELAY_SECONDS = 60.0
+
+
+@dataclass
+class AzureRequestContext:
+    """Share request parameters and retry budget across HTTP and SSE handling."""
+
+    request_kwargs: dict[str, Any]
+    retries_used: int = 0
 
 
 class AzureAdapter:
@@ -59,31 +68,61 @@ class AzureAdapter:
         except OSError as exc:
             console.print(f"[yellow]Recording failed (non-fatal): {exc}[/yellow]")
 
-        resp = self._request_upstream(request_kwargs)
+        request_context = AzureRequestContext(request_kwargs)
+        resp = self._request_upstream(request_context)
         if resp.status_code != 200:
             return self._handle_azure_error(resp, request_kwargs)
 
-        return self.response_adapter.adapt(resp)
+        return self.response_adapter.adapt(resp, request_context)
 
-    def _request_upstream(self, request_kwargs) -> requests.Response:
+    def _request_upstream(
+        self, request_context: AzureRequestContext
+    ) -> requests.Response:
         """Retry transient Azure rate limits before returning a response stream."""
-        retries = 0
         while True:
-            response = requests.request(**request_kwargs)
-            if retries >= MAX_AZURE_RATE_LIMIT_RETRIES:
+            response = requests.request(**request_context.request_kwargs)
+            if request_context.retries_used >= MAX_AZURE_RATE_LIMIT_RETRIES:
                 return response
 
-            retry_delay = self._azure_rate_limit_retry_delay(response, retries)
+            retry_delay = self._azure_rate_limit_retry_delay(
+                response, request_context.retries_used
+            )
             if retry_delay is None:
                 return response
 
             response.close()
-            console.print(
-                f"[yellow]Azure rate limit; retry {retries + 1}/"
-                f"{MAX_AZURE_RATE_LIMIT_RETRIES} in {retry_delay:.2f}s[/yellow]"
-            )
-            time.sleep(retry_delay)
-            retries += 1
+            self._wait_before_retry(request_context, retry_delay)
+
+    def _retry_stream_rate_limit(
+        self,
+        response: requests.Response,
+        request_context: AzureRequestContext,
+    ) -> requests.Response | None:
+        """Retry a streamed rate limit while sharing the HTTP retry budget."""
+        if request_context.retries_used >= MAX_AZURE_RATE_LIMIT_RETRIES:
+            return None
+
+        retry_delay = self._retry_delay_from_headers(
+            response.headers, request_context.retries_used
+        )
+        if retry_delay is None:
+            return None
+
+        response.close()
+        self._wait_before_retry(request_context, retry_delay)
+        return self._request_upstream(request_context)
+
+    @staticmethod
+    def _wait_before_retry(
+        request_context: AzureRequestContext, retry_delay: float
+    ) -> None:
+        retry_number = request_context.retries_used + 1
+        console.print(
+            f"[yellow]Azure rate limit; retry {retry_number}/"
+            f"{MAX_AZURE_RATE_LIMIT_RETRIES} in {retry_delay:.2f}s[/yellow]"
+        )
+        time.sleep(retry_delay)
+        request_context.retries_used += 1
 
     @staticmethod
     def _azure_rate_limit_retry_delay(
@@ -100,24 +139,25 @@ class AzureAdapter:
         if not isinstance(error, dict) or error.get("code") != "rate_limit_exceeded":
             return None
 
+        return AzureAdapter._retry_delay_from_headers(response.headers, retry_number)
+
+    @staticmethod
+    def _retry_delay_from_headers(headers, retry_number: int) -> float | None:
+        """Return Azure's bounded retry-after delay or exponential backoff."""
         for header, milliseconds_per_unit in (
             ("retry-after-ms", 0.001),
             ("retry-after", 1.0),
         ):
-            header_value = response.headers.get(header)
+            header_value = headers.get(header)
             if header_value is None:
                 continue
             try:
                 delay = float(header_value) * milliseconds_per_unit
             except ValueError:
                 continue
-            if (
-                not math.isfinite(delay)
-                or delay < 0
-                or delay > MAX_AZURE_RETRY_DELAY_SECONDS
-            ):
+            if not math.isfinite(delay) or delay < 0:
                 return None
-            return delay
+            return min(delay, MAX_AZURE_RETRY_DELAY_SECONDS)
 
         backoff_ceiling = min(2**retry_number, MAX_AZURE_RETRY_DELAY_SECONDS)
         return random.uniform(0.0, backoff_ceiling)

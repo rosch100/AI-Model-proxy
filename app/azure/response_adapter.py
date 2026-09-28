@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import random
 import time
+from dataclasses import dataclass
 from string import ascii_letters, digits
 from typing import Any, Dict, Iterable, Optional
 
@@ -62,6 +63,16 @@ _SILENT_EVENTS = {
     "response.audio.done",
     "response.audio.transcript.done",
 }
+
+
+@dataclass
+class _ResponseStreamState:
+    """Track mutable state for one adapted upstream response stream."""
+
+    upstream_resp: Any
+    completion_msg: Dict[str, Any]
+    events: int = 0
+    has_emitted_output: bool = False
 
 
 class ResponseAdapter:
@@ -599,7 +610,227 @@ class ResponseAdapter:
             }
         )
 
-    def adapt(self, upstream_resp: Any) -> Response:
+    @staticmethod
+    def _is_rate_limit_failure(raw_event: str, event_data: Any) -> bool:
+        """Identify Azure's retryable streaming rate-limit failure event."""
+        if raw_event != "response.failed" or not isinstance(event_data, dict):
+            return False
+        response = event_data.get("response")
+        if not isinstance(response, dict):
+            return False
+        error = response.get("error")
+        return isinstance(error, dict) and error.get("code") == "rate_limit_exceeded"
+
+    @staticmethod
+    def _error_from_response(upstream_resp: Any) -> Dict[str, str]:
+        """Extract a useful error when a stream retry returns a non-200 response."""
+        try:
+            payload = upstream_resp.json()
+        except (AttributeError, ValueError):
+            payload = {}
+        error = payload.get("error") if isinstance(payload, dict) else None
+        if isinstance(error, dict):
+            return {
+                "code": str(error.get("code") or upstream_resp.status_code),
+                "message": str(error.get("message") or upstream_resp.text),
+            }
+        return {
+            "code": str(upstream_resp.status_code),
+            "message": str(upstream_resp.text),
+        }
+
+    def _retry_stream_if_possible(
+        self, event: Any, state: _ResponseStreamState, request_context: Any
+    ) -> Any:
+        """Retry a rate-limit event only while downstream output is still empty."""
+        raw_event = event.event or ""
+        if (
+            raw_event != "response.failed"
+            or state.has_emitted_output
+            or request_context is None
+        ):
+            return None
+        if not self._is_rate_limit_failure(raw_event, event.json):
+            return None
+        return self.adapter._retry_stream_rate_limit(
+            state.upstream_resp, request_context
+        )
+
+    def _stream_upstream_events(
+        self,
+        state: _ResponseStreamState,
+        request_context: Any,
+        live: Live,
+    ) -> Iterable[Dict[str, Any]]:
+        """Adapt events, restarting the upstream stream only before output."""
+        while True:
+            if state.upstream_resp.status_code != 200:
+                error_chunk = self._failed(
+                    {
+                        "response": {
+                            "error": self._error_from_response(state.upstream_resp)
+                        }
+                    }
+                )
+                if error_chunk is not None:
+                    state.has_emitted_output = True
+                    yield error_chunk
+                    self._record_completion_chunk(error_chunk, state)
+                return
+
+            retry_stream = False
+            for event in sse_to_events(
+                state.upstream_resp.iter_content(chunk_size=8192)
+            ):
+                retry_response = self._retry_stream_if_possible(
+                    event, state, request_context
+                )
+                if retry_response is not None:
+                    state.upstream_resp = retry_response
+                    retry_stream = True
+                    break
+                yield from self._adapt_event(event, state, live)
+
+            if not retry_stream:
+                return
+
+    def _adapt_event(
+        self, event: Any, state: _ResponseStreamState, live: Live
+    ) -> Iterable[Dict[str, Any]]:
+        """Convert one upstream event and record any emitted completion data."""
+        if current_app.config["LOG_COMPLETION"]:
+            if state.events > 1:
+                live.update(create_message_panel(state.completion_msg, 1, 1))
+            state.events += 1
+
+        raw_event = event.event or ""
+        event_data = event.json
+        handler_name = "_" + raw_event.replace("response.", "", 1).replace(".", "__")
+        handler = getattr(self, handler_name, None)
+        if handler is None:
+            self._log_unhandled_event(raw_event, handler_name, event_data)
+            return
+
+        closing = self._reasoning_chunk_before_event(raw_event, event_data)
+        if closing is not None:
+            state.has_emitted_output = True
+            yield closing
+            self._record_completion_chunk(closing, state)
+
+        chunk = handler(event_data)
+        if chunk is not None:
+            state.has_emitted_output = True
+            yield chunk
+            self._record_completion_chunk(chunk, state)
+
+    def _reasoning_chunk_before_event(
+        self, raw_event: str, event_data: Any
+    ) -> Optional[Dict[str, Any]]:
+        """Close an open reasoning block when the next output event requires it."""
+        if raw_event not in {
+            "response.output_text.delta",
+            "response.output_item.added",
+            "response.completed",
+            "response.failed",
+            "response.incomplete",
+        }:
+            return None
+
+        item = event_data.get("item") if isinstance(event_data, dict) else None
+        if (
+            raw_event == "response.output_item.added"
+            and isinstance(item, dict)
+            and item.get("type") == "reasoning"
+        ):
+            return None
+
+        self._reasoning_pending_whitespace = ""
+        if self._reasoning_open:
+            return self._close_reasoning_chunk()
+        return None
+
+    @staticmethod
+    def _log_unhandled_event(
+        raw_event: str, handler_name: str, event_data: Any
+    ) -> None:
+        """Log unexpected upstream events while suppressing known lifecycle noise."""
+        if raw_event in _SILENT_EVENTS:
+            return
+        console.print(
+            f"[bold yellow]UNHANDLED EVENT:[/bold yellow] "
+            f"{rich_escape(f'{raw_event} → {handler_name} data={str(event_data)[:300]}')}"
+        )
+
+    @staticmethod
+    def _record_completion_chunk(
+        chunk: Dict[str, Any], state: _ResponseStreamState
+    ) -> None:
+        """Accumulate visible text and tool arguments for completion logging."""
+        if not current_app.config["LOG_COMPLETION"]:
+            return
+        delta = chunk.get("choices", [{}])[0].get("delta", {})
+        content = delta.get("content")
+        if content is not None:
+            state.completion_msg["content"] += content
+            return
+
+        for tool_call_delta in delta.get("tool_calls", []):
+            function = tool_call_delta.get("function", {})
+            name = function.get("name")
+            arguments = function.get("arguments", "")
+            if name:
+                state.completion_msg["tool_calls"].append(
+                    {
+                        "id": tool_call_delta.get("id", ""),
+                        "type": "function",
+                        "function": {"name": name, "arguments": arguments},
+                    }
+                )
+            else:
+                state.completion_msg["tool_calls"][-1]["function"][
+                    "arguments"
+                ] += arguments
+
+    def _finish_stream(
+        self, state: _ResponseStreamState, live: Live
+    ) -> Iterable[Dict[str, Any]]:
+        """Emit the terminal completion, usage, and logging updates."""
+        finish = "tool_calls" if self._tool_calls > 0 else "stop"
+        console.print(
+            f"[bold cyan]STREAM_END:[/bold cyan] events={state.events}, "
+            f"tool_calls={self._tool_calls}, finish_reason={finish}"
+        )
+
+        closing = self._close_reasoning_chunk()
+        if closing is not None:
+            state.has_emitted_output = True
+            yield closing
+        finish_reason = "tool_calls" if self._tool_calls > 0 else "stop"
+        yield self._build_completion_chunk(finish_reason=finish_reason)
+
+        if self.adapter.include_usage:
+            usage_chunk = self._build_usage_chunk()
+            if usage_chunk is not None:
+                yield usage_chunk
+        if current_app.config["LOG_COMPLETION"]:
+            live.update(create_message_panel(state.completion_msg, 1, 1))
+
+    def _adapt_stream(
+        self, upstream_resp: Any, request_context: Any
+    ) -> Iterable[Dict[str, Any]]:
+        """Manage per-stream state, logging, and upstream response cleanup."""
+        state = _ResponseStreamState(
+            upstream_resp=upstream_resp,
+            completion_msg={"role": "assistant", "content": "", "tool_calls": []},
+        )
+        try:
+            with Live(None, console=console, refresh_per_second=2) as live:
+                yield from self._stream_upstream_events(state, request_context, live)
+                yield from self._finish_stream(state, live)
+        finally:
+            state.upstream_resp.close()
+
+    def adapt(self, upstream_resp: Any, request_context: Any = None) -> Response:
         """Adapt an upstream Azure streaming response into SSE for Flask."""
 
         @stream_with_context
@@ -615,153 +846,16 @@ class ResponseAdapter:
             self._tool_calls = 0
             self._usage = None
 
-            def gen_dicts() -> Iterable[Dict[str, Any]]:
-                # Initialize message object for completion logging
-                completion_msg: Dict[str, Any] = {
-                    "role": "assistant",
-                    "content": "",
-                    "tool_calls": [],
-                }
-
-                events = 0
-                with Live(
-                    None,
-                    console=console,
-                    refresh_per_second=2,
-                ) as live:  # update 4 times a second to feel fluid
-                    for ev in sse_to_events(
-                        upstream_resp.iter_content(chunk_size=8192)
-                    ):
-                        if current_app.config["LOG_COMPLETION"]:
-                            if events > 1:
-                                live.update(create_message_panel(completion_msg, 1, 1))
-                            events += 1
-
-                        # Dispatch: strip "response." prefix, replace "." with "__"
-                        # Special case: "error" has no "response." prefix
-                        raw_event = ev.event or ""
-                        handler_name = "_" + raw_event.replace(
-                            "response.", "", 1  # only strip the first occurrence
-                        ).replace(".", "__")
-                        handler = getattr(self, handler_name, None)
-                        if not handler:
-                            # Log ALL unhandled events so nothing is silently dropped
-                            from ..common.logging import console as _evt_console
-
-                            # Suppress noisy lifecycle events we intentionally skip
-                            if raw_event not in _SILENT_EVENTS:
-                                event_data = ev.json
-                                _evt_console.print(
-                                    f"[bold yellow]UNHANDLED EVENT:[/bold yellow] "
-                                    f"{rich_escape(f'{raw_event} → {handler_name} data={str(event_data)[:300]}')}"
-                                )
-                            continue
-
-                        event_data = ev.json
-                        item = (
-                            event_data.get("item")
-                            if isinstance(event_data, dict)
-                            else None
-                        )
-                        is_reasoning_item_added = (
-                            raw_event == "response.output_item.added"
-                            and isinstance(item, dict)
-                            and item.get("type") == "reasoning"
-                        )
-                        closes_reasoning = (
-                            raw_event
-                            in {
-                                "response.output_text.delta",
-                                "response.output_item.added",
-                                "response.completed",
-                                "response.failed",
-                                "response.incomplete",
-                            }
-                            and not is_reasoning_item_added
-                        )
-                        if closes_reasoning:
-                            self._reasoning_pending_whitespace = ""
-                        if self._reasoning_open and closes_reasoning:
-                            closing = self._close_reasoning_chunk()
-                            if closing is not None:
-                                yield closing
-
-                                if current_app.config["LOG_COMPLETION"]:
-                                    closing_delta = closing.get("choices", [{}])[0].get(
-                                        "delta", {}
-                                    )
-                                    content = closing_delta.get("content")
-                                    if content is not None:
-                                        completion_msg["content"] += content
-
-                        res = handler(event_data)
-                        if res is not None:
-                            yield res
-
-                            if current_app.config["LOG_COMPLETION"]:
-                                delta = res.get("choices", [{}])[0].get("delta", {})
-                                content = delta.get("content")
-
-                                if content is not None:
-                                    # Append content to the message
-                                    completion_msg["content"] += content
-                                else:
-                                    # Handle tool calls
-                                    tool_calls_delta = delta.get("tool_calls", [])
-                                    for tool_call_delta in tool_calls_delta:
-                                        function = tool_call_delta.get("function", {})
-                                        name = function.get("name")
-                                        arguments = function.get("arguments", "")
-
-                                        if name:
-                                            # New tool call - add to the list
-                                            completion_msg["tool_calls"].append(
-                                                {
-                                                    "id": tool_call_delta.get("id", ""),
-                                                    "type": "function",
-                                                    "function": {
-                                                        "name": name,
-                                                        "arguments": arguments,
-                                                    },
-                                                }
-                                            )
-                                        else:
-                                            # Append arguments to the last tool call
-                                            completion_msg["tool_calls"][-1][
-                                                "function"
-                                            ]["arguments"] += arguments
-
-                    finish = "tool_calls" if self._tool_calls > 0 else "stop"
-                    from ..common.logging import console as _log_console
-
-                    _log_console.print(
-                        f"[bold cyan]STREAM_END:[/bold cyan] events={events}, "
-                        f"tool_calls={self._tool_calls}, finish_reason={finish}"
-                    )
-                    closing = self._close_reasoning_chunk()
-                    if closing is not None:
-                        yield closing
-                    if self._tool_calls > 0:
-                        yield self._build_completion_chunk(finish_reason="tool_calls")
-                    else:
-                        yield self._build_completion_chunk(finish_reason="stop")
-                    if self.adapter.include_usage:
-                        usage_chunk = self._build_usage_chunk()
-                        if usage_chunk is not None:
-                            yield usage_chunk
-                    if current_app.config["LOG_COMPLETION"]:
-                        live.update(create_message_panel(completion_msg, 1, 1))
-
             try:
-                yield from chunks_to_sse(gen_dicts())
+                yield from chunks_to_sse(
+                    self._adapt_stream(upstream_resp, request_context)
+                )
             except GeneratorExit:
                 # Downstream client closed the connection mid-stream
-                # Translate to a clearer exception; upstream will be closed in finally
+                # Translate to a clearer exception for the caller.
                 raise ClientClosedConnection(
                     "Client closed connection during streaming response"
                 ) from None
-            finally:
-                upstream_resp.close()
 
         headers = {}
         headers["Content-Type"] = "text/event-stream; charset=utf-8"

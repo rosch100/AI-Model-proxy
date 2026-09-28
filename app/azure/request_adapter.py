@@ -214,6 +214,7 @@ class RequestAdapter:
         """Resolve the Azure deployment and reasoning settings for this request."""
         settings = current_app.config
         inbound_model = payload.get("model")
+        deployment_map = settings["AZURE_MODEL_DEPLOYMENTS"]
 
         model_key = (inbound_model or "").lower()
         # Allow effort-suffixed names (e.g. gpt-5.6-sol-high) since Cursor only
@@ -233,7 +234,11 @@ class RequestAdapter:
                 f"\nGot: {inbound_model}"
             )
 
-        deployment_map = settings["AZURE_MODEL_DEPLOYMENTS"]
+        if model_key not in deployment_map:
+            raise CursorConfigurationError(
+                f"Model {model_key!r} is supported by the proxy but not configured "
+                "for this Azure resource."
+            )
         azure_deployment = deployment_map[model_key]
         inbound_reasoning = (
             payload.get("reasoning") if isinstance(payload, dict) else None

@@ -37,13 +37,14 @@ class TestConfig:
         sys.modules.pop("app.settings", None)
         settings = importlib.import_module("app.settings")
 
-        assert settings.AZURE_BASE_URL == "https://change-me.openai.azure.com"
+        assert (
+            settings.AZURE_BASE_URL
+            == "https://azureopenai-instanz2.cognitiveservices.azure.com"
+        )
         assert (
             settings.AZURE_RESPONSES_API_URL
-            == "https://change-me.openai.azure.com/openai/v1/responses"
+            == "https://azureopenai-instanz2.cognitiveservices.azure.com/openai/v1/responses"
         )
-        assert settings.AZURE_MODEL_DEPLOYMENTS["gpt-5"] == "gpt-5"
-        assert settings.AZURE_MODEL_DEPLOYMENTS["gpt-5.5"] == "gpt-5.5"
         expected_azure_deployments = {
             "gpt-5.6-luna": "gpt-5-6-luna-api",
             "gpt-5.6-sol": "gpt-5-6-sol-api",
@@ -52,8 +53,7 @@ class TestConfig:
             "gpt-6-luna": "gpt-6-luna-api",
             "gpt-6-sol": "gpt-6-sol-api",
         }
-        for model_name, deployment_name in expected_azure_deployments.items():
-            assert settings.AZURE_MODEL_DEPLOYMENTS.get(model_name) == deployment_name
+        assert settings.AZURE_MODEL_DEPLOYMENTS == expected_azure_deployments
         assert settings.SERVICE_API_KEY in (None, "")
 
     def test_optional_azure_settings_use_defaults_when_missing(self, monkeypatch):
@@ -127,14 +127,16 @@ class TestConfig:
         sys.modules.pop("app.settings", None)
         settings = importlib.import_module("app.settings")
 
-        assert settings.AZURE_MODEL_DEPLOYMENTS["gpt-5.4"] == "prod-gpt54"
-        assert settings.AZURE_MODEL_DEPLOYMENTS["gpt-5.4-mini"] == "team-mini"
-        assert settings.AZURE_MODEL_DEPLOYMENTS["gpt-5.5"] == "gpt-5.5-1"
-        assert settings.AZURE_MODEL_DEPLOYMENTS["gpt-6-luna"] == "luna-test-deployment"
-        assert settings.AZURE_MODEL_DEPLOYMENTS["gpt-5"] == "gpt-5"
+        assert settings.AZURE_MODEL_DEPLOYMENTS == {
+            "gpt-5.4": "prod-gpt54",
+            "gpt-5.4-mini": "team-mini",
+            "gpt-5.5": "gpt-5.5-1",
+            "gpt-6-luna": "luna-test-deployment",
+        }
 
     def test_legacy_single_deployment_env_is_ignored(self, monkeypatch):
         """Do not silently backfill the old single-deployment env var."""
+        monkeypatch.delenv("AZURE_MODEL_DEPLOYMENTS", raising=False)
         monkeypatch.setenv("AZURE_DEPLOYMENT", "legacy-custom-deployment")
 
         sys.modules.pop("app.settings", None)

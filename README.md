@@ -587,6 +587,13 @@ Check `AZURE_API_KEY`, the Azure resource, and whether the deployment exists.
 **`404` from Azure**
 Check `AZURE_BASE_URL` (should be the resource root, not a full path) and `AZURE_MODEL_DEPLOYMENTS` (deployment name must exist in Azure).
 
+**`429 rate_limit_exceeded` from Azure**
+Before streaming starts, the proxy retries this specific error up to two times.
+It honors Azure's `retry-after-ms` header (or `Retry-After`); without either,
+it uses bounded exponential backoff with jitter. Quota errors such as
+`insufficient_quota` are returned immediately. The proxy cannot automatically
+send a follow-up `continue` prompt after a response has started streaming.
+
 **Cursor cannot connect**
 The override base URL must be reachable from outside your machine. `http://localhost:8082` only works for local health checks. Use a tunnel or reverse proxy for the public URL.
 

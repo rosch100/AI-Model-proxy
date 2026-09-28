@@ -3,6 +3,7 @@
 import pytest
 
 from app.azure.adapter import AzureAdapter
+from app.exceptions import CursorConfigurationError
 from app.models import SUPPORTED_MODELS
 
 DEPLOYED_MODEL_ROUTES = (
@@ -63,6 +64,17 @@ def test_request_adapter_accepts_supported_bare_models(app, model_name):
 
     assert request_kwargs["json"]["model"] == model_name
     assert request_kwargs["json"]["reasoning"]["effort"] == "medium"
+
+
+def test_request_adapter_rejects_supported_model_without_deployment_mapping(app):
+    """Reject globally supported model IDs absent from this resource's map."""
+    adapter = AzureAdapter().request_adapter
+    app.config["AZURE_MODEL_DEPLOYMENTS"] = {
+        "gpt-6-luna": "gpt-6-luna-api",
+    }
+
+    with pytest.raises(CursorConfigurationError, match="not configured"):
+        adapter._resolve_model_and_reasoning({"model": "gpt-5.4"})
 
 
 @pytest.mark.parametrize("effort", ("minimal", "low", "medium", "high"))

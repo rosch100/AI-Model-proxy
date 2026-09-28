@@ -17,7 +17,6 @@ from .common.recording import (
     record_payload,
 )
 from .exceptions import ConfigurationError, ServiceConfigurationError
-from .models import SUPPORTED_MODELS
 
 blueprint = Blueprint("blueprint", __name__)
 
@@ -116,7 +115,7 @@ def models():
                     "created": 1686935002,
                     "owned_by": "openai",
                 }
-                for model in SUPPORTED_MODELS
+                for model in current_app.config["AZURE_MODEL_DEPLOYMENTS"]
             ],
         }
     )

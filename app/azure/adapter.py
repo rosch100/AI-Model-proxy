@@ -3,7 +3,10 @@
 from __future__ import annotations
 
 import json
+import math
+import random
 import re
+import time
 from typing import Optional
 
 import requests
@@ -15,6 +18,9 @@ from ..common.recording import record_payload
 # Local adapters
 from .request_adapter import RequestAdapter
 from .response_adapter import ResponseAdapter
+
+MAX_AZURE_RATE_LIMIT_RETRIES = 2
+MAX_AZURE_RETRY_DELAY_SECONDS = 30.0
 
 
 class AzureAdapter:
@@ -53,12 +59,68 @@ class AzureAdapter:
         except OSError as exc:
             console.print(f"[yellow]Recording failed (non-fatal): {exc}[/yellow]")
 
-        # Perform upstream request with kwargs directly (no long-lived session)
-        resp = requests.request(**request_kwargs)
+        resp = self._request_upstream(request_kwargs)
         if resp.status_code != 200:
             return self._handle_azure_error(resp, request_kwargs)
 
         return self.response_adapter.adapt(resp)
+
+    def _request_upstream(self, request_kwargs) -> requests.Response:
+        """Retry transient Azure rate limits before returning a response stream."""
+        retries = 0
+        while True:
+            response = requests.request(**request_kwargs)
+            if retries >= MAX_AZURE_RATE_LIMIT_RETRIES:
+                return response
+
+            retry_delay = self._azure_rate_limit_retry_delay(response, retries)
+            if retry_delay is None:
+                return response
+
+            response.close()
+            console.print(
+                f"[yellow]Azure rate limit; retry {retries + 1}/"
+                f"{MAX_AZURE_RATE_LIMIT_RETRIES} in {retry_delay:.2f}s[/yellow]"
+            )
+            time.sleep(retry_delay)
+            retries += 1
+
+    @staticmethod
+    def _azure_rate_limit_retry_delay(
+        response: requests.Response, retry_number: int
+    ) -> float | None:
+        """Return a bounded delay only for Azure's retryable rate-limit errors."""
+        if response.status_code != 429:
+            return None
+
+        try:
+            error = response.json().get("error")
+        except (AttributeError, ValueError):
+            return None
+        if not isinstance(error, dict) or error.get("code") != "rate_limit_exceeded":
+            return None
+
+        for header, milliseconds_per_unit in (
+            ("retry-after-ms", 0.001),
+            ("retry-after", 1.0),
+        ):
+            header_value = response.headers.get(header)
+            if header_value is None:
+                continue
+            try:
+                delay = float(header_value) * milliseconds_per_unit
+            except ValueError:
+                continue
+            if (
+                not math.isfinite(delay)
+                or delay < 0
+                or delay > MAX_AZURE_RETRY_DELAY_SECONDS
+            ):
+                return None
+            return delay
+
+        backoff_ceiling = min(2**retry_number, MAX_AZURE_RETRY_DELAY_SECONDS)
+        return random.uniform(0.0, backoff_ceiling)
 
     def _handle_azure_error(self, resp: Response, request_kwargs) -> Response:
 

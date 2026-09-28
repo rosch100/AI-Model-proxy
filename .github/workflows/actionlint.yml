@@ -1,0 +1,47 @@
+name: Actionlint
+
+# yamllint disable-line rule:truthy
+on:
+  push:
+    paths:
+      - ".github/workflows/**"
+      - ".github/dependabot.yml"
+      - ".github/actionlint.yaml"
+  pull_request:
+    paths:
+      - ".github/workflows/**"
+      - ".github/dependabot.yml"
+      - ".github/actionlint.yaml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  actionlint:
+    name: Lint workflow files
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install and run actionlint
+        env:
+          ACTIONLINT_VERSION: 1.7.12
+          ACTIONLINT_ARCHIVE_SHA256: 8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8
+        run: |
+          set -euo pipefail
+          archive="actionlint_${ACTIONLINT_VERSION}_linux_amd64.tar.gz"
+          base="https://github.com/rhysd/actionlint/releases/download/v${ACTIONLINT_VERSION}"
+          trap 'rm -f "$archive" actionlint' EXIT
+          curl -fsSL -o "$archive" "${base}/${archive}"
+          echo "${ACTIONLINT_ARCHIVE_SHA256}  ${archive}" | sha256sum -c -
+          tar -xzf "$archive" actionlint
+          ./actionlint -color

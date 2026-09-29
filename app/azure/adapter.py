@@ -143,7 +143,7 @@ class AzureAdapter:
 
     @staticmethod
     def _retry_delay_from_headers(headers, retry_number: int) -> float | None:
-        """Return Azure's bounded retry-after delay or exponential backoff."""
+        """Respect Azure's retry delay without retrying early when it exceeds the limit."""
         for header, milliseconds_per_unit in (
             ("retry-after-ms", 0.001),
             ("retry-after", 1.0),
@@ -157,7 +157,9 @@ class AzureAdapter:
                 continue
             if not math.isfinite(delay) or delay < 0:
                 return None
-            return min(delay, MAX_AZURE_RETRY_DELAY_SECONDS)
+            if delay > MAX_AZURE_RETRY_DELAY_SECONDS:
+                return None
+            return delay
 
         backoff_ceiling = min(2**retry_number, MAX_AZURE_RETRY_DELAY_SECONDS)
         return random.uniform(0.0, backoff_ceiling)

@@ -141,33 +141,24 @@ def test_token_rate_limit_retries_after_azure_delay_over_30_seconds(
     sleep.assert_called_once_with(31.0)
 
 
-def test_rate_limit_retry_delay_is_capped_at_sixty_seconds(
+def test_rate_limit_retry_does_not_retry_before_azure_retry_after(
     app, requests_mock, monkeypatch
 ):
-    """Cap Azure retry-after values at the configured maximum wait."""
+    """Do not retry early when Azure's delay exceeds the local wait limit."""
     requests_mock.post(
         AZURE_RESPONSES_URL,
-        [
-            {
-                "status_code": 429,
-                "headers": {"retry-after-ms": "90000"},
-                "json": {"error": {"code": "rate_limit_exceeded"}},
-            },
-            {
-                "status_code": 200,
-                "headers": {"content-type": "text/event-stream"},
-                "content": b"",
-            },
-        ],
+        status_code=429,
+        headers={"retry-after-ms": "90000"},
+        json={"error": {"code": "rate_limit_exceeded"}},
     )
     sleep = Mock()
     monkeypatch.setattr("time.sleep", sleep)
 
     response = AzureAdapter().forward(_request(app))
 
-    assert response.status_code == 200
-    assert requests_mock.call_count == 2
-    sleep.assert_called_once_with(60.0)
+    assert response.status_code == 429
+    assert requests_mock.call_count == 1
+    sleep.assert_not_called()
 
 
 def test_stream_rate_limit_retries_before_emitting_output(

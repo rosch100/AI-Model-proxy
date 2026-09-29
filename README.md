@@ -591,10 +591,12 @@ Check `AZURE_BASE_URL` (should be the resource root, not a full path) and `AZURE
 Before sending any response chunk, the proxy retries this specific error up to
 five times (six upstream attempts total), including `response.failed` SSE events
 returned with HTTP 200. It honors Azure's `retry-after-ms` header (or
-`Retry-After`); without either, it uses exponential backoff with jitter. Waits
-are bounded to 60 seconds. Quota errors such as `insufficient_quota` are
-returned immediately. Once a response chunk has been sent, the proxy does not
-restart the stream or automatically send a follow-up `continue` prompt.
+`Retry-After`) up to the 60-second wait limit; if Azure requests a longer wait,
+the proxy returns the rate-limit error rather than retrying early. Without
+either header, it uses exponential backoff with jitter. Quota errors such as
+`insufficient_quota` are returned immediately. Once a response chunk has been
+sent, the proxy does not restart the stream or automatically send a follow-up
+`continue` prompt.
 
 **Cursor cannot connect**
 The override base URL must be reachable from outside your machine. `http://localhost:8082` only works for local health checks. Use a tunnel or reverse proxy for the public URL.

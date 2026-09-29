@@ -46,7 +46,8 @@ Azure and Codex are separate providers with separate model lists, separate upstr
 
 - `/` and `/azure` route to Azure.
 - `/codex` routes to the Codex/ChatGPT subscription provider.
-- Both use the same Cursor-facing `SERVICE_API_KEY`.
+- Both use the same Cursor-facing `SERVICE_API_KEY` when `AUTH_MODE=single`.
+  In `AUTH_MODE=tenant`, each client uses a tenant-specific API key and Codex is unavailable.
 - Disabling one provider returns a local error instead of falling through to the other.
 
 This lets one public host serve Azure-backed Cursor clients and ChatGPT-subscription-backed Cursor clients at the same time. The two providers are peers: Codex is the primary path for ChatGPT monthly subscription users, while Azure is the primary path for Azure deployment users.
@@ -228,7 +229,7 @@ Azure and Codex are peers. The only reason Azure owns the root path is backward 
 | `https://your-public-proxy-url/azure` | Azure | Azure models |
 | `https://your-public-proxy-url/codex` | Codex | Codex models |
 
-Root is always Azure. It never falls through to Codex. Switching a Cursor client from Azure to the ChatGPT subscription-backed Codex provider only requires changing the provider word in the base URL from `/azure` to `/codex`; the OpenAI API key remains the same `SERVICE_API_KEY`.
+Root is always Azure. It never falls through to Codex. In `AUTH_MODE=single`, switching a Cursor client from Azure to the ChatGPT subscription-backed Codex provider only requires changing the provider word in the base URL from `/azure` to `/codex`; the OpenAI API key remains the same `SERVICE_API_KEY`. In `AUTH_MODE=tenant`, only Azure is available and each client uses its own tenant API key.
 
 ### GPT-5.5 Cursor Routing Issue
 
@@ -354,7 +355,7 @@ ENABLE_AZURE=true
 ENABLE_CODEX=true
 ```
 
-Use `https://your-public-proxy-url/azure` for Azure clients and `https://your-public-proxy-url/codex` for Codex clients. Both use the same `SERVICE_API_KEY`.
+Use `https://your-public-proxy-url/azure` for Azure clients and `https://your-public-proxy-url/codex` for Codex clients. In `AUTH_MODE=single`, both use the same `SERVICE_API_KEY`. Codex requires `AUTH_MODE=single`.
 
 ---
 
@@ -364,15 +365,17 @@ Use `https://your-public-proxy-url/azure` for Azure clients and `https://your-pu
 
 | Variable | Description |
 |---|---|
-| `SERVICE_API_KEY` | Secret the proxy validates against Cursor's `OpenAI API Key` setting |
-| `AZURE_BASE_URL` | Azure OpenAI resource URL when Azure is enabled |
-| `AZURE_API_KEY` | Azure OpenAI API key when Azure is enabled |
-| `CODEX_AUTH_PATH` | Codex ChatGPT auth file when Codex is enabled |
+| `SERVICE_API_KEY` | Required when `AUTH_MODE=single`. Secret the proxy validates against Cursor's `OpenAI API Key` setting |
+| `TENANTS` | Required when `AUTH_MODE=tenant`. JSON list of tenant objects (see Tenant mode below) |
+| `AZURE_BASE_URL` | Azure OpenAI resource URL when Azure is enabled in `AUTH_MODE=single` |
+| `AZURE_API_KEY` | Azure OpenAI API key when Azure is enabled in `AUTH_MODE=single` |
+| `CODEX_AUTH_PATH` | Codex ChatGPT auth file when Codex is enabled (`AUTH_MODE=single` only) |
 
 ### Optional
 
 | Variable | Default | Description |
 |---|---|---|
+| `AUTH_MODE` | `single` | `single` uses `SERVICE_API_KEY` plus global Azure settings; `tenant` uses per-tenant keys and Azure credentials |
 | `ENABLE_AZURE` | `true` | Enable the root and `/azure` provider |
 | `ENABLE_CODEX` | `false` | Enable the `/codex` provider |
 | `AZURE_MODEL_DEPLOYMENTS` | Identity map | JSON mapping from Cursor model IDs to Azure deployment names |
@@ -392,9 +395,39 @@ Use `https://your-public-proxy-url/azure` for Azure clients and `https://your-pu
 | `LOG_COMPLETION` | `off` | Log streamed completion content; enable only for debugging |
 | `LOG_REDACT` | `true` | Redact API keys and sensitive values in logs |
 
-`SERVICE_API_KEY` has no default. Generate a unique value with
+`SERVICE_API_KEY` has no default in `AUTH_MODE=single`. Generate a unique value with
 `python3 -c 'import secrets; print(secrets.token_urlsafe(32))'`; the proxy
 rejects missing, empty, and example values at startup.
+
+### Tenant mode
+
+Set `AUTH_MODE=tenant` to map each Cursor client to its own Azure resource. Store
+only SHA-256 digests of tenant API keys in `TENANTS`; inject Azure API keys via
+named environment variables. Codex is unavailable in tenant mode because it still
+uses a shared `auth.json` login.
+
+Every tenant must provide its own non-empty `azure_model_deployments` map
+(Cursor model id → that tenant's Azure deployment name). Global
+`AZURE_MODEL_DEPLOYMENTS` is ignored while `AUTH_MODE=tenant` is active; tenants
+do not inherit or share each other's model lists. `/v1/models` and request routing
+use only the authenticated tenant's map.
+
+```env
+AUTH_MODE=tenant
+TENANTS=[{"id":"acme","api_key_hash":"<sha256-hex>","azure_base_url":"https://acme.openai.azure.com","azure_api_key_env":"TENANT_ACME_AZURE_API_KEY","azure_model_deployments":{"gpt-5.6-sol":"acme-sol","gpt-5.5":"acme-gpt55"}},{"id":"beta","api_key_hash":"<sha256-hex>","azure_base_url":"https://beta.openai.azure.com","azure_api_key_env":"TENANT_BETA_AZURE_API_KEY","azure_model_deployments":{"gpt-5.6-luna":"beta-luna"}}]
+TENANT_ACME_AZURE_API_KEY=your-acme-azure-api-key
+TENANT_BETA_AZURE_API_KEY=your-beta-azure-api-key
+```
+
+Generate a tenant key and hash with:
+
+```bash
+python3 -c 'import hashlib,secrets; k=secrets.token_urlsafe(32); print(k); print(hashlib.sha256(k.encode()).hexdigest())'
+```
+
+Put the cleartext key into Cursor's OpenAI API Key setting. Unknown or invalid
+keys receive the same generic HTTP 401 response. `SERVICE_API_KEY` is not accepted
+as a fallback while `AUTH_MODE=tenant` is active.
 
 ### Deployment Mapping
 

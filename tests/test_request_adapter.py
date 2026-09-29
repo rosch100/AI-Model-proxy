@@ -74,7 +74,10 @@ def test_request_adapter_rejects_supported_model_without_deployment_mapping(app)
     }
 
     with pytest.raises(CursorConfigurationError, match="not configured"):
-        adapter._resolve_model_and_reasoning({"model": "gpt-5.4"})
+        adapter._resolve_model_and_reasoning(
+            {"model": "gpt-5.4"},
+            app.config["AZURE_MODEL_DEPLOYMENTS"],
+        )
 
 
 @pytest.mark.parametrize("effort", ("minimal", "low", "medium", "high"))

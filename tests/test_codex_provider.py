@@ -313,4 +313,4 @@ def test_codex_model_rewrite_changes_only_upstream_model(
 @pytest.mark.parametrize("provider_path", ["/codex/v1/models", "/codex/ready"])
 def test_codex_routes_require_shared_service_api_key(testapp, provider_path):
     """Codex provider uses the same Cursor-facing bearer secret."""
-    testapp.get(provider_path, status=400)
+    testapp.get(provider_path, status=401)

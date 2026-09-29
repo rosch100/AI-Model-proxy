@@ -55,6 +55,8 @@ class TestConfig:
         }
         assert settings.AZURE_MODEL_DEPLOYMENTS == expected_azure_deployments
         assert settings.SERVICE_API_KEY in (None, "")
+        assert settings.AUTH_MODE == "single"
+        assert settings.TENANTS == ()
 
     def test_optional_azure_settings_use_defaults_when_missing(self, monkeypatch):
         """Import settings without optional Azure env vars."""

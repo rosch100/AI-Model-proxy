@@ -11,8 +11,23 @@ from typing import Any, Dict, List
 
 from flask import Request, current_app
 
+from ..auth import current_tenant
 from ..exceptions import CursorConfigurationError, ServiceConfigurationError
 from ..models import SUPPORTED_MODELS, SUPPORTED_MODELS_TEXT
+from ..tenants import AUTH_MODE_TENANT, TenantConfig
+
+_STRIPPED_UPSTREAM_HEADERS = frozenset(
+    {
+        "authorization",
+        "api-key",
+        "host",
+        "tenant",
+        "tenant-id",
+        "x-tenant",
+        "x-tenant-id",
+        "x-tenant-key",
+    }
+)
 
 
 class RequestAdapter:
@@ -66,10 +81,12 @@ class RequestAdapter:
     def _copy_request_headers_for_azure(
         self, src: Request, *, api_key: str, session_id: str | None = None
     ) -> Dict[str, str]:
-        headers: Dict[str, str] = {k: v for k, v in src.headers.items()}
-        headers.pop("Host", None)
+        headers: Dict[str, str] = {}
+        for key, value in src.headers.items():
+            if key.casefold() in _STRIPPED_UPSTREAM_HEADERS:
+                continue
+            headers[key] = value
         # Azure prefers api-key header
-        headers.pop("Authorization", None)
         headers["api-key"] = api_key
 
         # Cache-routing headers matching Codex CLI (codex-rs).
@@ -81,6 +98,38 @@ class RequestAdapter:
             headers["x-client-request-id"] = session_id
 
         return headers
+
+    def _azure_runtime_settings(self) -> tuple[str, str, dict[str, str]]:
+        """Resolve Azure URL, API key, and deployment map for this request."""
+        tenant = current_tenant()
+        if tenant is not None:
+            return (
+                tenant.azure_responses_api_url,
+                tenant.azure_api_key,
+                dict(tenant.azure_model_deployments),
+            )
+        if current_app.config.get("AUTH_MODE") == AUTH_MODE_TENANT:
+            raise ServiceConfigurationError(
+                "AUTH_MODE=tenant requires an authenticated tenant; "
+                "refusing to use global Azure credentials."
+            )
+        settings = current_app.config
+        return (
+            settings["AZURE_RESPONSES_API_URL"],
+            settings["AZURE_API_KEY"],
+            settings["AZURE_MODEL_DEPLOYMENTS"],
+        )
+
+    @staticmethod
+    def _tenant_scoped_cache_key(
+        conversation_id: str | None, tenant: TenantConfig | None
+    ) -> str | None:
+        """Partition Azure cache/session keys per tenant when authenticated."""
+        if not conversation_id:
+            return None
+        if tenant is None:
+            return conversation_id
+        return f"{tenant.id}:{conversation_id}"
 
     def _messages_to_responses_input_and_instructions(
         self, messages: List[Dict[str, Any]]
@@ -210,11 +259,11 @@ class RequestAdapter:
             "name": function["name"],
         }
 
-    def _resolve_model_and_reasoning(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+    def _resolve_model_and_reasoning(
+        self, payload: Dict[str, Any], deployment_map: dict[str, str]
+    ) -> Dict[str, Any]:
         """Resolve the Azure deployment and reasoning settings for this request."""
-        settings = current_app.config
         inbound_model = payload.get("model")
-        deployment_map = settings["AZURE_MODEL_DEPLOYMENTS"]
 
         model_key = (inbound_model or "").lower()
         # Allow effort-suffixed names (e.g. gpt-5.6-sol-high) since Cursor only
@@ -281,6 +330,8 @@ class RequestAdapter:
         self.adapter.inbound_model = inbound_model
 
         settings = current_app.config
+        tenant = current_tenant()
+        azure_url, azure_api_key, deployment_map = self._azure_runtime_settings()
 
         # Derive conversation_id from Cursor's metadata.cursorConversationId.
         # This is unique per conversation, matching Codex CLI's use of
@@ -291,9 +342,10 @@ class RequestAdapter:
         conversation_id = (
             metadata.get("cursorConversationId") if isinstance(metadata, dict) else None
         )
+        cache_key = self._tenant_scoped_cache_key(conversation_id, tenant)
 
         upstream_headers = self._copy_request_headers_for_azure(
-            req, api_key=settings["AZURE_API_KEY"], session_id=conversation_id
+            req, api_key=azure_api_key, session_id=cache_key
         )
 
         # Map Chat/Completions to Responses (always streaming)
@@ -317,7 +369,7 @@ class RequestAdapter:
         else:
             responses_body = {"input": "", "instructions": None}
 
-        resolved_reasoning = self._resolve_model_and_reasoning(payload)
+        resolved_reasoning = self._resolve_model_and_reasoning(payload, deployment_map)
         azure_deployment = resolved_reasoning["azure_deployment"]
         reasoning_effort = resolved_reasoning["reasoning_effort"]
         inbound_summary = resolved_reasoning["inbound_summary"]
@@ -348,9 +400,9 @@ class RequestAdapter:
         # Matching Codex CLI: prompt_cache_key = conversation_id so each
         # conversation gets its own cache partition on the Azure backend.
         # Only set when we actually have a conversation ID; sending None
-        # could confuse Azure.
-        if conversation_id:
-            responses_body["prompt_cache_key"] = conversation_id
+        # could confuse Azure. Tenant mode prefixes the tenant id.
+        if cache_key:
+            responses_body["prompt_cache_key"] = cache_key
 
         # Always streaming
         responses_body["stream"] = True
@@ -412,7 +464,7 @@ class RequestAdapter:
 
         request_kwargs: Dict[str, Any] = {
             "method": "POST",
-            "url": settings["AZURE_RESPONSES_API_URL"],
+            "url": azure_url,
             "headers": upstream_headers,
             "json": responses_body,
             "data": None,

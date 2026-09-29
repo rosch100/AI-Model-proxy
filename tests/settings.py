@@ -6,6 +6,8 @@ ENV = "development"
 TESTING = True
 
 SERVICE_API_KEY = "test-service-api-key"
+AUTH_MODE = "single"
+TENANTS = ()
 
 ENABLE_AZURE = True
 ENABLE_CODEX = True

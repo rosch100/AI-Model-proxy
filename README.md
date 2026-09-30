@@ -7,13 +7,14 @@ A Flask proxy that lets [Cursor](https://cursor.com) use **Azure OpenAI** or a *
 > [!IMPORTANT]
 > **Using GPT-5.5 in Cursor?** Cursor may fail to route direct `gpt-5.5` traffic through custom base URLs and return `User API Key Rate limit exceeded`. See [GPT-5.5 Cursor routing](#gpt-55-cursor-routing). Forum thread: <https://forum.cursor.com/t/not-able-to-use-azure-api-key/149185/34>
 
-This fork is maintained at [rosch100/Cursor-Azure-GPT-5](https://github.com/rosch100/Cursor-Azure-GPT-5). Upstream history and community discussion live in [gabrii/Cursor-Azure-GPT-5](https://github.com/gabrii/Cursor-Azure-GPT-5).
+This fork is maintained at [rosch100/Cursor-Azure-GPT-5](https://github.com/rosch100/Cursor-Azure-GPT-5). It is based on the community Cursor Azure/Codex proxy line ([jbwmc/Cursor-Azure-GPT-5](https://github.com/jbwmc/Cursor-Azure-GPT-5) as the configured `upstream` remote; original project history at [gabrii/Cursor-Azure-GPT-5](https://github.com/gabrii/Cursor-Azure-GPT-5)). See [Changes in this fork](#changes-in-this-fork) for what differs from that base.
 
 ---
 
 ## Contents
 
 - [What it does](#what-it-does)
+- [Changes in this fork](#changes-in-this-fork)
 - [Authentication modes](#authentication-modes)
 - [Provider paths](#provider-paths)
 - [Features](#features)
@@ -40,6 +41,57 @@ Cursor speaks OpenAI-shaped APIs. Azure and Codex use Responses-style APIs with 
 | `/codex` | Codex / ChatGPT | Drive Cursor from an existing ChatGPT monthly subscription (`codex login`) |
 
 Azure owns the root URL for backward compatibility. Codex is **never** a silent fallback: it is selected only via `/codex`. Disabling a provider returns a local configuration error instead of routing to the other provider.
+
+---
+
+## Changes in this fork
+
+Relative to the fork base (`upstream/main` / this repo’s `main` merge base), this fork adds multi-tenant Azure hosting, newer model coverage, reliability fixes, and CI/security hardening.
+
+### Multi-tenant Azure auth
+
+| Base behavior | This fork |
+| --- | --- |
+| One shared `SERVICE_API_KEY` for all Cursor clients | `AUTH_MODE=single` (compatible default) **or** `AUTH_MODE=tenant` |
+| One global Azure URL, API key, and deployment map | Per-tenant Azure URL, API key (via env), and required `azure_model_deployments` |
+| Codex available whenever enabled | Codex remains single-login only; `AUTH_MODE=tenant` refuses `ENABLE_CODEX=true` |
+| Auth failures as Cursor configuration errors (HTTP 400) | Generic HTTP **401** for missing/invalid Bearer tokens |
+| Conversation cache keys shared by conversation id only | Tenant-prefixed cache/session keys (`{tenant_id}:{conversation_id}`) |
+
+See [Authentication modes](#authentication-modes) for configuration details.
+
+### Azure models and deployments
+
+- Cursor-facing support for GPT-5.6 (`luna` / `sol` / `terra`) and GPT-6 (`astra` / `luna` / `sol`) ids.
+- Explicit deployment scoping: a model may be on the proxy allowlist yet rejected if it is not mapped for the active Azure resource or tenant.
+- Example Instanz2 deployment names documented in `.env.example` and [Supported Azure models](#supported-azure-models).
+
+### Reliability and streaming
+
+- Retries Azure `rate_limit_exceeded` before streaming begins, including `response.failed` SSE payloads returned with HTTP 200.
+- Honors Azure `retry-after-ms` / `Retry-After` up to a 60-second wait cap; longer waits return the error instead of retrying early.
+- Avoids empty reasoning blocks that confused Cursor’s thinking UI.
+
+### Security and defaults
+
+- Startup refuses missing, empty, or placeholder `SERVICE_API_KEY` values in single mode.
+- Sensitive request/completion logging defaults to off (`LOG_CONTEXT`, `LOG_COMPLETION`); Compose `flask` defaults `LOG_LEVEL` to `warning`.
+- Upstream SSE fixtures are recorded once at stream end (same as downstream), keeping only complete SSE events and dropping an incomplete trailing UTF-8 sequence before anonymize.
+- Constant-time Bearer comparison using UTF-8 bytes (avoids `hmac.compare_digest` TypeError on non-ASCII tokens).
+- Dependency updates for known vulnerable packages.
+
+### CI and supply chain
+
+- OSV scanning for Python requirements.
+- Additional GitHub Actions for security review tooling, actionlint, zizmor, and dependency review.
+- Dependabot cooldown configuration and CodeRabbit workflow support.
+
+### Documentation
+
+- README restructured around auth modes, provider paths, and complete configuration.
+- Operator docs for tenant setup, smoke tests, and fork-specific troubleshooting.
+
+Upstream-compatible single-tenant Azure + Codex setups continue to work with `AUTH_MODE=single` (the default).
 
 ---
 
@@ -357,7 +409,8 @@ Each entry in `TENANTS` must include:
 | Variable | Default | Description |
 | --- | --- | --- |
 | `REASONING_DISPLAY_MODE` | `mdthinkblocks` | `none`, `mdthinkblocks`, or `thinkblocks` |
-| `RECORD_TRAFFIC` | `off` | Write redacted fixtures under `recordings/` |
+| `LOG_LEVEL` | `warning` (Compose `flask`); `debug` in `.env.example` | Gunicorn/app log level (`debug`/`info`/`warning`/`error`). Supervisord’s own log stays at `warn`. |
+| `RECORD_TRAFFIC` | `off` | Write redacted fixtures under `recordings/` (keep off in production; large streams bloat disk) |
 | `LOG_CONTEXT` | `off` | Log incoming request details (can be huge) |
 | `LOG_COMPLETION` | `off` | Log streamed completion content |
 | `LOG_REDACT` | `true` | Redact secrets in logs |

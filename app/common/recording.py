@@ -92,6 +92,41 @@ def anonymize(data: str) -> str:
     return data
 
 
+def decode_utf8_complete_prefix(data: bytes) -> str:
+    """Decode UTF-8, dropping only an incomplete trailing multi-byte sequence.
+
+    Stream-end recordings may still end inside a multi-byte character if the
+    upstream connection drops mid-chunk. Genuine invalid sequences still raise
+    ``UnicodeDecodeError``.
+    """
+    while True:
+        try:
+            return data.decode("utf-8")
+        except UnicodeDecodeError as exc:
+            incomplete_tail = exc.reason == "unexpected end of data" and exc.end == len(
+                data
+            )
+            if not incomplete_tail:
+                raise
+            trimmed = data[: exc.start]
+            if len(trimmed) >= len(data):
+                raise
+            data = trimmed
+
+
+def complete_sse_prefix(data: bytes) -> bytes:
+    """Keep only complete SSE events ending at the last blank-line delimiter.
+
+    A truncated final event can leave unterminated JSON string values that
+    ``anonymize`` cannot redact (patterns require a closing quote).
+    """
+    for separator in (b"\r\n\r\n", b"\n\n"):
+        index = data.rfind(separator)
+        if index != -1:
+            return data[: index + len(separator)]
+    return b""
+
+
 def _recording_file_path(name: str, ext: str) -> str:
     dir_path = os.path.join(RECORDINGS_DIR, str(__LAST_RECORDING_INDEX))
     os.makedirs(dir_path, exist_ok=True)
@@ -111,9 +146,11 @@ def record_payload(payload: Dict[str, Any], name: str) -> None:
 
 @config_bypass
 def record_sse(sse: bytes, name: str) -> None:
-    """Write raw SSE bytes under the current recording index subdirectory."""
+    """Write complete SSE events under the current recording index subdirectory."""
 
+    complete = complete_sse_prefix(sse)
+    if not complete:
+        return
     file_path = _recording_file_path(name, "sse")
     with open(file_path, "wb") as f:
-        sse = anonymize(sse.decode("utf-8")).encode("utf-8")
-        f.write(sse)
+        f.write(anonymize(decode_utf8_complete_prefix(complete)).encode("utf-8"))

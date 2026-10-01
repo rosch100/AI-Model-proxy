@@ -31,8 +31,8 @@ def _sse_event(event_name, payload):
     ).encode("utf-8")
 
 
-def test_rate_limit_retry_honors_retry_after_ms(app, requests_mock, monkeypatch):
-    """Retry a transient 429 only after Azure's recommended delay."""
+def test_rate_limit_retry_floors_short_retry_after_ms(app, requests_mock, monkeypatch):
+    """Do not honor sub-15s Azure hints that thrash the TPM window."""
     requests_mock.post(
         AZURE_RESPONSES_URL,
         [
@@ -55,7 +55,7 @@ def test_rate_limit_retry_honors_retry_after_ms(app, requests_mock, monkeypatch)
 
     assert response.status_code == 200
     assert requests_mock.call_count == 2
-    sleep.assert_called_once_with(0.025)
+    sleep.assert_called_once_with(15.0)
 
 
 @pytest.mark.parametrize("error_code", ("insufficient_quota", "quota_exceeded"))
@@ -80,23 +80,26 @@ def test_quota_429_is_not_retried(app, requests_mock, monkeypatch, error_code):
 def test_rate_limit_retries_are_bounded_with_exponential_backoff(
     app, requests_mock, monkeypatch
 ):
-    """Stop after five retries with backoff when Azure keeps throttling."""
+    """Stop after eight retries with floored exponential backoff."""
     rate_limited = {
         "status_code": 429,
         "json": {"error": {"code": "rate_limit_exceeded"}},
     }
-    requests_mock.post(AZURE_RESPONSES_URL, [rate_limited] * 6)
+    requests_mock.post(AZURE_RESPONSES_URL, [rate_limited] * 9)
     sleep = Mock()
     monkeypatch.setattr("time.sleep", sleep)
-    monkeypatch.setattr("random.uniform", lambda lower, upper: upper / 2)
+    monkeypatch.setattr("random.uniform", lambda lower, upper: lower)
 
     response = AzureAdapter().forward(_request(app))
 
     assert response.status_code == 429
-    assert requests_mock.call_count == 6
+    assert requests_mock.call_count == 9
     assert [call.args[0] for call in sleep.call_args_list] == [
-        7.5,
         15.0,
+        15.0,
+        30.0,
+        30.0,
+        30.0,
         30.0,
         30.0,
         30.0,
@@ -218,7 +221,6 @@ def test_stream_rate_limit_retries_before_emitting_output(
     )
     sleep = Mock()
     monkeypatch.setattr("time.sleep", sleep)
-    monkeypatch.setattr("random.uniform", lambda lower, upper: upper / 2)
 
     response = AzureAdapter().forward(_request(app))
     response_body = response.get_data()
@@ -227,7 +229,55 @@ def test_stream_rate_limit_retries_before_emitting_output(
     assert requests_mock.call_count == 2
     assert b"recovered" in response_body
     assert b"rate_limit_exceeded" not in response_body
-    sleep.assert_called_once_with(0.025)
+    sleep.assert_called_once_with(15.0)
+
+
+def test_stream_error_event_rate_limit_is_retried(app, requests_mock, monkeypatch):
+    """Retry bare SSE error events that carry rate_limit_exceeded before output."""
+    failed_event = _sse_event(
+        "error",
+        {
+            "type": "error",
+            "code": "rate_limit_exceeded",
+            "message": "The token rate limit was exceeded.",
+            "retry_after_ms": 20000,
+        },
+    )
+    recovered_stream = b"".join(
+        (
+            _sse_event(
+                "response.output_text.delta",
+                {"type": "response.output_text.delta", "delta": "recovered"},
+            ),
+            _sse_event(
+                "response.completed",
+                {"type": "response.completed", "response": {"usage": {}}},
+            ),
+        )
+    )
+    requests_mock.post(
+        AZURE_RESPONSES_URL,
+        [
+            {
+                "status_code": 200,
+                "headers": {"content-type": "text/event-stream"},
+                "content": failed_event,
+            },
+            {
+                "status_code": 200,
+                "headers": {"content-type": "text/event-stream"},
+                "content": recovered_stream,
+            },
+        ],
+    )
+    sleep = Mock()
+    monkeypatch.setattr("time.sleep", sleep)
+
+    response = AzureAdapter().forward(_request(app))
+
+    assert b"recovered" in response.get_data()
+    assert b"rate_limit_exceeded" not in response.get_data()
+    sleep.assert_called_once_with(20.0)
 
 
 def test_stream_rate_limit_without_retry_after_uses_minimum_backoff(
@@ -278,7 +328,7 @@ def test_stream_rate_limit_without_retry_after_uses_minimum_backoff(
     )
     sleep = Mock()
     monkeypatch.setattr("time.sleep", sleep)
-    monkeypatch.setattr("random.uniform", lambda lower, upper: upper / 2)
+    monkeypatch.setattr("random.uniform", lambda lower, upper: lower)
 
     response = AzureAdapter().forward(_request(app))
     response_body = response.get_data()
@@ -286,7 +336,7 @@ def test_stream_rate_limit_without_retry_after_uses_minimum_backoff(
     assert response.status_code == 200
     assert b"recovered" in response_body
     assert b"rate_limit_exceeded" not in response_body
-    sleep.assert_called_once_with(7.5)
+    sleep.assert_called_once_with(15.0)
 
 
 def test_stream_rate_limit_honors_retry_after_on_sse_error(
@@ -428,24 +478,24 @@ def test_stream_rate_limit_retries_are_bounded(app, requests_mock, monkeypatch):
                 "content": failed_event,
             }
         ]
-        * 6,
+        * 9,
     )
     sleep = Mock()
     monkeypatch.setattr("time.sleep", sleep)
-    monkeypatch.setattr("random.uniform", lambda lower, upper: upper / 2)
+    monkeypatch.setattr("random.uniform", lambda lower, upper: lower)
 
     response = AzureAdapter().forward(_request(app))
     response_body = response.get_data()
 
     assert b"rate_limit_exceeded" in response_body
-    assert requests_mock.call_count == 6
-    assert sleep.call_count == 5
+    assert requests_mock.call_count == 9
+    assert sleep.call_count == 8
 
 
 def test_http_and_stream_rate_limit_retries_share_budget(
     app, requests_mock, monkeypatch
 ):
-    """Do not exceed five total retries across HTTP and SSE rate limits."""
+    """Do not exceed eight total retries across HTTP and SSE rate limits."""
     failed_event = _sse_event(
         "response.failed",
         {
@@ -464,7 +514,7 @@ def test_http_and_stream_rate_limit_retries_share_budget(
             "headers": {"retry-after-ms": "25"},
             "json": {"error": {"code": "rate_limit_exceeded"}},
         }
-        for _ in range(5)
+        for _ in range(8)
     ]
     responses.append(
         {
@@ -481,5 +531,5 @@ def test_http_and_stream_rate_limit_retries_share_budget(
     response_body = response.get_data()
 
     assert b"rate_limit_exceeded" in response_body
-    assert requests_mock.call_count == 6
-    assert sleep.call_count == 5
+    assert requests_mock.call_count == 9
+    assert sleep.call_count == 8

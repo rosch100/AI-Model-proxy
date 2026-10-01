@@ -20,7 +20,7 @@ from ..common.recording import record_payload
 from .request_adapter import RequestAdapter
 from .response_adapter import ResponseAdapter
 
-MAX_AZURE_RATE_LIMIT_RETRIES = 5
+MAX_AZURE_RATE_LIMIT_RETRIES = 8
 MAX_AZURE_RETRY_DELAY_SECONDS = 60.0
 MIN_AZURE_RATE_LIMIT_DELAY_SECONDS = 15.0
 
@@ -35,6 +35,9 @@ class AzureRequestContext:
 
     request_kwargs: dict[str, Any]
     retries_used: int = 0
+    # Monotonic deadline this request has already waited through, so a retry
+    # sleep does not pay the same shared cooldown twice.
+    satisfied_cooldown_until: float = 0.0
 
 
 class AzureAdapter:
@@ -85,10 +88,10 @@ class AzureAdapter:
     ) -> requests.Response:
         """Retry transient Azure rate limits before returning a response stream."""
         while True:
-            if request_context.retries_used == 0:
-                self._wait_for_shared_cooldown(request_context)
+            self._wait_for_shared_cooldown(request_context)
             response = requests.request(**request_context.request_kwargs)
             if request_context.retries_used >= MAX_AZURE_RATE_LIMIT_RETRIES:
+                self._record_exhausted_cooldown(request_context, response)
                 return response
 
             retry_delay = self._azure_rate_limit_retry_delay(
@@ -108,6 +111,9 @@ class AzureAdapter:
     ) -> requests.Response | None:
         """Retry a streamed rate limit while sharing the HTTP retry budget."""
         if request_context.retries_used >= MAX_AZURE_RATE_LIMIT_RETRIES:
+            AzureAdapter._record_shared_cooldown_until(
+                request_context, time.monotonic() + MAX_AZURE_RETRY_DELAY_SECONDS
+            )
             return None
 
         retry_delay = self._retry_delay_from_headers(
@@ -122,6 +128,17 @@ class AzureAdapter:
         return self._request_upstream(request_context)
 
     @staticmethod
+    def _record_exhausted_cooldown(
+        request_context: AzureRequestContext, response: requests.Response
+    ) -> None:
+        """Keep peers waiting after the local retry budget is spent on TPM limits."""
+        if response.status_code != 429:
+            return
+        AzureAdapter._record_shared_cooldown_until(
+            request_context, time.monotonic() + MAX_AZURE_RETRY_DELAY_SECONDS
+        )
+
+    @staticmethod
     def _wait_before_retry(
         request_context: AzureRequestContext, retry_delay: float
     ) -> None:
@@ -130,8 +147,12 @@ class AzureAdapter:
             f"[yellow]Azure rate limit; retry {retry_number}/"
             f"{MAX_AZURE_RATE_LIMIT_RETRIES} in {retry_delay:.2f}s[/yellow]"
         )
-        AzureAdapter._record_shared_cooldown(request_context, retry_delay)
+        cooldown_until = time.monotonic() + retry_delay
+        AzureAdapter._record_shared_cooldown_until(request_context, cooldown_until)
         time.sleep(retry_delay)
+        request_context.satisfied_cooldown_until = max(
+            request_context.satisfied_cooldown_until, cooldown_until
+        )
         request_context.retries_used += 1
 
     @staticmethod
@@ -197,28 +218,43 @@ class AzureAdapter:
     @staticmethod
     def _wait_for_shared_cooldown(request_context: AzureRequestContext) -> None:
         key = AzureAdapter._rate_limit_key(request_context)
-        remaining = _rate_limit_not_before.get(key, 0.0) - time.monotonic()
+        not_before = _rate_limit_not_before.get(key, 0.0)
+        if not_before <= request_context.satisfied_cooldown_until:
+            return
+        remaining = not_before - time.monotonic()
         if remaining <= 0:
+            request_context.satisfied_cooldown_until = max(
+                request_context.satisfied_cooldown_until, time.monotonic()
+            )
             return
         console.print(
             f"[yellow]Azure rate limit cooldown {remaining:.2f}s "
             "before next upstream attempt[/yellow]"
         )
         time.sleep(remaining)
+        request_context.satisfied_cooldown_until = max(
+            request_context.satisfied_cooldown_until, not_before
+        )
 
     @staticmethod
-    def _record_shared_cooldown(
-        request_context: AzureRequestContext, retry_delay: float
+    def _record_shared_cooldown_until(
+        request_context: AzureRequestContext, not_before: float
     ) -> None:
         key = AzureAdapter._rate_limit_key(request_context)
-        not_before = time.monotonic() + retry_delay
         previous = _rate_limit_not_before.get(key, 0.0)
         if not_before > previous:
             _rate_limit_not_before[key] = not_before
 
     @staticmethod
-    def _retry_delay_from_headers(headers, retry_number: int) -> float | None:
-        """Wait Azure's delay when present; otherwise back off at least 15s."""
+    def _backoff_ceiling(retry_number: int) -> float:
+        return min(
+            MIN_AZURE_RATE_LIMIT_DELAY_SECONDS * (2**retry_number),
+            MAX_AZURE_RETRY_DELAY_SECONDS,
+        )
+
+    @staticmethod
+    def _azure_hint_delay_seconds(headers) -> float | None:
+        """Parse Azure retry-after hints; ignore unusable values."""
         for header, milliseconds_per_unit in (
             ("retry-after-ms", 0.001),
             ("retry-after", 1.0),
@@ -236,13 +272,19 @@ class AzureAdapter:
                 continue
             if not math.isfinite(delay) or delay < 0:
                 return None
-            return min(delay, MAX_AZURE_RETRY_DELAY_SECONDS)
+            return delay
+        return None
 
-        backoff_ceiling = min(
-            MIN_AZURE_RATE_LIMIT_DELAY_SECONDS * (2**retry_number),
-            MAX_AZURE_RETRY_DELAY_SECONDS,
-        )
-        return random.uniform(backoff_ceiling / 2.0, backoff_ceiling)
+    @staticmethod
+    def _retry_delay_from_headers(headers, retry_number: int) -> float | None:
+        """Floor short Azure hints at 15s so TPM windows can refill under load."""
+        azure_delay = AzureAdapter._azure_hint_delay_seconds(headers)
+        floor = MIN_AZURE_RATE_LIMIT_DELAY_SECONDS
+        if azure_delay is not None:
+            return min(max(azure_delay, floor), MAX_AZURE_RETRY_DELAY_SECONDS)
+
+        backoff_ceiling = AzureAdapter._backoff_ceiling(retry_number)
+        return random.uniform(max(floor, backoff_ceiling / 2.0), backoff_ceiling)
 
     def _handle_azure_error(self, resp: Response, request_kwargs) -> Response:
 

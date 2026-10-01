@@ -611,15 +611,28 @@ class ResponseAdapter:
         )
 
     @staticmethod
+    def _error_dict_is_rate_limit(error: Any) -> bool:
+        """Match Azure TPM/RPM throttles by code or message text."""
+        if not isinstance(error, dict):
+            return False
+        if error.get("code") == "rate_limit_exceeded":
+            return True
+        message = str(error.get("message") or "").lower()
+        return "rate limit" in message or "token rate" in message
+
+    @staticmethod
     def _is_rate_limit_failure(raw_event: str, event_data: Any) -> bool:
         """Identify Azure's retryable streaming rate-limit failure event."""
-        if raw_event != "response.failed" or not isinstance(event_data, dict):
+        if not isinstance(event_data, dict):
+            return False
+        if raw_event == "error":
+            return ResponseAdapter._error_dict_is_rate_limit(event_data)
+        if raw_event != "response.failed":
             return False
         response = event_data.get("response")
         if not isinstance(response, dict):
             return False
-        error = response.get("error")
-        return isinstance(error, dict) and error.get("code") == "rate_limit_exceeded"
+        return ResponseAdapter._error_dict_is_rate_limit(response.get("error"))
 
     @staticmethod
     def _error_from_response(upstream_resp: Any) -> Dict[str, str]:
@@ -643,13 +656,9 @@ class ResponseAdapter:
         self, event: Any, state: _ResponseStreamState, request_context: Any
     ) -> Any:
         """Retry a rate-limit event only while downstream output is still empty."""
-        raw_event = event.event or ""
-        if (
-            raw_event != "response.failed"
-            or state.has_emitted_output
-            or request_context is None
-        ):
+        if state.has_emitted_output or request_context is None:
             return None
+        raw_event = event.event or ""
         if not self._is_rate_limit_failure(raw_event, event.json):
             return None
         return self.adapter._retry_stream_rate_limit(

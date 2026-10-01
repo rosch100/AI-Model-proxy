@@ -533,3 +533,115 @@ def test_http_and_stream_rate_limit_retries_share_budget(
     assert b"rate_limit_exceeded" in response_body
     assert requests_mock.call_count == 9
     assert sleep.call_count == 8
+
+
+def test_empty_error_precursor_avoids_stream_error_and_retries(
+    app, requests_mock, monkeypatch
+):
+    """Absorb empty SSE error noise, cool peers early, then retry on response.failed."""
+    from app.azure import adapter as azure_adapter
+
+    failed_stream = b"".join(
+        (
+            _sse_event("error", {"type": "error", "code": "", "message": ""}),
+            _sse_event(
+                "response.failed",
+                {
+                    "type": "response.failed",
+                    "response": {
+                        "error": {
+                            "code": "rate_limit_exceeded",
+                            "message": "The token rate limit was exceeded.",
+                        }
+                    },
+                },
+            ),
+        )
+    )
+    recovered_stream = b"".join(
+        (
+            _sse_event(
+                "response.output_text.delta",
+                {"type": "response.output_text.delta", "delta": "recovered"},
+            ),
+            _sse_event(
+                "response.completed",
+                {"type": "response.completed", "response": {"usage": {}}},
+            ),
+        )
+    )
+    requests_mock.post(
+        AZURE_RESPONSES_URL,
+        [
+            {
+                "status_code": 200,
+                "headers": {"content-type": "text/event-stream"},
+                "content": failed_stream,
+            },
+            {
+                "status_code": 200,
+                "headers": {"content-type": "text/event-stream"},
+                "content": recovered_stream,
+            },
+        ],
+    )
+    sleep = Mock()
+    monkeypatch.setattr("time.sleep", sleep)
+    precursor = Mock(wraps=AzureAdapter.note_empty_stream_error_precursor)
+    monkeypatch.setattr(
+        AzureAdapter,
+        "note_empty_stream_error_precursor",
+        staticmethod(precursor),
+    )
+
+    response = AzureAdapter().forward(_request(app))
+
+    assert b"recovered" in response.get_data()
+    assert b"rate_limit_exceeded" not in response.get_data()
+    precursor.assert_called_once()
+    assert sleep.call_count == 1
+    assert sleep.call_args.args[0] == 15.0
+    assert azure_adapter._rate_limit_not_before
+
+
+def test_empty_error_alone_before_output_triggers_retry(
+    app, requests_mock, monkeypatch
+):
+    """Retry when the upstream stream ends on an empty error without response.failed."""
+    empty_error = _sse_event("error", {"type": "error"})
+    recovered_stream = b"".join(
+        (
+            _sse_event(
+                "response.output_text.delta",
+                {"type": "response.output_text.delta", "delta": "recovered"},
+            ),
+            _sse_event(
+                "response.completed",
+                {"type": "response.completed", "response": {"usage": {}}},
+            ),
+        )
+    )
+    requests_mock.post(
+        AZURE_RESPONSES_URL,
+        [
+            {
+                "status_code": 200,
+                "headers": {"content-type": "text/event-stream"},
+                "content": empty_error,
+            },
+            {
+                "status_code": 200,
+                "headers": {"content-type": "text/event-stream"},
+                "content": recovered_stream,
+            },
+        ],
+    )
+    sleep = Mock()
+    monkeypatch.setattr("time.sleep", sleep)
+    monkeypatch.setattr("random.uniform", lambda lower, upper: lower)
+
+    response = AzureAdapter().forward(_request(app))
+
+    assert b"recovered" in response.get_data()
+    assert requests_mock.call_count == 2
+    sleep.assert_called_once_with(15.0)

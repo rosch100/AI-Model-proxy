@@ -68,7 +68,7 @@ See [Authentication modes](#authentication-modes) for configuration details.
 
 ### Reliability and streaming
 
-- Retries Azure `rate_limit_exceeded` before streaming begins, including `response.failed` SSE payloads returned with HTTP 200.
+- Retries Azure `rate_limit_exceeded` before streaming begins, including `error` and `response.failed` SSE payloads returned with HTTP 200.
 - Honors Azure `retry-after-ms` / `Retry-After` up to a 60-second wait cap; longer waits return the error instead of retrying early.
 - Avoids empty reasoning blocks that confused Cursor’s thinking UI.
 
@@ -573,7 +573,7 @@ Check the Azure API key, resource, and deployment for that principal (global or 
 `AZURE_BASE_URL` / tenant `azure_base_url` must be the resource root. Deployment names in the active model map must exist in Azure.
 
 **`rate_limit_exceeded` from Azure**
-Before any response chunk is sent, the proxy retries this error up to five times (six attempts), including `response.failed` SSE with HTTP 200. It honors `retry-after-ms` / `Retry-After` from HTTP headers or the SSE error, waiting at most 60 seconds. Without those hints it waits 15–60 seconds with exponential backoff instead of retrying in under a second. Concurrent requests to the same Azure deployment share that cooldown. Quota errors such as `insufficient_quota` are returned immediately. After streaming has started, the proxy does not restart the stream. Persistent token-limit errors still mean the Azure deployment TPM is too low for the parallel Cursor load.
+Before any response chunk is sent, the proxy retries this error up to eight times (nine attempts), including `error` and `response.failed` SSE with HTTP 200. It honors `retry-after-ms` / `Retry-After` from HTTP headers or the SSE error, but floors short Azure hints at 15 seconds and waits at most 60 seconds. Without those hints it uses 15–60 seconds of exponential backoff. Concurrent requests to the same Azure deployment share that cooldown, including after the local retry budget is exhausted. Quota errors such as `insufficient_quota` are returned immediately. After streaming has started, the proxy does not restart the stream. Persistent token-limit errors still mean the Azure deployment TPM is too low for the parallel Cursor load.
 
 **Cursor cannot connect**
 The override base URL must be reachable from Cursor’s servers. `http://localhost:8082` is only for local checks.

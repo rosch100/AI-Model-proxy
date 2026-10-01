@@ -652,6 +652,26 @@ class ResponseAdapter:
             "message": str(upstream_resp.text),
         }
 
+    def _absorb_empty_error_precursor(
+        self, event: Any, state: _ResponseStreamState, request_context: Any
+    ) -> bool:
+        """Skip empty SSE error noise and start shared cooldown before peers stampede."""
+        if state.has_emitted_output or request_context is None:
+            return False
+        if (event.event or "") != "error":
+            return False
+        data = event.json if isinstance(event.json, dict) else {}
+        code = str(data.get("code") or "").strip()
+        message = str(data.get("message") or "").strip()
+        if code or message:
+            return False
+        self.adapter.note_empty_stream_error_precursor(request_context)
+        console.print(
+            "[yellow]Azure empty stream error before output; "
+            "holding shared cooldown for likely rate limit[/yellow]"
+        )
+        return True
+
     def _retry_stream_if_possible(
         self, event: Any, state: _ResponseStreamState, request_context: Any
     ) -> Any:
@@ -688,9 +708,13 @@ class ResponseAdapter:
                 return
 
             retry_stream = False
+            empty_error_precursor = False
             for event in sse_to_events(
                 state.upstream_resp.iter_content(chunk_size=8192)
             ):
+                if self._absorb_empty_error_precursor(event, state, request_context):
+                    empty_error_precursor = True
+                    continue
                 retry_response = self._retry_stream_if_possible(
                     event, state, request_context
                 )
@@ -700,8 +724,25 @@ class ResponseAdapter:
                     break
                 yield from self._adapt_event(event, state, live)
 
-            if not retry_stream:
-                return
+            if retry_stream:
+                continue
+            if (
+                empty_error_precursor
+                and not state.has_emitted_output
+                and request_context is not None
+            ):
+                retry_response = self.adapter._retry_stream_rate_limit(
+                    state.upstream_resp,
+                    request_context,
+                    {
+                        "code": "rate_limit_exceeded",
+                        "message": "token rate limit",
+                    },
+                )
+                if retry_response is not None:
+                    state.upstream_resp = retry_response
+                    continue
+            return
 
     def _adapt_event(
         self, event: Any, state: _ResponseStreamState, live: Live

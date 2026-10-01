@@ -246,6 +246,15 @@ class AzureAdapter:
             _rate_limit_not_before[key] = not_before
 
     @staticmethod
+    def note_empty_stream_error_precursor(
+        request_context: AzureRequestContext,
+    ) -> None:
+        """Protect peers when Azure emits an empty error before response.failed."""
+        AzureAdapter._record_shared_cooldown_until(
+            request_context, time.monotonic() + MIN_AZURE_RATE_LIMIT_DELAY_SECONDS
+        )
+
+    @staticmethod
     def _backoff_ceiling(retry_number: int) -> float:
         return min(
             MIN_AZURE_RATE_LIMIT_DELAY_SECONDS * (2**retry_number),

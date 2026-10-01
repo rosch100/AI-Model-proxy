@@ -57,13 +57,24 @@ class TestBadModelName(ReplyBase):
 
 
 class TestBareModelWithoutReasoning(ReplyBase):
-    """Require Cursor's native reasoning field for bare model names."""
+    """Use the default high reasoning effort when Cursor omits the field."""
 
-    expected_upstream_request_body = None
-    expected_downstream_status_code = 400
-    expected_downstream_response_body = b"""Cursor configuration error, check your Cursor settings.
+    expected_downstream_status_code = 200
 
-\tCursor must send reasoning.effort when using bare model names like gpt-5.4."""
+    @property
+    def expected_upstream_request_body(self) -> str:
+        """Expect a bare model request to use high reasoning effort."""
+        payload = json.loads(super().expected_upstream_request_body)
+        payload["model"] = "gpt-5.4"
+        payload["reasoning"]["effort"] = "high"
+        return json.dumps(payload)
+
+    @property
+    def expected_downstream_response_body(self) -> bytes:
+        """Expect the Cursor-facing response to retain the requested model id."""
+        return super().expected_downstream_response_body.replace(
+            b'"model":"gpt-5"', b'"model":"gpt-5.4"'
+        )
 
     @property
     def downstream_request_body(self) -> str:

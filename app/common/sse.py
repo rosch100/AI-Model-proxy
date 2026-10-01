@@ -102,7 +102,6 @@ class SSEDecoder:
                 self._event_lines = []
             else:
                 self._event_lines.append(stripped)
-        record_sse(self.full_buffer, "upstream_response")
 
     def end_of_input(self) -> Iterator[SSEEvent]:
         """Flush and yield a trailing event if the stream ended mid-message."""
@@ -120,9 +119,13 @@ def sse_to_events(
 ) -> Iterator[SSEEvent]:
     """Convert an SSE byte-stream into parsed SSEEvent objects."""
     decoder = SSEDecoder(encoding=encoding)
-    for chunk in stream:
-        yield from decoder.feed(chunk)
-    yield from decoder.end_of_input()
+    try:
+        for chunk in stream:
+            yield from decoder.feed(chunk)
+        yield from decoder.end_of_input()
+    finally:
+        # Record once at stream end so anonymize sees complete UTF-8/JSON.
+        record_sse(decoder.full_buffer, "upstream_response")
 
 
 def encode_sse_data(data: str) -> bytes:

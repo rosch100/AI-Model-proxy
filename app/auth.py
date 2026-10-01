@@ -1,16 +1,69 @@
 """Authentication module."""
 
 from functools import wraps
+from hmac import compare_digest
 
-from flask import current_app, request
+from flask import Response, current_app, g, request
 
-from .exceptions import CursorConfigurationError
+from .tenants import (
+    AUTH_MODE_SINGLE,
+    AUTH_MODE_TENANT,
+    TenantConfig,
+    resolve_tenant_for_api_key,
+)
+
+_GENERIC_UNAUTHORIZED = (
+    "Authentication with the proxy service failed.\n\n"
+    "Provide a valid Bearer token in:\n"
+    "\tCursor Settings > Models > API Keys > OpenAI API Key\n\n"
+    "The value must match a configured proxy API key.\n"
+    "If modifying the .env file, restart the service for the changes to apply."
+)
 
 
-def valid_bearer_token():
-    """Validate the bearer token."""
-    service_api_key = current_app.config["SERVICE_API_KEY"]
-    return request.authorization and request.authorization.token == service_api_key
+def _unauthorized_response() -> Response:
+    """Return the same generic HTTP 401 for any failed authentication."""
+    return Response(_GENERIC_UNAUTHORIZED, status=401, mimetype="text/plain")
+
+
+def _bearer_token() -> str | None:
+    authorization = request.authorization
+    if authorization is None or not authorization.token:
+        return None
+    token = authorization.token
+    if not isinstance(token, str) or not token.strip():
+        return None
+    return token
+
+
+def authenticate_request() -> TenantConfig | None:
+    """Authenticate the request and return the tenant when in tenant mode.
+
+    In single mode returns None after validating SERVICE_API_KEY.
+    Raises AuthenticationError on missing or invalid credentials.
+    """
+    token = _bearer_token()
+    if token is None:
+        raise AuthenticationError()
+
+    auth_mode = current_app.config.get("AUTH_MODE", AUTH_MODE_SINGLE)
+    if auth_mode == AUTH_MODE_TENANT:
+        tenants = current_app.config.get("TENANTS") or ()
+        tenant = resolve_tenant_for_api_key(token, tenants)
+        if tenant is None:
+            raise AuthenticationError()
+        return tenant
+
+    service_api_key = current_app.config.get("SERVICE_API_KEY")
+    if not isinstance(service_api_key, str) or not compare_digest(
+        token.encode("utf-8"), service_api_key.encode("utf-8")
+    ):
+        raise AuthenticationError()
+    return None
+
+
+class AuthenticationError(Exception):
+    """Raised when the request bearer token is missing or invalid."""
 
 
 def require_auth(func):
@@ -19,17 +72,23 @@ def require_auth(func):
     @wraps(func)
     def wrapper(*args, **kwargs):
         """Wrapper function return Unauthorized if the token is invalid."""
-        if valid_bearer_token():
-            return func(*args, **kwargs)
-        else:
-            raise CursorConfigurationError(
-                "Authentication with the proxy service failed.\n\n"
-                "This value of:\n"
-                "\tCursor Settings > Models > API Keys > OpenAI API Key\n\n"
-                "must match the value of:\n"
-                "\tSERVICE_API_KEY in your .env file\n\n"
-                "Ensure the values match exactly, and try again.\n"
-                "If modifying the .env file, restart the service for the changes to apply."
-            )
+        try:
+            tenant = authenticate_request()
+        except AuthenticationError:
+            return _unauthorized_response()
+
+        g.tenant = tenant
+        g.auth_mode = current_app.config.get("AUTH_MODE", AUTH_MODE_SINGLE)
+        return func(*args, **kwargs)
 
     return wrapper
+
+
+def current_tenant() -> TenantConfig | None:
+    """Return the authenticated tenant for the current request, if any."""
+    return getattr(g, "tenant", None)
+
+
+def is_tenant_auth_mode() -> bool:
+    """Return True when the request was authenticated in tenant mode."""
+    return getattr(g, "auth_mode", AUTH_MODE_SINGLE) == AUTH_MODE_TENANT

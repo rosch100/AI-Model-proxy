@@ -1,7 +1,3 @@
-data: {"id":"chatcmpl-potuMRpJpFuW52IV3MhnXDmi","object":"chat.completion.chunk","created":1779525422,"model":"gpt-5","choices":[{"index":0,"delta":{"role":"assistant","content":"<details>\n<summary>Thought</summary>\n\n"},"finish_reason":null}]}
-
-data: {"id":"chatcmpl-potuMRpJpFuW52IV3MhnXDmi","object":"chat.completion.chunk","created":1779525422,"model":"gpt-5","choices":[{"index":0,"delta":{"role":"assistant","content":"\n\n</details>\n\n"},"finish_reason":null}]}
-
 data: {"id":"chatcmpl-potuMRpJpFuW52IV3MhnXDmi","object":"chat.completion.chunk","created":1779525422,"model":"gpt-5","choices":[{"index":0,"delta":{"role":"assistant","content":"pong"},"finish_reason":null}]}
 
 data: {"id":"chatcmpl-potuMRpJpFuW52IV3MhnXDmi","object":"chat.completion.chunk","created":1779525422,"model":"gpt-5","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}

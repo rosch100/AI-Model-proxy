@@ -16,8 +16,8 @@ services:
     environment:
       FLASK_ENV: production
       FLASK_DEBUG: "0"
-      LOG_LEVEL: info
-      GUNICORN_WORKERS: "1"
+      LOG_LEVEL: ${LOG_LEVEL:-warning}
+      GUNICORN_WORKERS: ${GUNICORN_WORKERS:-1}
     ports:
       - "127.0.0.1:5000:5000"
     volumes:

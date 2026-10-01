@@ -10,9 +10,9 @@ from typing import Any, Dict, List
 from flask import Request
 from rich import box
 from rich.console import Console, Group
-from rich.markup import escape as rich_escape
 from rich.json import JSON
 from rich.markdown import Markdown
+from rich.markup import escape as rich_escape
 from rich.padding import Padding
 from rich.panel import Panel
 from rich.table import Table
@@ -148,7 +148,10 @@ def create_message_panel(msg: Dict[str, Any], idx: int, total: int) -> Panel:
     message_title = (
         f"[italic]{idx}/{total}[/italic] [bold]<{rich_escape(role)}>[/bold]"
         if not name
-        else f"[italic]{idx}/{total}[/italic] [bold]<{rich_escape(role)} name={rich_escape(str(name))} id={rich_escape(str(tool_call_id))}>[/bold]"
+        else (
+            f"[italic]{idx}/{total}[/italic] [bold]<{rich_escape(role)} "
+            f"name={rich_escape(str(name))} id={rich_escape(str(tool_call_id))}>[/bold]"
+        )
     )
     message_elements = []
     message_elements.append(
@@ -164,7 +167,9 @@ def create_message_panel(msg: Dict[str, Any], idx: int, total: int) -> Panel:
         function = tool_call.get("function", {})
         arguments = function.get("arguments")
         tool_elements = []
-        tool_title = f"[bold]<tool_call id={rich_escape(str(tool_call.get('id')))}>[/bold]"
+        tool_title = (
+            f"[bold]<tool_call id={rich_escape(str(tool_call.get('id')))}>[/bold]"
+        )
         tool_elements.append(
             f"[bold][magenta]{rich_escape(str(function.get('name')))}[/magenta] [blue]([/blue][/bold]",
         )

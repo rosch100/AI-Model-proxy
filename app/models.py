@@ -22,7 +22,12 @@ SUPPORTED_MODELS: Final[tuple[str, ...]] = (
     "gpt-5.4",
     "gpt-5.4-mini",
     "gpt-5.4-nano",
+    "gpt-5.6-luna",
     "gpt-5.6-sol",
+    "gpt-5.6-terra",
+    "gpt-6-astra",
+    "gpt-6-luna",
+    "gpt-6-sol",
 )
 
 SUPPORTED_MODELS_TEXT: Final[str] = "\n".join(
@@ -37,9 +42,8 @@ def default_model_deployments() -> dict[str, str]:
 
 def parse_model_deployments(raw_mapping: str | None) -> dict[str, str]:
     """Parse a JSON mapping of public model ids to Azure deployment names."""
-    deployments = default_model_deployments()
     if not raw_mapping:
-        return deployments
+        return default_model_deployments()
 
     try:
         parsed = json.loads(raw_mapping)
@@ -53,6 +57,7 @@ def parse_model_deployments(raw_mapping: str | None) -> dict[str, str]:
             "AZURE_MODEL_DEPLOYMENTS must be a JSON object mapping model ids to deployment names."
         )
 
+    deployments = {}
     unknown_models = sorted(set(parsed) - set(SUPPORTED_MODELS))
     if unknown_models:
         raise ServiceConfigurationError(

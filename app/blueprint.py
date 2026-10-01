@@ -6,7 +6,7 @@ forwards incoming HTTP requests to the configured backend implementation.
 
 from flask import Blueprint, current_app, jsonify, request
 
-from .auth import require_auth
+from .auth import current_tenant, is_tenant_auth_mode, require_auth
 from .azure.adapter import AzureAdapter
 from .codex.adapter import CodexAdapter
 from .codex.settings import codex_model_payload
@@ -17,7 +17,7 @@ from .common.recording import (
     record_payload,
 )
 from .exceptions import ConfigurationError, ServiceConfigurationError
-from .models import SUPPORTED_MODELS
+from .tenants import AUTH_MODE_TENANT
 
 blueprint = Blueprint("blueprint", __name__)
 
@@ -62,6 +62,28 @@ def _ensure_provider_enabled(provider: str) -> None:
         raise ServiceConfigurationError(f"{label} provider is disabled.")
 
 
+def _ensure_provider_allowed_for_auth(provider: str) -> None:
+    """Reject Codex when the caller authenticated with a tenant API key."""
+    if provider == "codex" and is_tenant_auth_mode():
+        raise ServiceConfigurationError(
+            "Codex is not available in AUTH_MODE=tenant. "
+            "Tenant API keys may only use the Azure provider."
+        )
+
+
+def _azure_model_ids() -> list[str]:
+    """Return Cursor-facing Azure model ids for the authenticated principal."""
+    tenant = current_tenant()
+    if tenant is not None:
+        return list(tenant.azure_model_deployments)
+    if current_app.config.get("AUTH_MODE") == AUTH_MODE_TENANT:
+        raise ServiceConfigurationError(
+            "AUTH_MODE=tenant requires an authenticated tenant; "
+            "refusing to expose global Azure model deployments."
+        )
+    return list(current_app.config["AZURE_MODEL_DEPLOYMENTS"])
+
+
 @blueprint.route("/", defaults={"path": ""}, methods=ALL_METHODS)
 @blueprint.route("/<path:path>", methods=ALL_METHODS)
 @require_auth
@@ -85,6 +107,7 @@ def catch_all(path: str):
 
     provider, provider_path = _provider_for_path(path)
     _ensure_provider_enabled(provider)
+    _ensure_provider_allowed_for_auth(provider)
     if provider == "codex":
         return CodexAdapter().forward(request, provider_path)
     return AzureAdapter().forward(request)
@@ -104,6 +127,7 @@ def models():
     """Return a list of available models."""
     provider, _ = _provider_for_path(request.path)
     _ensure_provider_enabled(provider)
+    _ensure_provider_allowed_for_auth(provider)
     if provider == "codex":
         return jsonify(codex_model_payload())
     return jsonify(
@@ -116,7 +140,7 @@ def models():
                     "created": 1686935002,
                     "owned_by": "openai",
                 }
-                for model in SUPPORTED_MODELS
+                for model in _azure_model_ids()
             ],
         }
     )
@@ -127,6 +151,7 @@ def models():
 def codex_ready():
     """Return Codex provider readiness."""
     _ensure_provider_enabled("codex")
+    _ensure_provider_allowed_for_auth("codex")
     return CodexAdapter().ready()
 
 

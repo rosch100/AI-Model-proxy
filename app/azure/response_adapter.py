@@ -653,7 +653,7 @@ class ResponseAdapter:
         if not self._is_rate_limit_failure(raw_event, event.json):
             return None
         return self.adapter._retry_stream_rate_limit(
-            state.upstream_resp, request_context
+            state.upstream_resp, request_context, event.json
         )
 
     def _stream_upstream_events(

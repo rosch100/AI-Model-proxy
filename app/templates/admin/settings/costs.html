@@ -16,6 +16,22 @@
   {% endif %}
 
   <h2>Billing-Schlüssel (OpenAI / OpenRouter)</h2>
+  <ul class="secret-list">
+    <li>OpenAI:
+      {% if view.billing_key_masks.openai %}
+        <code class="secret-mask">{{ view.billing_key_masks.openai }}</code>
+      {% else %}
+        nicht gespeichert
+      {% endif %}
+    </li>
+    <li>OpenRouter:
+      {% if view.billing_key_masks.openrouter %}
+        <code class="secret-mask">{{ view.billing_key_masks.openrouter }}</code>
+      {% else %}
+        nicht gespeichert
+      {% endif %}
+    </li>
+  </ul>
   <form method="post" action="{{ url_for('admin.save_billing') }}" class="stack">
     {{ billing_form.csrf_token }}
     <label>{{ billing_form.provider.label }}{{ billing_form.provider() }}</label>

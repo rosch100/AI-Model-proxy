@@ -44,6 +44,7 @@ class ConnectionView:
     openrouter: ProviderProfile | None
     catalog: tuple[ProviderCatalogEntry, ...]
     active_provider: str | None
+    inference_key_masks: dict[str, str | None]
 
 
 @dataclass(frozen=True)
@@ -54,6 +55,7 @@ class CostsView:
     bindings: tuple[tuple[ProviderScopeBinding, ProviderScopeNode], ...]
     jobs: tuple[CostRefreshJob, ...]
     records: tuple[CostUsageRecord, ...]
+    billing_key_masks: dict[str, str | None]
 
 
 def provider_state(profile: ProviderProfile | None) -> str:

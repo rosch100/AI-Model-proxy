@@ -14,6 +14,8 @@ from .models import parse_model_deployments
 
 AUTH_MODE_SINGLE = "single"
 AUTH_MODE_TENANT = "tenant"
+TENANT_CONFIG_ENVIRONMENT = "environment"
+TENANT_CONFIG_DATABASE = "database"
 VALID_AUTH_MODES = frozenset({AUTH_MODE_SINGLE, AUTH_MODE_TENANT})
 
 _PLACEHOLDER_AZURE_API_KEYS = frozenset({"change_me", "change-me"})
@@ -22,18 +24,66 @@ _SHA256_HEX_LENGTH = 64
 
 @dataclass(frozen=True)
 class TenantConfig:
-    """Resolved Azure configuration for one authenticated tenant."""
+    """Resolved Azure configuration for one environment-configured tenant."""
 
     id: str
     api_key_hash: str
     azure_base_url: str
     azure_api_key: str
     azure_model_deployments: Mapping[str, str]
+    azure_default_model: str | None = None
 
     @property
     def azure_responses_api_url(self) -> str:
         """Return the Azure Responses API URL for this tenant."""
         return f"{self.azure_base_url}/openai/v1/responses"
+
+
+@dataclass(frozen=True)
+class DatabaseTenantSnapshot:
+    """Consistent persisted tenant and active provider configuration for a request."""
+
+    id: str
+    api_key_hash: str
+    custom_model_id: str
+    provider: str | None
+    provider_settings: Mapping[str, Any]
+    inference_secret: str | None
+    default_model: str | None
+
+    @property
+    def azure_base_url(self) -> str | None:
+        """Return the configured Azure base URL for this active profile."""
+        base_url = self.provider_settings.get("base_url")
+        return base_url if isinstance(base_url, str) else None
+
+    @property
+    def azure_api_key(self) -> str | None:
+        """Return the decrypted Azure inference credential for this snapshot."""
+        return self.inference_secret
+
+    @property
+    def azure_model_deployments(self) -> Mapping[str, str]:
+        """Return the configured model-to-deployment map for this profile."""
+        deployments = self.provider_settings.get("model_deployments", {})
+        if not isinstance(deployments, dict) or any(
+            not isinstance(model, str) or not isinstance(deployment, str)
+            for model, deployment in deployments.items()
+        ):
+            raise ServiceConfigurationError(
+                "The active Azure profile has invalid model deployments."
+            )
+        return deployments
+
+    @property
+    def azure_responses_api_url(self) -> str:
+        """Return the Azure Responses API URL for this active profile."""
+        base_url = self.azure_base_url
+        if base_url is None:
+            raise ServiceConfigurationError(
+                "The active tenant profile has no Azure base URL."
+            )
+        return f"{base_url.rstrip('/')}/openai/v1/responses"
 
 
 def hash_api_key(api_key: str) -> str:
@@ -150,12 +200,22 @@ def _parse_tenant_entry(entry: Any, index: int) -> TenantConfig:
             f"TENANTS[{index}].azure_model_deployments is invalid: {exc.args[0]}"
         ) from exc
 
+    default_model = entry.get("azure_default_model")
+    if default_model is not None and (
+        not isinstance(default_model, str) or default_model not in deployments
+    ):
+        raise ServiceConfigurationError(
+            f"TENANTS[{index}].azure_default_model must name a model in "
+            "azure_model_deployments."
+        )
+
     return TenantConfig(
         id=tenant_id,
         api_key_hash=api_key_hash,
         azure_base_url=azure_base_url,
         azure_api_key=azure_api_key.strip(),
         azure_model_deployments=dict(deployments),
+        azure_default_model=default_model,
     )
 
 

@@ -8,6 +8,8 @@ from webtest import TestApp
 
 from app import create_app
 
+pytest_plugins = ["tests.admin_app"]
+
 
 @pytest.fixture
 def app() -> Flask:

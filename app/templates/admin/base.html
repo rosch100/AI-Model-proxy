@@ -1,0 +1,44 @@
+<!DOCTYPE html>
+<html lang="de">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>{% block title %}Altanis Proxy{% endblock %}</title>
+    <link rel="stylesheet" href="{{ url_for('static', filename='admin/admin.css') }}" />
+    <meta name="csrf-token" content="{{ csrf_token() }}" />
+    <script src="{{ url_for('static', filename='admin/htmx.min.js') }}" defer></script>
+    <script src="{{ url_for('static', filename='admin/admin.js') }}" defer></script>
+  </head>
+  <body>
+    <a class="skip-link" href="#content">Zum Inhalt</a>
+    {% if current_user_nav %}
+    <header class="topbar">
+      <p class="brand">Altanis Proxy</p>
+      <nav aria-label="Admin">
+        <a href="{{ url_for('admin.dashboard') }}">Übersicht</a>
+        <a href="{{ url_for('admin.settings_general') }}">Allgemein</a>
+        <a href="{{ url_for('admin.settings_connection') }}">Verbindung</a>
+        <a href="{{ url_for('admin.settings_costs') }}">Kosten</a>
+        <a href="{{ url_for('admin.account') }}">Konto</a>
+      </nav>
+      <form method="post" action="{{ url_for('admin.logout') }}">
+        {{ logout_form.csrf_token }}
+        <button type="submit">Abmelden</button>
+      </form>
+    </header>
+    {% endif %}
+    <main id="content">
+      {% with messages = get_flashed_messages(with_categories=true) %}
+        {% if messages %}
+          <ul class="flashes">
+            {% for category, message in messages %}
+              <li class="{{ category }}">{{ message }}</li>
+            {% endfor %}
+          </ul>
+        {% endif %}
+      {% endwith %}
+      {% block content %}{% endblock %}
+    </main>
+    {% block scripts %}{% endblock %}
+  </body>
+</html>

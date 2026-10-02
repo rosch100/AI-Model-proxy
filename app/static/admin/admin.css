@@ -1,0 +1,207 @@
+:root {
+  --ink: #14221c;
+  --moss: #1f4d3a;
+  --amber: #c45c26;
+  --paper: #e7efe4;
+  --grain: #d5e3d0;
+  --flash-error: #8b1e1e;
+  --flash-info: #1f4d3a;
+  font-family: "Trebuchet MS", "Century Gothic", "Gill Sans", sans-serif;
+  color: var(--ink);
+  background:
+    radial-gradient(1200px 500px at 10% -10%, #f3f7ef 0%, transparent 55%),
+    linear-gradient(160deg, var(--paper), var(--grain));
+  min-height: 100%;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  min-height: 100vh;
+}
+
+.skip-link {
+  position: absolute;
+  left: -999px;
+}
+
+.skip-link:focus {
+  left: 1rem;
+  top: 1rem;
+  background: white;
+  padding: 0.4rem 0.7rem;
+}
+
+.brand {
+  font-size: 1.4rem;
+  letter-spacing: 0.04em;
+  color: var(--moss);
+  margin: 0;
+}
+
+.hero-brand {
+  font-size: 2.4rem;
+  line-height: 1.1;
+}
+
+.lede {
+  max-width: 38rem;
+}
+
+.topbar {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 1rem;
+  align-items: center;
+  justify-content: space-between;
+  padding: 1rem 1.5rem;
+  border-bottom: 2px solid var(--moss);
+}
+
+.topbar nav {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.8rem;
+}
+
+.topbar a {
+  color: var(--ink);
+}
+
+main {
+  padding: 2rem 1.5rem 4rem;
+  max-width: 52rem;
+}
+
+.login-stage {
+  min-height: 80vh;
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  max-width: 26rem;
+}
+
+.stack {
+  display: grid;
+  gap: 0.8rem;
+  max-width: 36rem;
+}
+
+label {
+  display: grid;
+  gap: 0.3rem;
+}
+
+input,
+textarea,
+select,
+button {
+  font: inherit;
+  padding: 0.55rem 0.7rem;
+}
+
+button {
+  background: var(--moss);
+  color: #f4fff8;
+  border: 0;
+  width: fit-content;
+  cursor: pointer;
+}
+
+button:hover,
+button:focus-visible {
+  background: var(--amber);
+}
+
+.flashes {
+  list-style: none;
+  padding: 0;
+}
+
+.flashes .error {
+  color: var(--flash-error);
+}
+
+.flashes .info {
+  color: var(--flash-info);
+}
+
+.status-list {
+  padding-left: 1.2rem;
+}
+
+.once-secret {
+  padding: 0.8rem;
+  background: #fff7ef;
+  border-left: 4px solid var(--amber);
+}
+
+.primary-cta {
+  font-size: 1.05rem;
+  padding: 0.75rem 1rem;
+}
+
+.bootstrap-auth {
+  margin-top: 1.5rem;
+  max-width: 26rem;
+}
+
+.bootstrap-auth summary {
+  cursor: pointer;
+  color: var(--moss);
+  margin-bottom: 0.8rem;
+}
+
+.status {
+  color: var(--moss);
+}
+
+.status.error {
+  color: var(--flash-error);
+}
+
+.passkey-list {
+  list-style: none;
+  padding: 0;
+  display: grid;
+  gap: 0.8rem;
+}
+
+.passkey-list li {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.8rem;
+  justify-content: space-between;
+  align-items: center;
+  padding: 0.8rem 0;
+  border-bottom: 1px solid color-mix(in srgb, var(--moss) 25%, transparent);
+}
+
+.passkey-list .meta {
+  margin: 0.2rem 0 0;
+  font-size: 0.9rem;
+  opacity: 0.8;
+}
+
+button:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+code {
+  font-family: "Menlo", "Consolas", monospace;
+  font-size: 0.92em;
+}
+
+@media (max-width: 768px) {
+  .hero-brand {
+    font-size: 2rem;
+  }
+
+  main {
+    padding: 1.2rem;
+  }
+}

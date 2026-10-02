@@ -1,0 +1,73 @@
+{% extends "admin/base.html" %}
+{% set current_user_nav = true %}
+{% block title %}Verbindung · Altanis Proxy{% endblock %}
+{% block content %}
+<section>
+  <h1>Verbindung</h1>
+  <p class="lede">Profile speichern, Katalog laden, danach genau einen Anbieter aktivieren.</p>
+  {% if view.active_provider %}
+    <p>Aktiver Anbieter: <strong>{{ view.active_provider }}</strong></p>
+  {% else %}
+    <p>Kein Anbieter aktiv.</p>
+  {% endif %}
+
+  <h2>Azure</h2>
+  <form method="post" action="{{ url_for('admin.save_azure_connection') }}" class="stack">
+    {{ azure_form.csrf_token }}
+    <label>{{ azure_form.base_url.label }}{{ azure_form.base_url() }}</label>
+    <label>{{ azure_form.api_key.label }}{{ azure_form.api_key() }}</label>
+    <label>{{ azure_form.default_model.label }}{{ azure_form.default_model() }}</label>
+    <label>{{ azure_form.model_deployments.label }}{{ azure_form.model_deployments(rows=8) }}</label>
+    <button type="submit">Azure speichern</button>
+  </form>
+  <form method="post" action="{{ url_for('admin.refresh_catalog') }}">
+    {{ azure_form.csrf_token }}
+    <input type="hidden" name="provider" value="azure" />
+    <button type="submit">Azure-Katalog aktualisieren</button>
+  </form>
+
+  <h2>OpenAI</h2>
+  <form method="post" action="{{ url_for('admin.save_openai_connection') }}" class="stack">
+    {{ openai_form.csrf_token }}
+    <label>{{ openai_form.api_key.label }}{{ openai_form.api_key() }}</label>
+    <label>{{ openai_form.default_model.label }}{{ openai_form.default_model() }}</label>
+    <label>{{ openai_form.organization.label }}{{ openai_form.organization() }}</label>
+    <label>{{ openai_form.project.label }}{{ openai_form.project() }}</label>
+    <button type="submit">OpenAI speichern</button>
+  </form>
+  <form method="post" action="{{ url_for('admin.refresh_catalog') }}">
+    {{ openai_form.csrf_token }}
+    <input type="hidden" name="provider" value="openai" />
+    <button type="submit">OpenAI-Katalog aktualisieren</button>
+  </form>
+
+  <h2>OpenRouter</h2>
+  <form method="post" action="{{ url_for('admin.save_openrouter_connection') }}" class="stack">
+    {{ openrouter_form.csrf_token }}
+    <label>{{ openrouter_form.api_key.label }}{{ openrouter_form.api_key() }}</label>
+    <label>{{ openrouter_form.default_model.label }}{{ openrouter_form.default_model() }}</label>
+    <button type="submit">OpenRouter speichern</button>
+  </form>
+  <form method="post" action="{{ url_for('admin.refresh_catalog') }}">
+    {{ openrouter_form.csrf_token }}
+    <input type="hidden" name="provider" value="openrouter" />
+    <button type="submit">OpenRouter-Katalog aktualisieren</button>
+  </form>
+
+  <h2>Aktivieren</h2>
+  <form method="post" action="{{ url_for('admin.activate_connection') }}" class="stack">
+    {{ activate_form.csrf_token }}
+    <label>{{ activate_form.provider.label }}{{ activate_form.provider() }}</label>
+    <button type="submit">Anbieter aktivieren</button>
+  </form>
+
+  {% if view.catalog %}
+    <h2>Katalog</h2>
+    <ul>
+      {% for entry in view.catalog %}
+        <li>{{ entry.model_id }}{% if entry.deployment_id %} → {{ entry.deployment_id }}{% endif %}</li>
+      {% endfor %}
+    </ul>
+  {% endif %}
+</section>
+{% endblock %}

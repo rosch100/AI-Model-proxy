@@ -1,0 +1,31 @@
+{% extends "admin/base.html" %}
+{% block title %}Anmelden · Altanis Proxy{% endblock %}
+{% block content %}
+<section class="login-stage">
+  <p class="brand hero-brand">Altanis Proxy</p>
+  <h1>Admin-Anmeldung</h1>
+  <p class="lede">Melde dich mit einem Passkey an. Passwort nur für die erstmalige Einrichtung.</p>
+  <div class="stack">
+    <button type="button" id="passkey-login" class="primary-cta">Mit Passkey anmelden</button>
+    <p id="passkey-login-status" class="status" hidden></p>
+  </div>
+  <details class="bootstrap-auth">
+    <summary>Ersteinrichtung mit Passwort</summary>
+    <form method="post" action="{{ url_for('admin.login_submit') }}" class="stack">
+      {{ form.csrf_token }}
+      <label>
+        {{ form.username.label }}
+        {{ form.username(autocomplete="username") }}
+      </label>
+      <label>
+        {{ form.password.label }}
+        {{ form.password(autocomplete="current-password") }}
+      </label>
+      <button type="submit">Mit Passwort anmelden</button>
+    </form>
+  </details>
+</section>
+{% endblock %}
+{% block scripts %}
+<script src="{{ url_for('static', filename='admin/admin-passkeys.js') }}" defer></script>
+{% endblock %}

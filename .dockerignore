@@ -7,3 +7,4 @@ tests
 docs
 *.log
 __pycache__
+._*

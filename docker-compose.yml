@@ -18,8 +18,12 @@ services:
       FLASK_DEBUG: "0"
       LOG_LEVEL: ${LOG_LEVEL:-warning}
       GUNICORN_WORKERS: ${GUNICORN_WORKERS:-1}
-    ports:
-      - "127.0.0.1:5000:5000"
+      TRUSTED_HOSTS: ${PUBLIC_HOSTNAMES:?Set PUBLIC_HOSTNAMES in .env},localhost,127.0.0.1
+      TRUST_PROXY_HEADERS: "true"
+    expose:
+      - "5000"
+    networks:
+      - proxy
     volumes:
       # Mount the host Codex login state into the container user home so token
       # refresh can update auth.json in place across different machines/users.
@@ -29,6 +33,25 @@ services:
       interval: 10s
       timeout: 5s
       retries: 3
+
+  caddy:
+    image: caddy:2-alpine
+    restart: unless-stopped
+    environment:
+      PUBLIC_HOSTNAMES: ${PUBLIC_HOSTNAMES:?Set PUBLIC_HOSTNAMES in .env}
+    ports:
+      - "80:80/tcp"
+      - "443:443/tcp"
+      - "443:443/udp"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    networks:
+      - proxy
+    depends_on:
+      flask:
+        condition: service_healthy
 
   # ── Dev / management helpers (not started by default) ─────────────────────
   flask-dev:
@@ -54,3 +77,11 @@ services:
     volumes:
       - ./:/app
     profiles: ["dev"]
+
+networks:
+  proxy:
+    driver: bridge
+
+volumes:
+  caddy_data:
+  caddy_config:

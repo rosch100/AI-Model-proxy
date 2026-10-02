@@ -209,6 +209,74 @@ def test_create_app_rejects_tenant_mode_without_tenants():
         create_app(config)
 
 
+def test_create_app_rejects_unknown_tenant_config_source():
+    """Runtime source is an explicit, validated configuration choice."""
+    config = type(
+        "InvalidTenantSourceConfig",
+        (),
+        {
+            "SERVICE_API_KEY": None,
+            "AUTH_MODE": "tenant",
+            "TENANT_CONFIG_SOURCE": "fallback",
+            "TENANTS": (),
+        },
+    )
+
+    with pytest.raises(ServiceConfigurationError, match="TENANT_CONFIG_SOURCE"):
+        create_app(config)
+
+
+def test_create_app_accepts_database_as_tenant_runtime_source():
+    """Database-backed web startup accepts an empty legacy TENANTS setting."""
+    config = type(
+        "DatabaseTenantConfig",
+        (),
+        {
+            "SERVICE_API_KEY": None,
+            "AUTH_MODE": "tenant",
+            "TENANT_CONFIG_SOURCE": "database",
+            "TENANTS": (),
+            "DATABASE_URL": "postgresql+psycopg://user:password@localhost/proxy",
+            "PROVIDER_ENCRYPTION_KEY": "a2tra2tra2tra2tra2tra2tra2tra2tra2tra2tra2s=",
+            "ADMIN_SESSION_SECRET": "test-admin-session-secret-bytes-32",
+            "WEBAUTHN_RP_ID": "localhost",
+            "WEBAUTHN_RP_NAME": "Test Proxy",
+            "WEBAUTHN_ORIGINS": "http://localhost",
+            "ENABLE_CODEX": False,
+        },
+    )
+
+    app = create_app(config)
+
+    assert app.config["TENANT_CONFIG_SOURCE"] == "database"
+    app.extensions["database"].engine.dispose()
+
+
+def test_create_app_rejects_tenants_when_database_is_the_runtime_source():
+    """Database-backed web startup rejects a conflicting TENANTS configuration."""
+    config = type(
+        "ConflictingDatabaseTenantConfig",
+        (),
+        {
+            "SERVICE_API_KEY": None,
+            "AUTH_MODE": "tenant",
+            "TENANT_CONFIG_SOURCE": "database",
+            "TENANTS": (),
+            "TENANTS_CONFIGURED": True,
+            "DATABASE_URL": "postgresql+psycopg://user:password@localhost/proxy",
+            "PROVIDER_ENCRYPTION_KEY": "a2tra2tra2tra2tra2tra2tra2tra2tra2tra2tra2s=",
+            "ADMIN_SESSION_SECRET": "test-admin-session-secret-bytes-32",
+            "WEBAUTHN_RP_ID": "localhost",
+            "WEBAUTHN_RP_NAME": "Test Proxy",
+            "WEBAUTHN_ORIGINS": "http://localhost",
+            "ENABLE_CODEX": False,
+        },
+    )
+
+    with pytest.raises(ServiceConfigurationError, match="TENANTS.*database"):
+        create_app(config)
+
+
 def test_create_app_accepts_tenant_mode_without_service_api_key(monkeypatch):
     """Tenant mode does not require SERVICE_API_KEY."""
     monkeypatch.setenv("TENANT_ACME_AZURE_API_KEY", "acme-azure-secret")

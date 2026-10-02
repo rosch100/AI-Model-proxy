@@ -8,6 +8,12 @@ TESTING = True
 SERVICE_API_KEY = "test-service-api-key"
 AUTH_MODE = "single"
 TENANTS = ()
+TRUSTED_HOSTS = ["localhost", "127.0.0.1", "proxy.altanis.de", "proxy.iffm-gmbh.de"]
+TRUST_PROXY_HEADERS = True
+ADMIN_SESSION_SECRET = "test-admin-session-secret-bytes-32"
+WEBAUTHN_RP_ID = "localhost"
+WEBAUTHN_RP_NAME = "Test Proxy"
+WEBAUTHN_ORIGINS = ("http://localhost", "http://127.0.0.1")
 
 ENABLE_AZURE = True
 ENABLE_CODEX = True

@@ -1,0 +1,54 @@
+{% extends "admin/base.html" %}
+{% set current_user_nav = true %}
+{% block title %}Konto · Altanis Proxy{% endblock %}
+{% block content %}
+<section>
+  <h1>Konto</h1>
+  <p class="lede">Angemeldet als {{ username }}.</p>
+
+  <h2>Passkeys</h2>
+  {% if passkeys %}
+  <ul class="passkey-list">
+    {% for key in passkeys %}
+    <li>
+      <div>
+        <strong>{{ key.label }}</strong>
+        <p class="meta">Erstellt {{ key.created_at }}{% if key.last_used_at %} · Zuletzt {{ key.last_used_at }}{% endif %}</p>
+      </div>
+      <form method="post" action="{{ url_for('admin.delete_account_passkey', passkey_id=key.id) }}">
+        {{ logout_form.csrf_token }}
+        <button type="submit"{% if passkeys|length < 2 %} disabled title="Mindestens ein Passkey muss bleiben"{% endif %}>Löschen</button>
+      </form>
+    </li>
+    {% endfor %}
+  </ul>
+  {% else %}
+  <p>Noch keine Passkeys registriert.</p>
+  {% endif %}
+  <div class="stack">
+    <label>
+      Neue Bezeichnung
+      <input id="passkey-label" type="text" value="Zusatzgerät" maxlength="128" />
+    </label>
+    <button type="button" id="passkey-register">Weiteren Passkey hinzufügen</button>
+    <p id="passkey-register-status" class="status" hidden></p>
+  </div>
+
+  {% if password_change_allowed %}
+  <h2>Passwort</h2>
+  <form method="post" action="{{ url_for('admin.change_password') }}" class="stack">
+    {{ form.csrf_token }}
+    <label>{{ form.current_password.label }}{{ form.current_password() }}</label>
+    <label>{{ form.new_password.label }}{{ form.new_password() }}</label>
+    <label>{{ form.confirm_password.label }}{{ form.confirm_password() }}</label>
+    <button type="submit">Passwort ändern</button>
+  </form>
+  {% else %}
+  <h2>Passwort</h2>
+  <p class="lede">Nach der Passkey-Einrichtung ist die Anmeldung nur noch per Passkey möglich. Passwortänderung ist deaktiviert.</p>
+  {% endif %}
+</section>
+{% endblock %}
+{% block scripts %}
+<script src="{{ url_for('static', filename='admin/admin-passkeys.js') }}" defer></script>
+{% endblock %}

@@ -1,0 +1,3 @@
+{$PUBLIC_HOSTNAMES} {
+    reverse_proxy flask:5000
+}

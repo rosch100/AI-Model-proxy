@@ -1,8 +1,8 @@
 # Deployment: Cursor → Azure OpenAI proxy
 
-How this checkout is deployed and configured for Josh's setup. The upstream
-[README](README.md) documents the proxy itself; this file documents *our*
-deployment on Azure Container Apps and the local patches on top of upstream.
+The upstream [README](README.md) documents the proxy itself. This file covers
+the existing Azure Container Apps deployment, its local patches, and the
+self-hosted Docker Compose option with Caddy for multiple DNS names on one IP.
 
 Set up on 2026-08-18 (see Cursor chat history for the full walkthrough).
 
@@ -17,7 +17,98 @@ between and translates both directions, streaming included.
 Cursor (BYOK) ──▶ Azure Container App (this proxy) ──▶ Azure OpenAI (gpt-5.6-sol)
 ```
 
-## Live deployment
+## Self-hosted: mehrere DNS-Namen auf einer IP
+
+Der Docker-Compose-Stack nutzt Caddy als öffentlichen Reverse-Proxy. Alle in
+`PUBLIC_HOSTNAMES` aufgeführten DNS-Namen können auf dieselbe statische
+öffentliche IPv4-Adresse zeigen. Caddy unterscheidet sie über TLS-SNI und den
+HTTP-Hostnamen, bezieht automatisch separate ACME-Zertifikate und erneuert sie
+automatisch. Dafür sind weder eine IP pro Domain noch Wildcard-Zertifikate
+notwendig.
+
+### Voraussetzungen
+
+- Für jeden Namen einen öffentlichen `A`-Record auf dieselbe IPv4-Adresse
+  setzen, zum Beispiel `proxy.altanis.de` und `proxy.iffm-gmbh.de`.
+- `AAAA`-Records nur setzen, wenn der Host und die Firewall IPv6 tatsächlich
+  bis zum Container routen; ein falscher `AAAA`-Record kann Clients vom
+  funktionierenden IPv4-Pfad ablenken.
+- TCP-Ports 80 und 443 am Host bzw. Router zur Maschine mit Docker weiterleiten
+  und in der Firewall freigeben. Caddy braucht Port 80 für HTTP-01 und
+  HTTPS-Weiterleitungen sowie Port 443 für TLS-ALPN und HTTPS. UDP 443 ist
+  optional und ermöglicht HTTP/3.
+- Auf dem Host Docker Compose installieren und sicherstellen, dass kein anderer
+  Dienst diese Ports belegt.
+
+### Start
+
+1. `.env.example` als `.env` kopieren und die erforderlichen Proxy-/Provider-
+   Secrets setzen. `PUBLIC_HOSTNAMES` enthält ausschließlich kommagetrennte
+   Hostnamen ohne Schema oder Pfad, zum Beispiel:
+
+   ```dotenv
+   PUBLIC_HOSTNAMES=proxy.altanis.de, proxy.iffm-gmbh.de
+   ```
+
+2. Stack bauen und starten:
+
+   ```bash
+   docker compose up -d --build
+   docker compose logs -f caddy
+   ```
+
+3. Zertifikatsausstellung und HTTPS prüfen:
+
+   ```bash
+   curl --fail https://proxy.altanis.de/health
+   curl --fail https://proxy.iffm-gmbh.de/health
+   ```
+
+Caddy speichert Zertifikate und ACME-Zustand im persistenten Volume
+`caddy_data`; `caddy_config` bewahrt die aktive Konfiguration. Diese Volumes
+bei Updates nicht entfernen und in die Host-Backup-Strategie aufnehmen. Bei
+DNS- oder ACME-Problemen zuerst öffentliche DNS-Auflösung, Portfreigaben,
+Firewall und Caddy-Logs prüfen.
+
+Flask hat im Produktions-Compose-Stack keinen veröffentlichten Host-Port und
+ist nur für Caddy über das private Compose-Netz erreichbar. Die Liste aus
+`PUBLIC_HOSTNAMES` wird zugleich als Flask-Host-Allowlist verwendet. Werkzeug
+`ProxyFix` vertraut genau einem Reverse-Proxy-Hop für Client-IP, Scheme und
+Host; deshalb darf Flask nicht zusätzlich direkt öffentlich erreichbar sein.
+
+SNI und `Host` bestimmen ausschließlich TLS-Zertifikat und HTTP-Routing. Sie
+wählen keinen Tenant aus und umgehen keine Authentifizierung: Tenant-Zuordnung
+bleibt an den Bearer-API-Key gebunden. Ein und derselbe Key muss über beide
+DNS-Namen dieselbe Tenant-Konfiguration erreichen.
+
+## Tenant Admin UI (database mode)
+
+With `AUTH_MODE=tenant` and `TENANT_CONFIG_SOURCE=database`, the proxy serves a
+browser admin UI under `/admin`. Authentication uses mandatory WebAuthn
+passkeys after bootstrap:
+
+1. Set `ADMIN_SESSION_SECRET` (≥32 random bytes), `WEBAUTHN_RP_ID`,
+   `WEBAUTHN_RP_NAME`, and `WEBAUTHN_ORIGINS` (comma-separated exact origins for
+   every public hostname that serves `/admin`).
+2. Run migrations (`flask db upgrade`) so `admin_passkeys` /
+   `admin_webauthn_challenges` exist.
+3. Bootstrap: sign in once with username/password. The UI forces passkey
+   enrollment before any other admin page is reachable.
+4. Afterwards password login is rejected; use „Mit Passkey anmelden“.
+
+### Operator recovery (lost last passkey)
+
+There is no self-service or CLI recovery. On the host, delete the account's
+passkey rows so password bootstrap works again, then enroll a new passkey:
+
+```sql
+DELETE FROM admin_passkeys
+WHERE account_id = (SELECT id FROM admin_accounts WHERE username = 'admin');
+```
+
+When zero passkeys remain, password login is allowed once and redirects to
+forced enrollment.
+
 
 | Thing | Value |
 |---|---|

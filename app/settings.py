@@ -18,6 +18,8 @@ env.read_env()
 
 ENV = env.str("FLASK_ENV", default="production")
 DEBUG = ENV == "development"
+TRUSTED_HOSTS = env.list("TRUSTED_HOSTS", default=None)
+TRUST_PROXY_HEADERS = env.bool("TRUST_PROXY_HEADERS", default=False)
 RECORD_TRAFFIC = env.bool("RECORD_TRAFFIC", False)
 LOG_CONTEXT = env.bool("LOG_CONTEXT", False)
 LOG_COMPLETION = env.bool("LOG_COMPLETION", False)
@@ -26,8 +28,17 @@ REASONING_DISPLAY_MODE = parse_reasoning_display_mode(
 )
 
 AUTH_MODE = parse_auth_mode(env.str("AUTH_MODE", default="single"))
+TENANT_CONFIG_SOURCE = env.str("TENANT_CONFIG_SOURCE", default="environment")
+DATABASE_URL = env.str("DATABASE_URL", default=None)
+PROVIDER_ENCRYPTION_KEY = env.str("PROVIDER_ENCRYPTION_KEY", default=None)
+ADMIN_SESSION_SECRET = env.str("ADMIN_SESSION_SECRET", default=None)
+WEBAUTHN_RP_ID = env.str("WEBAUTHN_RP_ID", default=None)
+WEBAUTHN_RP_NAME = env.str("WEBAUTHN_RP_NAME", default=None)
+WEBAUTHN_ORIGINS = env.str("WEBAUTHN_ORIGINS", default=None)
 SERVICE_API_KEY = env.str("SERVICE_API_KEY", default=None)
-TENANTS = parse_tenants(env.str("TENANTS", default=""))
+_raw_tenants = env.str("TENANTS", default="")
+TENANTS_CONFIGURED = bool(_raw_tenants.strip())
+TENANTS = () if TENANT_CONFIG_SOURCE == "database" else parse_tenants(_raw_tenants)
 
 ENABLE_AZURE = env.bool("ENABLE_AZURE", True)
 ENABLE_CODEX = env.bool("ENABLE_CODEX", False)

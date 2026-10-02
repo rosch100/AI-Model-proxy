@@ -1,10 +1,12 @@
 """Unit tests for Azure request adaptation."""
 
 import pytest
+from flask import g
 
 from app.azure.adapter import AzureAdapter
-from app.exceptions import CursorConfigurationError
+from app.exceptions import CursorConfigurationError, ServiceConfigurationError
 from app.models import SUPPORTED_MODELS
+from app.tenants import DatabaseTenantSnapshot
 
 DEPLOYED_MODEL_ROUTES = (
     ("gpt-5.6-luna", "gpt-5-6-luna-api"),
@@ -281,3 +283,36 @@ def test_request_adapter_transforms_forced_function_tool_choice_for_responses(ap
         "type": "function",
         "name": "smoke_test",
     }
+
+
+def test_request_adapter_rejects_database_default_missing_from_deployments(app):
+    """Fail closed when a DB tenant default model is absent from its map."""
+    adapter = AzureAdapter().request_adapter
+    snapshot = DatabaseTenantSnapshot(
+        id="acme",
+        api_key_hash="a" * 64,
+        custom_model_id="cursor-acme-model",
+        provider="azure",
+        provider_settings={
+            "base_url": "https://acme.openai.azure.com",
+            "model_deployments": {"gpt-5.4": "acme-gpt54"},
+        },
+        inference_secret="azure-key",
+        default_model="gpt-5.6-sol",
+    )
+    with app.test_request_context(
+        "/chat/completions",
+        method="POST",
+        json={
+            "model": "cursor-acme-model",
+            "input": [
+                {"role": "user", "content": [{"type": "input_text", "text": "Hi"}]}
+            ],
+            "stream": True,
+        },
+        headers={"Authorization": "Bearer unused"},
+    ) as ctx:
+        g.tenant = snapshot
+        g.auth_mode = "tenant"
+        with pytest.raises(ServiceConfigurationError, match="deployment map"):
+            adapter.adapt(ctx.request)

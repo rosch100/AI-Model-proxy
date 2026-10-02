@@ -14,7 +14,7 @@ from flask import Request, current_app
 from ..auth import current_tenant
 from ..exceptions import CursorConfigurationError, ServiceConfigurationError
 from ..models import SUPPORTED_MODELS, SUPPORTED_MODELS_TEXT
-from ..tenants import AUTH_MODE_TENANT, TenantConfig
+from ..tenants import AUTH_MODE_TENANT, DatabaseTenantSnapshot, TenantConfig
 
 _STRIPPED_UPSTREAM_HEADERS = frozenset(
     {
@@ -103,6 +103,15 @@ class RequestAdapter:
         """Resolve Azure URL, API key, and deployment map for this request."""
         tenant = current_tenant()
         if tenant is not None:
+            if isinstance(tenant, DatabaseTenantSnapshot):
+                if tenant.provider != "azure":
+                    raise ServiceConfigurationError(
+                        "The active tenant provider is not available on the Azure route."
+                    )
+                if tenant.azure_api_key is None or not tenant.azure_model_deployments:
+                    raise ServiceConfigurationError(
+                        "The active Azure profile is missing credentials or model deployments."
+                    )
             return (
                 tenant.azure_responses_api_url,
                 tenant.azure_api_key,
@@ -122,7 +131,8 @@ class RequestAdapter:
 
     @staticmethod
     def _tenant_scoped_cache_key(
-        conversation_id: str | None, tenant: TenantConfig | None
+        conversation_id: str | None,
+        tenant: TenantConfig | DatabaseTenantSnapshot | None,
     ) -> str | None:
         """Partition Azure cache/session keys per tenant when authenticated."""
         if not conversation_id:
@@ -332,6 +342,23 @@ class RequestAdapter:
         settings = current_app.config
         tenant = current_tenant()
         azure_url, azure_api_key, deployment_map = self._azure_runtime_settings()
+        if (
+            isinstance(tenant, DatabaseTenantSnapshot)
+            and inbound_model == tenant.custom_model_id
+        ):
+            if tenant.default_model is None:
+                raise ServiceConfigurationError(
+                    "The active Azure profile has no default model configured."
+                )
+            if (
+                tenant.default_model not in deployment_map
+                and tenant.default_model.lower() not in deployment_map
+            ):
+                raise ServiceConfigurationError(
+                    "The active Azure profile default model is not present in "
+                    "the tenant deployment map."
+                )
+            payload = {**payload, "model": tenant.default_model}
 
         # Derive conversation_id from Cursor's metadata.cursorConversationId.
         # This is unique per conversation, matching Codex CLI's use of

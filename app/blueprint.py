@@ -17,7 +17,7 @@ from .common.recording import (
     record_payload,
 )
 from .exceptions import ConfigurationError, ServiceConfigurationError
-from .tenants import AUTH_MODE_TENANT
+from .tenants import AUTH_MODE_TENANT, DatabaseTenantSnapshot
 
 blueprint = Blueprint("blueprint", __name__)
 
@@ -74,6 +74,8 @@ def _ensure_provider_allowed_for_auth(provider: str) -> None:
 def _azure_model_ids() -> list[str]:
     """Return Cursor-facing Azure model ids for the authenticated principal."""
     tenant = current_tenant()
+    if isinstance(tenant, DatabaseTenantSnapshot):
+        return [tenant.custom_model_id]
     if tenant is not None:
         return list(tenant.azure_model_deployments)
     if current_app.config.get("AUTH_MODE") == AUTH_MODE_TENANT:

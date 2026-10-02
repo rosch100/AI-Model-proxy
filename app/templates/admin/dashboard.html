@@ -1,0 +1,19 @@
+{% extends "admin/base.html" %}
+{% set current_user_nav = true %}
+{% block title %}Übersicht · Altanis Proxy{% endblock %}
+{% block content %}
+<section>
+  <h1>Mandant {{ view.tenant_id }}</h1>
+  <p class="lede">Status der gespeicherten Anbieterprofile.</p>
+  <p>Custom-Model-ID: <code>{{ view.custom_model_id }}</code></p>
+  <ul class="status-list">
+    {% for provider in view.providers %}
+      <li>
+        <strong>{{ provider.label }}</strong>
+        — {{ provider.state }}
+        {% if provider.is_active %}(aktiv){% endif %}
+      </li>
+    {% endfor %}
+  </ul>
+</section>
+{% endblock %}

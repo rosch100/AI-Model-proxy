@@ -92,7 +92,8 @@ class DatabaseTenantSnapshot:
 
 def hash_api_key(api_key: str) -> str:
     """Return the SHA-256 hex digest of an API key."""
-    # codeql[py/weak-sensitive-data-hashing] API keys are 256-bit random bearer tokens, not passwords.
+    # API keys are generated as 256-bit random bearer tokens, not passwords.
+    # codeql[py/weak-sensitive-data-hashing]
     return hashlib.sha256(api_key.encode("utf-8")).hexdigest()
 
 

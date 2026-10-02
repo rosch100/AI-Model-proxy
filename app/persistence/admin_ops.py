@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import hashlib
 import json
 import secrets
 from datetime import datetime, timezone
@@ -24,12 +23,13 @@ from app.persistence.models import (
 from app.persistence.secrets import SecretCipher
 from app.providers.azure_url import validate_azure_base_url
 from app.providers.catalog import selectable_catalog_models
+from app.tenants import hash_api_key
 
 
 def rotate_api_key(session: Session, tenant: Tenant, actor_id: str) -> str:
     """Replace the Cursor API key digest and return the plaintext key once."""
     api_key = secrets.token_urlsafe(32)
-    tenant.api_key_hash = hashlib.sha256(api_key.encode("utf-8")).hexdigest()
+    tenant.api_key_hash = hash_api_key(api_key)
     session.add(
         AuditEvent(
             tenant_id=tenant.id,

@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import hashlib
 import os
 import secrets
 import unicodedata
@@ -15,7 +14,7 @@ from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from werkzeug.security import generate_password_hash
 
-from app.tenants import parse_tenants
+from app.tenants import hash_api_key, parse_tenants
 
 from .persistence.database import Database
 from .persistence.models import (
@@ -60,7 +59,7 @@ def create_tenant(tenant_id: str) -> None:
     api_key = secrets.token_urlsafe(32)
     tenant = Tenant(
         id=tenant_id,
-        api_key_hash=hashlib.sha256(api_key.encode("utf-8")).hexdigest(),
+        api_key_hash=hash_api_key(api_key),
         custom_model_id=f"cursor-{secrets.token_urlsafe(18)}",
     )
     admin = AdminAccount(

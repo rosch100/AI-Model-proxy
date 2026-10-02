@@ -187,6 +187,83 @@ def test_database_tenant_api_key_authenticates_against_persisted_profile(monkeyp
     engine.dispose()
 
 
+def test_database_openai_provider_forwards_to_openai_compatible(monkeypatch):
+    """Active OpenAI profiles use the OpenAI-compatible forwarder, not Azure."""
+    api_key = "openai-tenant-cleartext-key"
+    database_config = type(
+        "DatabaseOpenAIConfig",
+        (),
+        {
+            "TESTING": True,
+            "AUTH_MODE": "tenant",
+            "TENANT_CONFIG_SOURCE": "database",
+            "TENANTS": (),
+            "SERVICE_API_KEY": None,
+            "DATABASE_URL": "postgresql+psycopg://user:password@localhost/proxy",
+            "PROVIDER_ENCRYPTION_KEY": "a2tra2tra2tra2tra2tra2tra2tra2tra2tra2tra2s=",
+            "ADMIN_SESSION_SECRET": "test-admin-session-secret-bytes-32",
+            "WEBAUTHN_RP_ID": "localhost",
+            "WEBAUTHN_RP_NAME": "Test Proxy",
+            "WEBAUTHN_ORIGINS": "http://localhost",
+            "ENABLE_AZURE": True,
+            "ENABLE_CODEX": False,
+            "AZURE_MODEL_DEPLOYMENTS": {},
+            "AZURE_RESPONSES_API_URL": "https://global.openai.azure.com/openai/v1/responses",
+            "AZURE_API_KEY": "global-azure-key",
+            "AZURE_SUMMARY_LEVEL": "detailed",
+            "AZURE_VERBOSITY_LEVEL": "medium",
+            "AZURE_TRUNCATION": "disabled",
+            "RECORD_TRAFFIC": False,
+            "LOG_CONTEXT": False,
+            "LOG_COMPLETION": False,
+            "REASONING_DISPLAY_MODE": "mdthinkblocks",
+            "TRUSTED_HOSTS": ["localhost"],
+        },
+    )
+    engine = create_engine("sqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    cipher = SecretCipher.from_key(database_config.PROVIDER_ENCRYPTION_KEY)
+    database = Database(
+        engine, sessionmaker(bind=engine, expire_on_commit=False), cipher
+    )
+    monkeypatch.setattr(Database, "from_config", lambda config: database)
+    with database.sessions.begin() as session:
+        profile = ProviderProfile(
+            id="profile-openai",
+            tenant_id="openai-tenant",
+            provider="openai",
+            settings={"organization": "", "project": ""},
+            inference_secret_ciphertext=cipher.encrypt("sk-test"),
+            default_model="gpt-5.4",
+        )
+        tenant = Tenant(
+            id="openai-tenant",
+            api_key_hash=hash_api_key(api_key),
+            custom_model_id="cursor-openai-model",
+            active_profile_id=profile.id,
+        )
+        session.add_all((tenant, profile))
+
+    seen: dict[str, object] = {}
+
+    def fake_forward(req, snapshot):
+        seen["provider"] = snapshot.provider
+        seen["default_model"] = snapshot.default_model
+        return Response("openai-ok", status=200, mimetype="text/plain")
+
+    monkeypatch.setattr("app.blueprint.forward_openai_compatible", fake_forward)
+    app = create_app(database_config)
+    response = app.test_client().post(
+        "/v1/chat/completions",
+        headers={"Authorization": f"Bearer {api_key}"},
+        json={"model": "cursor-openai-model", "messages": []},
+    )
+    assert response.status_code == 200
+    assert response.get_data(as_text=True) == "openai-ok"
+    assert seen == {"provider": "openai", "default_model": "gpt-5.4"}
+    engine.dispose()
+
+
 def test_unknown_and_single_service_key_return_same_generic_401(
     tenant_testapp, tenant_keys
 ):

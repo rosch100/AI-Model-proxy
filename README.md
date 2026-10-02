@@ -68,8 +68,8 @@ See [Authentication modes](#authentication-modes) for configuration details.
 
 ### Reliability and streaming
 
-- Retries Azure `rate_limit_exceeded` before streaming begins, including `error` and `response.failed` SSE payloads returned with HTTP 200.
-- Honors Azure `retry-after-ms` / `Retry-After` up to a 60-second wait cap; longer waits return the error instead of retrying early.
+- Retries Azure `rate_limit_exceeded` HTTP 429s and SSE failures before visible output; after output starts, it keeps streaming incrementally and does not restart a failed attempt.
+- Honors Azure `retry-after-ms` / `Retry-After` with waits capped at 60 seconds per retry. Retry attempts are unbounded; the proxy does not monitor downstream disconnects during synchronous pre-output upstream attempts or retry waits, so it may continue retrying after the client disconnects, potentially indefinitely if Azure keeps rate-limiting the request.
 - Avoids empty reasoning blocks that confused Cursor’s thinking UI.
 
 ### Security and defaults
@@ -585,7 +585,7 @@ Check the Azure API key, resource, and deployment for that principal (global or 
 `AZURE_BASE_URL` / tenant `azure_base_url` must be the resource root. Deployment names in the active model map must exist in Azure.
 
 **`rate_limit_exceeded` from Azure**
-Before any response chunk is sent, the proxy retries this error up to eight times (nine attempts), including `error` and `response.failed` SSE with HTTP 200. Empty SSE `error` events that arrive before output are treated as rate-limit precursors: they start the shared cooldown immediately and do not emit a stream error to Cursor. The proxy honors `retry-after-ms` / `Retry-After` from HTTP headers or the SSE error, but floors short Azure hints at 15 seconds and waits at most 60 seconds. Without those hints it uses 15–60 seconds of exponential backoff. Concurrent requests to the same Azure deployment share that cooldown, including after the local retry budget is exhausted. Quota errors such as `insufficient_quota` are returned immediately. After streaming has started, the proxy does not restart the stream. Persistent token-limit errors still mean the Azure deployment TPM is too low for the parallel Cursor load.
+The proxy retries HTTP 429 responses and `error` / `response.failed` rate-limit SSE events returned with HTTP 200 while no response content or tool-call data has been sent to Cursor. Once output starts, upstream chunks are forwarded incrementally to preserve low time-to-first-token; a later failure is reported in-stream and is not retried, avoiding duplicated text or repeated tool calls. Empty SSE `error` events before output are treated as rate-limit precursors and retried; after output they are reported as an incomplete response without restarting the request. The proxy honors `retry-after-ms` / `Retry-After` from HTTP headers or SSE errors, floors short hints at 15 seconds, and caps each wait at 60 seconds; without a hint it uses 15–60 seconds of exponential backoff. Concurrent requests handled by the same worker process share the cooldown, including when a failure arrives after output has begun; Gunicorn workers do not share this in-memory cooldown with one another. Pre-output retries can keep a Cursor request open indefinitely while Azure continues to rate-limit it; a disconnected client may not stop the retry loop promptly. Quota errors such as `insufficient_quota` are returned immediately. Persistent token-limit errors still indicate that the Azure deployment TPM is too low for the parallel Cursor load.
 
 **Cursor cannot connect**
 The override base URL must be reachable from Cursor’s servers. `http://localhost:8082` is only for local checks.

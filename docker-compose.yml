@@ -22,6 +22,9 @@ services:
       TRUST_PROXY_HEADERS: "true"
     expose:
       - "5000"
+    depends_on:
+      postgres:
+        condition: service_healthy
     networks:
       - proxy
     volumes:
@@ -33,6 +36,23 @@ services:
       interval: 10s
       timeout: 5s
       retries: 3
+
+  postgres:
+    image: postgres:18-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-proxy}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}
+      POSTGRES_DB: ${POSTGRES_DB:-proxy}
+    volumes:
+      - postgres_data:/var/lib/postgresql
+    networks:
+      - proxy
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
 
   caddy:
     image: caddy:2-alpine
@@ -85,3 +105,4 @@ networks:
 volumes:
   caddy_data:
   caddy_config:
+  postgres_data:

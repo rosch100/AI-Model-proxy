@@ -1,8 +1,8 @@
 # Admin Passkey (WebAuthn) Authentication
 
-**Date:** 2026-10-02  
-**Status:** Draft for review  
-**Worktree:** `feature/tenant-provider-admin`  
+**Date:** 2026-10-02
+**Status:** Accepted
+**Worktree:** `feature/tenant-provider-admin`
 **Library:** Duo Labs `webauthn` (py_webauthn) on PyPI
 
 ## Goal

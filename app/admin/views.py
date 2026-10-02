@@ -43,6 +43,7 @@ from app.admin.security import (
     GENERIC_LOGIN_ERROR,
     admin_cookie_secure,
     csrf,
+    mask_secret,
     prefers_html,
 )
 from app.admin.view_models import ConnectionView, CostsView, dashboard_view
@@ -823,6 +824,20 @@ def _connection_context() -> dict[str, object]:
         azure = profiles.get("azure")
         openai = profiles.get("openai")
         openrouter = profiles.get("openrouter")
+        inference_key_masks = {
+            name: (
+                mask_secret(
+                    database.secret_cipher.decrypt(profile.inference_secret_ciphertext)
+                )
+                if profile is not None and profile.inference_secret_ciphertext
+                else None
+            )
+            for name, profile in (
+                ("azure", azure),
+                ("openai", openai),
+                ("openrouter", openrouter),
+            )
+        }
         azure_form = AzureConnectionForm(
             base_url=(azure.settings.get("base_url") if azure else "") or "",
             default_model=azure.default_model if azure else "",
@@ -856,6 +871,7 @@ def _connection_context() -> dict[str, object]:
                     ),
                     None,
                 ),
+                inference_key_masks=inference_key_masks,
             ),
             "azure_form": azure_form,
             "openai_form": openai_form,
@@ -868,6 +884,27 @@ def _connection_context() -> dict[str, object]:
 def _costs_context() -> dict[str, object]:
     database = _database()
     with database.sessions() as session:
+        profiles = {
+            profile.provider: profile
+            for profile in session.scalars(
+                select(ProviderProfile).where(
+                    ProviderProfile.tenant_id == g.admin.tenant_id
+                )
+            )
+        }
+        billing_key_masks = {
+            name: (
+                mask_secret(
+                    database.secret_cipher.decrypt(profile.billing_secret_ciphertext)
+                )
+                if profile is not None and profile.billing_secret_ciphertext
+                else None
+            )
+            for name, profile in (
+                ("openai", profiles.get("openai")),
+                ("openrouter", profiles.get("openrouter")),
+            )
+        }
         bindings = tuple(
             session.execute(
                 select(ProviderScopeBinding, ProviderScopeNode)
@@ -899,6 +936,7 @@ def _costs_context() -> dict[str, object]:
                 bindings=bindings,
                 jobs=jobs,
                 records=records,
+                billing_key_masks=billing_key_masks,
             ),
             "billing_form": BillingCredentialsForm(),
             "logout_form": LoginForm(),

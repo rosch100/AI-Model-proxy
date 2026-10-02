@@ -61,3 +61,11 @@ def prefers_html(incoming: Request | None = None) -> bool:
 def admin_cookie_secure(app: Flask) -> bool:
     """Return whether the opaque admin session cookie must be marked Secure."""
     return bool(app.config.get("SESSION_COOKIE_SECURE"))
+
+
+def mask_secret(secret: str) -> str:
+    """Return a display-only mask that reveals short prefix and suffix edges."""
+    if len(secret) <= 8:
+        return "•" * max(len(secret), 4)
+    prefix_len = 4 if len(secret) >= 12 else 2
+    return f"{secret[:prefix_len]}{'•' * 8}{secret[-4:]}"

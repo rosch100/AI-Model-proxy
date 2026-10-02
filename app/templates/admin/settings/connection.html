@@ -12,10 +12,15 @@
   {% endif %}
 
   <h2>Azure</h2>
+  {% if view.inference_key_masks.azure %}
+    <p class="secret-hint">Gespeicherter Schlüssel: <code class="secret-mask">{{ view.inference_key_masks.azure }}</code></p>
+  {% else %}
+    <p class="secret-hint">Kein Azure-Schlüssel gespeichert.</p>
+  {% endif %}
   <form method="post" action="{{ url_for('admin.save_azure_connection') }}" class="stack">
     {{ azure_form.csrf_token }}
     <label>{{ azure_form.base_url.label }}{{ azure_form.base_url() }}</label>
-    <label>{{ azure_form.api_key.label }}{{ azure_form.api_key() }}</label>
+    <label>{{ azure_form.api_key.label }}{{ azure_form.api_key(placeholder="Leer lassen, um den gespeicherten Schlüssel zu behalten") }}</label>
     <label>{{ azure_form.default_model.label }}{{ azure_form.default_model() }}</label>
     <label>{{ azure_form.model_deployments.label }}{{ azure_form.model_deployments(rows=8) }}</label>
     <button type="submit">Azure speichern</button>
@@ -27,9 +32,14 @@
   </form>
 
   <h2>OpenAI</h2>
+  {% if view.inference_key_masks.openai %}
+    <p class="secret-hint">Gespeicherter Schlüssel: <code class="secret-mask">{{ view.inference_key_masks.openai }}</code></p>
+  {% else %}
+    <p class="secret-hint">Kein OpenAI-Schlüssel gespeichert.</p>
+  {% endif %}
   <form method="post" action="{{ url_for('admin.save_openai_connection') }}" class="stack">
     {{ openai_form.csrf_token }}
-    <label>{{ openai_form.api_key.label }}{{ openai_form.api_key() }}</label>
+    <label>{{ openai_form.api_key.label }}{{ openai_form.api_key(placeholder="Leer lassen, um den gespeicherten Schlüssel zu behalten") }}</label>
     <label>{{ openai_form.default_model.label }}{{ openai_form.default_model() }}</label>
     <label>{{ openai_form.organization.label }}{{ openai_form.organization() }}</label>
     <label>{{ openai_form.project.label }}{{ openai_form.project() }}</label>
@@ -42,9 +52,14 @@
   </form>
 
   <h2>OpenRouter</h2>
+  {% if view.inference_key_masks.openrouter %}
+    <p class="secret-hint">Gespeicherter Schlüssel: <code class="secret-mask">{{ view.inference_key_masks.openrouter }}</code></p>
+  {% else %}
+    <p class="secret-hint">Kein OpenRouter-Schlüssel gespeichert.</p>
+  {% endif %}
   <form method="post" action="{{ url_for('admin.save_openrouter_connection') }}" class="stack">
     {{ openrouter_form.csrf_token }}
-    <label>{{ openrouter_form.api_key.label }}{{ openrouter_form.api_key() }}</label>
+    <label>{{ openrouter_form.api_key.label }}{{ openrouter_form.api_key(placeholder="Leer lassen, um den gespeicherten Schlüssel zu behalten") }}</label>
     <label>{{ openrouter_form.default_model.label }}{{ openrouter_form.default_model() }}</label>
     <button type="submit">OpenRouter speichern</button>
   </form>

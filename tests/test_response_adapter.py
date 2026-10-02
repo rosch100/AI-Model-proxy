@@ -95,6 +95,43 @@ def _azure_messages(app, events, mode="mdthinkblocks"):
     return _messages_from_response(adapter.response_adapter.adapt(upstream))
 
 
+def test_response_adapter_yields_each_delta_before_reading_next_upstream_chunk(app):
+    """Yield visible output immediately instead of draining the whole SSE body."""
+    app.config["REASONING_DISPLAY_MODE"] = "mdthinkblocks"
+    adapter = AzureAdapter()
+    adapter.inbound_model = "gpt-5.4"
+    adapter.include_usage = False
+    adapter.response_adapter._reasoning_open = False
+    adapter.response_adapter._reasoning_pending_whitespace = ""
+    adapter.response_adapter._tool_calls = 0
+    adapter.response_adapter._usage = None
+    adapter.response_adapter._chat_completion_id = "chatcmpl-test"
+    upstream_advanced = False
+
+    def upstream_chunks():
+        nonlocal upstream_advanced
+        yield _sse(
+            "response.output_text.delta",
+            {"type": "response.output_text.delta", "delta": "first"},
+        )
+        upstream_advanced = True
+        yield _sse(
+            "response.output_text.delta",
+            {"type": "response.output_text.delta", "delta": "second"},
+        )
+
+    stream = adapter.response_adapter._adapt_stream(
+        _FakeUpstreamResponse(upstream_chunks()), None
+    )
+    try:
+        first_chunk = next(stream)
+    finally:
+        stream.close()
+
+    assert first_chunk["choices"][0]["delta"]["content"] == "first"
+    assert upstream_advanced is False
+
+
 def test_response_adapter_emits_usage_chunk(app):
     """Emit a terminal usage chunk when Azure reports final token usage."""
     adapter = AzureAdapter()

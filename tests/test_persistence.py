@@ -76,6 +76,33 @@ def test_postgresql_downgrade_removes_all_migration_functions(monkeypatch):
     assert "DROP FUNCTION IF EXISTS validate_provider_scope_binding()" in generated_sql
 
 
+def test_openrouter_workspace_migration_updates_postgresql_binding_validator(
+    monkeypatch,
+):
+    """Upgrade migration accepts workspace scopes in PostgreSQL validator."""
+    project_root = Path(__file__).resolve().parents[1]
+    monkeypatch.setenv(
+        "DATABASE_URL", "postgresql+psycopg://user:password@localhost/proxy"
+    )
+    output = StringIO()
+    config = Config(str(project_root / "alembic.ini"), output_buffer=output)
+    config.set_main_option("script_location", str(project_root / "migrations"))
+
+    command.upgrade(config, "head", sql=True)
+
+    generated_sql = output.getvalue()
+    assert (
+        "CREATE OR REPLACE FUNCTION validate_provider_scope_binding()" in generated_sql
+    )
+    assert (
+        "IF scope_kind <> 'workspace' OR parent_node IS NOT NULL"
+        " OR NEW.parent_binding_id IS NOT NULL THEN"
+    ) in generated_sql
+    assert "NEW.created_at = OLD.created_at" in generated_sql
+    assert "AND NOT EXISTS" in generated_sql
+    assert "JOIN cost_refresh_jobs j ON j.binding_id = b.id" in generated_sql
+
+
 def test_persistence_schema_creates_on_sqlite_for_portable_constraint_checks():
     """Persistence metadata is consistent for unit-level schema checks."""
     engine = create_engine("sqlite:///:memory:")

@@ -1,6 +1,7 @@
 """Tests for click commands defined in the application."""
 
 import re
+from datetime import datetime
 
 import click
 import pytest
@@ -17,6 +18,7 @@ from app.persistence.models import (
     AdminAccount,
     AuditEvent,
     Base,
+    CostRefreshJob,
     ProviderProfile,
     ProviderScopeBinding,
     ProviderScopeNode,
@@ -286,7 +288,7 @@ def test_tenants_bind_scope_creates_exclusive_bindings_and_audit(provider):
                 "resourceGroups/acme-rg/providers/Microsoft.CognitiveServices/"
                 "accounts/acme-ai\n"
                 if provider == "azure"
-                else "shared-account\n"
+                else "550e8400-e29b-41d4-a716-446655440000\n"
             )
             + "yes\n"
         ),
@@ -316,8 +318,150 @@ def test_tenants_bind_scope_creates_exclusive_bindings_and_audit(provider):
             )
             assert usage_binding.parent_binding_id == billing_binding.id
         else:
-            assert nodes[0].scope_type == "account"
+            assert nodes[0].scope_type == "workspace"
         assert events[0].action == "billing_scope.bind"
+    engine.dispose()
+
+
+def test_tenants_bind_openrouter_workspace_migrates_existing_account_binding():
+    """Rebind an existing account scope to the required workspace UUID."""
+    app = Flask("tenant-scope-test")
+    app.cli.add_command(tenant_commands)
+    engine = create_engine("sqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    app.extensions["database"] = Database(
+        engine=engine,
+        sessions=sessionmaker(bind=engine, expire_on_commit=False),
+        secret_cipher=SecretCipher.from_key(
+            "a2tra2tra2tra2tra2tra2tra2tra2tra2tra2tra2s="
+        ),
+    )
+    with Session(engine) as session:
+        tenant = Tenant(id="acme", api_key_hash="a" * 64, custom_model_id="tenant-acme")
+        profile = ProviderProfile(
+            id="profile-acme", tenant_id="acme", provider="openrouter", settings={}
+        )
+        account = ProviderScopeNode(
+            id="account-node",
+            tenant_id="acme",
+            provider="openrouter",
+            scope_type="account",
+            canonical_scope_id="legacy-account-id",
+        )
+        session.add_all((tenant, profile, account))
+        session.flush()
+        session.add(
+            ProviderScopeBinding(
+                id="billing-binding",
+                tenant_id="acme",
+                provider="openrouter",
+                profile_id=profile.id,
+                purpose="billing",
+                node_id=account.id,
+            )
+        )
+        session.commit()
+
+    result = app.test_cli_runner().invoke(
+        args=["tenants", "bind-billing-scope"],
+        input="acme\nopenrouter\n550e8400-e29b-41d4-a716-446655440000\nyes\n",
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "updated" in result.output.casefold()
+    with Session(engine) as session:
+        nodes = session.scalars(select(ProviderScopeNode)).all()
+        bindings = session.scalars(select(ProviderScopeBinding)).all()
+        events = session.scalars(select(AuditEvent)).all()
+        assert len(nodes) == 1
+        assert nodes[0].scope_type == "workspace"
+        assert nodes[0].canonical_scope_id == "550e8400-e29b-41d4-a716-446655440000"
+        assert len(bindings) == 1
+        assert bindings[0].node_id == nodes[0].id
+        assert events[0].action == "billing_scope.rebind"
+        assert events[0].details == {
+            "provider": "openrouter",
+            "purpose": "billing",
+            "previous_scope_type": "account",
+            "previous_scope_id": "legacy-account-id",
+            "new_scope_type": "workspace",
+            "new_scope_id": "550e8400-e29b-41d4-a716-446655440000",
+        }
+    engine.dispose()
+
+
+@pytest.mark.parametrize(
+    ("job_status", "should_rebind"),
+    [("failed", True), ("unavailable", True), ("running", False), ("success", False)],
+)
+def test_tenants_bind_openrouter_workspace_respects_refresh_history(
+    job_status, should_rebind
+):
+    """Rebind only when no active or successful refresh exists."""
+    app = Flask("tenant-scope-test")
+    app.cli.add_command(tenant_commands)
+    engine = create_engine("sqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    app.extensions["database"] = Database(
+        engine=engine,
+        sessions=sessionmaker(bind=engine, expire_on_commit=False),
+        secret_cipher=SecretCipher.from_key(
+            "a2tra2tra2tra2tra2tra2tra2tra2tra2tra2tra2s="
+        ),
+    )
+    with Session(engine) as session:
+        tenant = Tenant(id="acme", api_key_hash="a" * 64, custom_model_id="tenant-acme")
+        profile = ProviderProfile(
+            id="profile-acme", tenant_id="acme", provider="openrouter", settings={}
+        )
+        account = ProviderScopeNode(
+            id="account-node",
+            tenant_id="acme",
+            provider="openrouter",
+            scope_type="account",
+            canonical_scope_id="legacy-account-id",
+        )
+        session.add_all((tenant, profile, account))
+        session.flush()
+        binding = ProviderScopeBinding(
+            id="billing-binding",
+            tenant_id="acme",
+            provider="openrouter",
+            profile_id=profile.id,
+            purpose="billing",
+            node_id=account.id,
+        )
+        session.add(binding)
+        session.flush()
+        session.add(
+            CostRefreshJob(
+                id="historical-job",
+                tenant_id="acme",
+                provider="openrouter",
+                binding_id=binding.id,
+                period_start=datetime(2026, 9, 1),
+                period_end=datetime(2026, 9, 2),
+                source_api="openrouter",
+                operation_key="openrouter:historical",
+                status=job_status,
+            )
+        )
+        session.commit()
+
+    result = app.test_cli_runner().invoke(
+        args=["tenants", "bind-billing-scope"],
+        input="acme\nopenrouter\n550e8400-e29b-41d4-a716-446655440000\nyes\n",
+    )
+
+    assert (result.exit_code == 0) is should_rebind, result.output
+    with Session(engine) as session:
+        node = session.get(ProviderScopeNode, "account-node")
+        assert node.scope_type == ("workspace" if should_rebind else "account")
+        assert node.canonical_scope_id == (
+            "550e8400-e29b-41d4-a716-446655440000"
+            if should_rebind
+            else "legacy-account-id"
+        )
     engine.dispose()
 
 
@@ -357,11 +501,11 @@ def test_tenants_bind_scope_rejects_a_scope_owned_by_another_tenant():
 
     first = app.test_cli_runner().invoke(
         args=["tenants", "bind-billing-scope"],
-        input="acme\nopenrouter\nshared-account\nyes\n",
+        input=("acme\nopenrouter\n550e8400-e29b-41d4-a716-446655440000\nyes\n"),
     )
     second = app.test_cli_runner().invoke(
         args=["tenants", "bind-billing-scope"],
-        input="beta\nopenrouter\nshared-account\nyes\n",
+        input=("beta\nopenrouter\n550e8400-e29b-41d4-a716-446655440000\nyes\n"),
     )
 
     assert first.exit_code == 0, first.output
@@ -370,6 +514,42 @@ def test_tenants_bind_scope_rejects_a_scope_owned_by_another_tenant():
     with Session(engine) as session:
         bindings = session.scalars(select(ProviderScopeBinding)).all()
         assert len(bindings) == 1
+    engine.dispose()
+
+
+def test_tenants_bind_scope_rejects_invalid_openrouter_workspace_id():
+    """Require an API-filterable workspace UUID for OpenRouter billing."""
+    app = Flask("tenant-scope-test")
+    app.cli.add_command(tenant_commands)
+    engine = create_engine("sqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    app.extensions["database"] = Database(
+        engine=engine,
+        sessions=sessionmaker(bind=engine, expire_on_commit=False),
+        secret_cipher=SecretCipher.from_key(
+            "a2tra2tra2tra2tra2tra2tra2tra2tra2tra2tra2s="
+        ),
+    )
+    with Session(engine) as session:
+        session.add(
+            Tenant(id="acme", api_key_hash="a" * 64, custom_model_id="tenant-acme")
+        )
+        session.add(
+            ProviderProfile(
+                id="profile-acme", tenant_id="acme", provider="openrouter", settings={}
+            )
+        )
+        session.commit()
+
+    result = app.test_cli_runner().invoke(
+        args=["tenants", "bind-billing-scope"],
+        input="acme\nopenrouter\nnot-a-workspace\n",
+    )
+
+    assert result.exit_code != 0
+    assert "workspace ID must be a UUID" in result.output
+    with Session(engine) as session:
+        assert session.scalar(select(ProviderScopeBinding)) is None
     engine.dispose()
 
 
@@ -399,7 +579,7 @@ def test_tenants_bind_billing_scope_requires_exclusivity_confirmation():
 
     result = app.test_cli_runner().invoke(
         args=["tenants", "bind-billing-scope"],
-        input="acme\nopenrouter\naccount-id\nno\n",
+        input="acme\nopenrouter\n550e8400-e29b-41d4-a716-446655440000\nno\n",
     )
 
     assert result.exit_code != 0

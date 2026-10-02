@@ -24,7 +24,9 @@
         Klartext anzeigen
       </label>
     </div>
-    <label>{{ azure_form.default_model.label }}{{ azure_form.default_model() }}</label>
+    <label for="azure-default-model">Standardmodell *</label>
+    {{ azure_form.default_model(id="azure-default-model") }}
+    <p id="azure-model-hint" class="hint">Wähle ein Modell aus dem zuletzt geladenen Azure-Katalog.</p>
     {% if view.selectable_models.azure %}
       <div class="model-catalog">
         <h3>Wählbare Modelle (automatisch aus Katalog)</h3>
@@ -65,7 +67,9 @@
         Klartext anzeigen
       </label>
     </div>
-    <label>{{ openai_form.default_model.label }}{{ openai_form.default_model() }}</label>
+    <label for="openai-default-model">Standardmodell *</label>
+    {{ openai_form.default_model(id="openai-default-model") }}
+    <p id="openai-model-hint" class="hint">Wähle ein Modell aus dem zuletzt geladenen OpenAI-Katalog.</p>
     <label>{{ openai_form.organization.label }}{{ openai_form.organization() }}</label>
     <label>{{ openai_form.project.label }}{{ openai_form.project() }}</label>
     {% if view.selectable_models.openai %}
@@ -99,7 +103,9 @@
         Klartext anzeigen
       </label>
     </div>
-    <label>{{ openrouter_form.default_model.label }}{{ openrouter_form.default_model() }}</label>
+    <label for="openrouter-default-model">Standardmodell *</label>
+    {{ openrouter_form.default_model(id="openrouter-default-model") }}
+    <p id="openrouter-model-hint" class="hint">Wähle ein Modell aus dem zuletzt geladenen OpenRouter-Katalog.</p>
     {% if view.selectable_models.openrouter %}
       <div class="model-catalog">
         <h3>Wählbare Modelle ({{ view.selectable_models.openrouter|length }} aus Katalog)</h3>

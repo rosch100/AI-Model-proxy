@@ -4,7 +4,7 @@
 {% block content %}
 <section>
   <h1>Kosten</h1>
-  <p class="lede">Abrechnung nur für gebundenen Scope; Azure-Scope ist schreibgeschützt.</p>
+  <p class="lede">Abrechnungs- und Nutzungsdaten hängen von den Rechten und Filtermöglichkeiten des jeweiligen Anbieter-Endpunkts ab.</p>
   {% if view.bindings %}
     <ul>
       {% for binding, node in view.bindings %}
@@ -15,7 +15,16 @@
     <p>Kein Billing-Scope gebunden.</p>
   {% endif %}
 
-  <h2>Billing-Schlüssel (OpenAI / OpenRouter)</h2>
+  <h2>Zugang zur Abrechnungs-API</h2>
+  <p>Es gibt keinen providerübergreifenden „Billing-Key“. Der Zugang muss zum Anbieter und zum operatorseitig gebundenen Scope passen:</p>
+  <ul>
+    <li><strong>OpenAI:</strong> Admin API Key mit Organisationsrechten, nicht der normale Inference-Key. Der Abruf liefert Kosten und Input-/Output-Tokens für das gebundene Projekt.</li>
+    <li><strong>OpenRouter:</strong> Management Key, nicht der normale Inference-Key. Die Activity-API liefert OpenRouter-Guthabenverbrauch und BYOK-Kosten getrennt sowie Prompt-, Completion- und Reasoning-Tokens je Modell/Endpoint für die letzten 30 abgeschlossenen UTC-Tage. Sie bietet keinen frei wählbaren Zeitraum. Die Bindung muss eine Workspace-ID enthalten; sie wird als Filter verwendet und muss zu dem Konto des Management Keys gehören.</li>
+    <li><strong>Azure:</strong> Ein Azure-API-Key reicht nicht. Kosten benötigen eine Microsoft-Entra-Service-Principal- oder Managed-Identity mit Cost Management Reader am Resource-Group-Scope. Token-Usage muss separat über Azure Monitor mit Monitoring Reader auf der Cognitive-Services-Ressource abgefragt werden. Dieser Entra-Zugang ist in der Admin-Oberfläche derzeit nicht eingerichtet.</li>
+  </ul>
+  <p class="hint">Ein Schlüssel allein reicht nicht: nötig sind anbieterspezifische Rechte, API-Endpunkte und passende Scopes. Inference-Keys erlauben üblicherweise keine Billing-Abfragen. Derzeit liefern OpenAI und OpenRouter Kosten und Tokenverbrauch; Azure-Kosten und -Tokens sind hier noch nicht integriert.</p>
+
+  <h3>OpenAI- und OpenRouter-Zugangsdaten</h3>
   <ul class="secret-list">
     <li>OpenAI:
       {% if view.billing_key_masks.openai %}
@@ -35,18 +44,20 @@
   <form method="post" action="{{ url_for('admin.save_billing') }}" class="stack">
     {{ billing_form.csrf_token }}
     <label>{{ billing_form.provider.label }}{{ billing_form.provider() }}</label>
-    <label>{{ billing_form.billing_secret.label }}{{ billing_form.billing_secret() }}</label>
-    <button type="submit">Schlüssel speichern</button>
+    <label>{{ billing_form.billing_secret.label }}{{ billing_form.billing_secret(autocomplete="off") }}</label>
+    <p class="hint">Je nach Auswahl: OpenAI Admin API Key oder OpenRouter Management Key. Für OpenRouter muss die operatorseitige Billing-Bindung die Workspace-ID dieses Management-Key-Kontos enthalten.</p>
+    <button type="submit">Zugangsdaten speichern</button>
   </form>
 
   <h2>Aktualisieren</h2>
-  {% for provider in ["azure", "openai", "openrouter"] %}
+  {% for provider in ["openai", "openrouter"] %}
     <form method="post" action="{{ url_for('admin.refresh_costs') }}">
       {{ billing_form.csrf_token }}
       <input type="hidden" name="provider" value="{{ provider }}" />
       <button type="submit">{{ provider }} aktualisieren</button>
     </form>
   {% endfor %}
+  <p class="hint">Azure-Kosten und Azure-Tokenverbrauch sind hier noch nicht abrufbar. Azure aktualisieren ist daher nicht verfügbar.</p>
 
   {% if view.jobs %}
     <h2>Letzte Jobs</h2>

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 import secrets
 
 from app.admin.security import ADMIN_COOKIE_NAME, mask_secret
@@ -38,10 +39,8 @@ def test_selectable_azure_catalog_keeps_supported_models_only():
     }
 
 
-def test_connection_page_puts_secret_in_password_field(admin_app):
-    """Stored keys fill a password input with a Klartext reveal control."""
+def _authenticated_admin_client(admin_app):
     database = admin_app.extensions["database"]
-    full_key = "azure-secret-key-value-xyz9"
     with database.sessions.begin() as session:
         account = authenticate_admin(session, "ada", "correct-horse-battery")
         insert_passkey(
@@ -55,6 +54,18 @@ def test_connection_page_puts_secret_in_password_field(admin_app):
             aaguid=None,
             backed_up=False,
         )
+        principal = create_admin_session(session, account, enrollment_only=False)
+
+    client = admin_app.test_client()
+    client.set_cookie(ADMIN_COOKIE_NAME, principal.token, path="/admin")
+    return client
+
+
+def test_connection_page_puts_secret_in_password_field(admin_app):
+    """Stored keys fill a password input with a Klartext reveal control."""
+    database = admin_app.extensions["database"]
+    full_key = "azure-secret-key-value-xyz9"
+    with database.sessions.begin() as session:
         profile = upsert_provider_profile(
             session,
             database.secret_cipher,
@@ -74,10 +85,8 @@ def test_connection_page_puts_secret_in_password_field(admin_app):
             [("gpt-6-astra", "gpt-6-astra"), ("gpt-6-luna", "gpt-6-luna")],
             None,
         )
-        principal = create_admin_session(session, account, enrollment_only=False)
 
-    client = admin_app.test_client()
-    client.set_cookie(ADMIN_COOKIE_NAME, principal.token, path="/admin")
+    client = _authenticated_admin_client(admin_app)
     response = client.get("/admin/settings/connection")
     body = response.get_data(as_text=True)
     assert response.status_code == 200
@@ -87,6 +96,42 @@ def test_connection_page_puts_secret_in_password_field(admin_app):
     assert 'data-reveal-secret="azure-api-key"' in body
     assert "Klartext anzeigen" in body
     assert "Wählbare Modelle" in body
-    assert "gpt-6-astra" in body
+    azure_select = re.search(
+        r'<select(?=[^>]*id="azure-default-model")[^>]*>.*?</select>', body
+    )
+    assert azure_select is not None
+    assert 'name="default_model"' in azure_select.group()
+    assert re.search(
+        r'<option[^>]*value="gpt-6-astra">gpt-6-astra</option>',
+        azure_select.group(),
+    )
+    assert re.search(
+        r'<option[^>]*value="gpt-6-luna">gpt-6-luna</option>',
+        azure_select.group(),
+    )
+    assert 'for="azure-default-model"' in body
+    assert 'aria-describedby="azure-model-hint"' in azure_select.group()
+    assert re.search(r'<select(?=[^>]*id="openai-default-model")', body)
+    assert re.search(r'<select(?=[^>]*id="openrouter-default-model")', body)
+    assert len(re.findall(r'<select(?=[^>]*id="[^"]*-default-model")', body)) == 3
     assert "Modell-Deployments" not in body
     assert "Pflichtfelder sind mit" in body
+
+
+def test_costs_page_explains_provider_specific_credentials_and_limits(admin_app):
+    """Provider-specific billing requirements are visible in the admin UI."""
+    client = _authenticated_admin_client(admin_app)
+    response = client.get("/admin/settings/costs")
+    body = response.get_data(as_text=True)
+
+    assert response.status_code == 200
+    assert "Es gibt keinen providerübergreifenden „Billing-Key“." in body
+    assert "Admin API Key" in body
+    assert "Management Key" in body
+    assert "Workspace-ID enthalten" in body
+    assert "als Filter verwendet" in body
+    assert "Azure-API-Key reicht nicht" in body
+    assert "letzten 30 abgeschlossenen UTC-Tage" in body
+    assert "OpenRouter-Guthabenverbrauch und BYOK-Kosten getrennt" in body
+    assert "Prompt-, Completion- und Reasoning-Tokens" in body
+    assert "Kosten und Tokenverbrauch" in body

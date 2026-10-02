@@ -50,6 +50,7 @@ class AzureConnectionForm(FlaskForm):
         validators=[DataRequired(message="Standardmodell ist erforderlich.")],
         choices=[],
         validate_choice=True,
+        render_kw={"aria-describedby": "azure-model-hint"},
     )
 
 
@@ -62,6 +63,7 @@ class OpenAIConnectionForm(FlaskForm):
         validators=[DataRequired(message="Standardmodell ist erforderlich.")],
         choices=[],
         validate_choice=True,
+        render_kw={"aria-describedby": "openai-model-hint"},
     )
     organization = StringField("Organisation (optional)", validators=[Optional()])
     project = StringField("Projekt (optional)", validators=[Optional()])
@@ -78,6 +80,7 @@ class OpenRouterConnectionForm(FlaskForm):
         validators=[DataRequired(message="Standardmodell ist erforderlich.")],
         choices=[],
         validate_choice=True,
+        render_kw={"aria-describedby": "openrouter-model-hint"},
     )
 
 
@@ -103,4 +106,6 @@ class BillingCredentialsForm(FlaskForm):
         choices=[("openai", "OpenAI"), ("openrouter", "OpenRouter")],
         validators=[DataRequired()],
     )
-    billing_secret = PasswordField("Billing-Schlüssel *", validators=[Optional()])
+    billing_secret = PasswordField(
+        "Provider-Schlüssel mit Billing-Rechten *", validators=[Optional()]
+    )

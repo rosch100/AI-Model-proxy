@@ -103,8 +103,8 @@ from app.providers.catalog import (
 )
 from app.providers.cost_jobs import (
     collect_provider_costs,
-    load_billing_binding,
     persist_cost_refresh,
+    start_cost_refresh,
 )
 from app.providers.costs import CostRefreshError
 
@@ -689,19 +689,21 @@ def refresh_costs():
     """Refresh provider costs; provider I/O stays outside the write transaction."""
     provider = request.form.get("provider", "")
     database = _database()
-    end = datetime.now(timezone.utc)
+    end = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
     start = end - timedelta(days=30)
-    with database.sessions() as session:
-        try:
-            profile, binding, node = load_billing_binding(
-                session, g.admin.tenant_id, provider
+    try:
+        with database.sessions.begin() as session:
+            profile, binding, node, job = start_cost_refresh(
+                session, g.admin.tenant_id, provider, start, end
             )
-        except LookupError as exc:
-            flash(str(exc), "error")
-            return redirect(url_for("admin.settings_costs"))
-        profile_id = profile.id
-        binding_id = binding.id
-        canonical_scope_id = node.canonical_scope_id
+            profile_id = profile.id
+            binding_id = binding.id
+            job_id = job.id
+            canonical_scope_id = node.canonical_scope_id
+    except LookupError as exc:
+        flash(str(exc), "error")
+        return redirect(url_for("admin.settings_costs"))
+
     with database.sessions() as session:
         profile = session.get(ProviderProfile, profile_id)
         try:
@@ -715,21 +717,27 @@ def refresh_costs():
     with database.sessions.begin() as session:
         profile = session.get(ProviderProfile, profile_id)
         binding = session.get(ProviderScopeBinding, binding_id)
-        persist_cost_refresh(
+        job = session.get(CostRefreshJob, job_id)
+        persisted_job = persist_cost_refresh(
             session,
             g.admin.tenant_id,
             g.admin.username,
             profile,
             binding,
-            start,
-            end,
+            job,
             buckets,
             error,
         )
-    flash(
-        "Kosten aktualisiert." if error is None else str(error),
-        "info" if error is None else "error",
-    )
+    if persisted_job is None:
+        flash(
+            "Der Refresh ist abgelaufen; das verspätete Ergebnis wurde verworfen.",
+            "error",
+        )
+    else:
+        flash(
+            "Kosten aktualisiert." if error is None else str(error),
+            "info" if error is None else "error",
+        )
     return redirect(url_for("admin.settings_costs"))
 
 

@@ -9,6 +9,11 @@ class CatalogRefreshError(Exception):
     """Raised when a provider catalog cannot be retrieved."""
 
 
+# Azure OpenAI data-plane listing of deployments is only served on the
+# legacy deployments API version. Newer api-version values return HTTP 404.
+AZURE_DEPLOYMENTS_API_VERSION = "2022-12-01"
+
+
 def refresh_provider_catalog(
     provider: str, settings: dict[str, object], inference_secret: str
 ) -> list[tuple[str, str | None]]:
@@ -28,7 +33,10 @@ def _refresh_azure(
     base_url = settings.get("base_url")
     if not isinstance(base_url, str) or not base_url:
         raise CatalogRefreshError("Azure base URL is missing.")
-    url = f"{base_url.rstrip('/')}/openai/deployments?api-version=2024-10-21"
+    url = (
+        f"{base_url.rstrip('/')}/openai/deployments"
+        f"?api-version={AZURE_DEPLOYMENTS_API_VERSION}"
+    )
     response = requests.get(url, headers={"api-key": api_key}, timeout=30)
     if response.status_code >= 400:
         raise CatalogRefreshError(f"Azure catalog HTTP {response.status_code}")

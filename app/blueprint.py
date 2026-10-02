@@ -76,6 +76,8 @@ def _azure_model_ids() -> list[str]:
     """Return Cursor-facing Azure model ids for the authenticated principal."""
     tenant = current_tenant()
     if isinstance(tenant, DatabaseTenantSnapshot):
+        if tenant.profile_id is None or tenant.profile_deleted:
+            return []
         return [tenant.custom_model_id]
     if tenant is not None:
         return list(tenant.azure_model_deployments)
@@ -115,6 +117,14 @@ def catch_all(path: str):
         return CodexAdapter().forward(request, provider_path)
     tenant = current_tenant()
     if isinstance(tenant, DatabaseTenantSnapshot):
+        if tenant.profile_id is None:
+            raise ServiceConfigurationError(
+                "No active provider profile is configured for this tenant."
+            )
+        if tenant.profile_deleted:
+            raise ServiceConfigurationError(
+                "The active provider profile has been removed."
+            )
         if tenant.provider in {"openai", "openrouter"}:
             return forward_openai_compatible(request, tenant)
         if tenant.provider is None:
@@ -125,7 +135,10 @@ def catch_all(path: str):
             raise ServiceConfigurationError(
                 f"Unsupported active provider {tenant.provider!r}."
             )
-    return AzureAdapter().forward(request)
+    azure_adapter = AzureAdapter()
+    if isinstance(tenant, DatabaseTenantSnapshot):
+        return azure_adapter.forward(request, tenant)
+    return azure_adapter.forward(request)
 
 
 # ── Model list ──────────────────────────────────────────────────────────────

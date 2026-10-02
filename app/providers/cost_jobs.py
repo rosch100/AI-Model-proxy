@@ -27,31 +27,55 @@ from app.providers.costs import (
 )
 
 
-def load_billing_binding(
-    session: Session, tenant_id: str, provider: str
-) -> tuple[ProviderProfile, ProviderScopeBinding, ProviderScopeNode]:
-    """Return the exclusive billing binding for a tenant provider."""
+def load_billing_binding(session: Session, tenant_id: str, profile_id: str) -> tuple[
+    ProviderProfile,
+    ProviderScopeBinding,
+    ProviderScopeNode,
+    ProviderScopeNode | None,
+]:
+    """Return one account's billing scope and optional Azure usage resource."""
     profile = session.scalar(
         select(ProviderProfile).where(
             ProviderProfile.tenant_id == tenant_id,
-            ProviderProfile.provider == provider,
+            ProviderProfile.id == profile_id,
+            ProviderProfile.deleted_at.is_(None),
         )
     )
     if profile is None:
-        raise LookupError(f"No {provider} profile is configured")
+        raise LookupError("Provider account was not found")
     binding = session.scalar(
         select(ProviderScopeBinding).where(
             ProviderScopeBinding.tenant_id == tenant_id,
-            ProviderScopeBinding.provider == provider,
+            ProviderScopeBinding.profile_id == profile.id,
+            ProviderScopeBinding.provider == profile.provider,
             ProviderScopeBinding.purpose == "billing",
         )
     )
     if binding is None:
-        raise LookupError(f"No {provider} billing scope is bound")
+        raise LookupError(f"No billing scope is bound to {profile.display_name}")
     node = session.get(ProviderScopeNode, binding.node_id)
     if node is None:
-        raise LookupError(f"No {provider} billing scope node is bound")
-    return profile, binding, node
+        raise LookupError(f"No {profile.provider} billing scope node is bound")
+    usage_node = None
+    if profile.provider == "azure":
+        usage_binding = session.scalar(
+            select(ProviderScopeBinding).where(
+                ProviderScopeBinding.tenant_id == tenant_id,
+                ProviderScopeBinding.profile_id == profile.id,
+                ProviderScopeBinding.provider == profile.provider,
+                ProviderScopeBinding.purpose == "usage",
+            )
+        )
+        if usage_binding is None:
+            raise LookupError(
+                f"No Azure usage resource is bound to {profile.display_name}"
+            )
+        usage_node = session.get(ProviderScopeNode, usage_binding.node_id)
+        if usage_node is None:
+            raise LookupError(
+                f"No Azure usage resource is bound to {profile.display_name}"
+            )
+    return profile, binding, node, usage_node
 
 
 def collect_provider_costs(
@@ -60,21 +84,21 @@ def collect_provider_costs(
     canonical_scope_id: str,
     start: datetime,
     end: datetime,
+    *,
+    usage_scope_id: str | None = None,
 ) -> list[CostBucket]:
     """Call the provider billing API using decrypted credentials."""
-    secret = None
-    if profile.billing_secret_ciphertext:
-        secret = cipher.decrypt(profile.billing_secret_ciphertext)
-    elif profile.inference_secret_ciphertext:
-        secret = cipher.decrypt(profile.inference_secret_ciphertext)
-    if not secret:
+    if not profile.billing_secret_ciphertext:
         raise CostRefreshError("Billing credentials are missing.")
+    secret = cipher.decrypt(profile.billing_secret_ciphertext)
     if profile.provider == "openai":
         return fetch_openai_costs(secret, canonical_scope_id, start, end)
     if profile.provider == "openrouter":
         return fetch_openrouter_costs(secret, start, end)
     if profile.provider == "azure":
-        return fetch_azure_costs(secret, canonical_scope_id, start, end)
+        if usage_scope_id is None:
+            raise CostRefreshError("Azure usage resource is missing.")
+        return fetch_azure_costs(secret, canonical_scope_id, usage_scope_id, start, end)
     raise CostRefreshError(f"Unsupported provider {profile.provider!r}")
 
 
@@ -100,7 +124,7 @@ def persist_cost_refresh(
         period_start=start,
         period_end=end,
         source_api=profile.provider,
-        operation_key=f"{profile.provider}:{now.isoformat()}",
+        operation_key=f"{profile.id}:{binding.id}:{now.isoformat()}",
         status=status,
         retry_at=None,
         limitation=str(error) if error is not None else None,
@@ -140,10 +164,14 @@ def persist_cost_refresh(
         AuditEvent(
             tenant_id=tenant_id,
             actor_id=actor_id,
-            target=f"costs:{profile.provider}",
+            target=f"costs:{profile.id}",
             action="costs.refresh",
             outcome=status,
-            details={"provider": profile.provider, "job_id": job.id},
+            details={
+                "provider": profile.provider,
+                "profile_id": profile.id,
+                "job_id": job.id,
+            },
         )
     )
     return job

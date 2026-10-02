@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import unicodedata
 from datetime import datetime
 from decimal import Decimal
 
@@ -17,9 +18,20 @@ from sqlalchemy import (
     Numeric,
     String,
     UniqueConstraint,
+    column,
+    event,
     func,
+    text,
 )
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
+
+
+def provider_profile_name_key(display_name: str) -> str:
+    """Return the normalized, case-insensitive key used for profile names."""
+    key = unicodedata.normalize("NFKC", display_name).casefold()
+    if len(key) > 384:
+        raise ValueError("Normalized account name must be at most 384 characters")
+    return key
 
 
 class Base(DeclarativeBase):
@@ -75,7 +87,6 @@ class ProviderProfile(Base):
 
     __tablename__ = "provider_profiles"
     __table_args__ = (
-        UniqueConstraint("tenant_id", "provider", name="uq_profile_tenant_provider"),
         UniqueConstraint(
             "tenant_id", "provider", "id", name="uq_profile_tenant_provider_id"
         ),
@@ -84,11 +95,34 @@ class ProviderProfile(Base):
             "provider IN ('azure', 'openai', 'openrouter')",
             name="ck_profile_provider",
         ),
+        CheckConstraint(
+            "history_generation >= 0", name="ck_profile_history_generation"
+        ),
+        Index(
+            "uq_profile_active_name",
+            "tenant_id",
+            "provider",
+            column("display_name_key"),
+            unique=True,
+            postgresql_where=text("deleted_at IS NULL"),
+            sqlite_where=text("deleted_at IS NULL"),
+        ),
     )
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True)
     tenant_id: Mapped[str] = mapped_column(ForeignKey("tenants.id"), nullable=False)
     provider: Mapped[str] = mapped_column(String(16), nullable=False)
+    display_name: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    display_name_key: Mapped[str | None] = mapped_column(String(384), nullable=True)
+    deleted_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    history_generation: Mapped[int] = mapped_column(
+        nullable=False, default=0, server_default="0"
+    )
+    catalog_generation: Mapped[int] = mapped_column(
+        nullable=False, default=0, server_default="0"
+    )
     settings: Mapped[dict[str, object]] = mapped_column(JSON, nullable=False)
     inference_secret_ciphertext: Mapped[str | None] = mapped_column(
         String, nullable=True
@@ -101,6 +135,16 @@ class ProviderProfile(Base):
     catalog_error: Mapped[str | None] = mapped_column(String(512), nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+
+
+@event.listens_for(ProviderProfile, "before_insert")
+@event.listens_for(ProviderProfile, "before_update")
+def _ensure_profile_name_key(_mapper, _connection, profile: ProviderProfile) -> None:
+    profile.display_name_key = (
+        provider_profile_name_key(profile.display_name)
+        if profile.display_name is not None
+        else None
     )
 
 
@@ -169,9 +213,7 @@ class ProviderScopeBinding(Base):
         UniqueConstraint(
             "profile_id", "provider", "purpose", name="uq_binding_profile_purpose"
         ),
-        UniqueConstraint(
-            "tenant_id", "provider", "purpose", name="uq_binding_tenant_purpose"
-        ),
+        UniqueConstraint("node_id", name="uq_binding_node_id"),
         UniqueConstraint(
             "tenant_id", "provider", "id", name="uq_binding_tenant_provider_id"
         ),

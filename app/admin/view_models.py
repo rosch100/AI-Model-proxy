@@ -36,16 +36,16 @@ class DashboardView:
 
 @dataclass(frozen=True)
 class ConnectionView:
-    """Editable connection state for every supported provider."""
+    """Provider accounts grouped for the connection settings page."""
 
     tenant_id: str
-    azure: ProviderProfile | None
-    openai: ProviderProfile | None
-    openrouter: ProviderProfile | None
+    profiles_by_provider: dict[str, tuple[ProviderProfile, ...]]
     catalogs: dict[str, tuple[ProviderCatalogEntry, ...]]
     selectable_models: dict[str, tuple[tuple[str, str | None], ...]]
+    selectable_model_ids: dict[str, tuple[str, ...]]
+    active_profile_id: str | None
+    active_profile_name: str | None
     active_provider: str | None
-    inference_secrets: dict[str, str | None]
 
 
 @dataclass(frozen=True)
@@ -53,7 +53,11 @@ class CostsView:
     """Bound scopes, latest refresh, and recorded cost buckets."""
 
     tenant_id: str
-    bindings: tuple[tuple[ProviderScopeBinding, ProviderScopeNode], ...]
+    profiles: tuple[ProviderProfile, ...]
+    bindings: tuple[
+        tuple[ProviderProfile, ProviderScopeBinding, ProviderScopeNode], ...
+    ]
+    binding_profile_names: dict[str, str]
     jobs: tuple[CostRefreshJob, ...]
     records: tuple[CostUsageRecord, ...]
     billing_key_masks: dict[str, str | None]

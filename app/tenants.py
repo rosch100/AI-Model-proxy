@@ -50,6 +50,10 @@ class DatabaseTenantSnapshot:
     provider_settings: Mapping[str, Any]
     inference_secret: str | None
     default_model: str | None
+    profile_id: str | None = None
+    profile_name: str | None = None
+    history_generation: int | None = None
+    profile_deleted: bool = False
 
     @property
     def azure_base_url(self) -> str | None:

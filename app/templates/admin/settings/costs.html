@@ -4,55 +4,52 @@
 {% block content %}
 <section>
   <h1>Kosten</h1>
-  <p class="lede">Abrechnung nur für gebundenen Scope; Azure-Scope ist schreibgeschützt.</p>
+  <p class="lede">Abrechnung pro Account und ausschließlich für dessen gebundenen Scope.</p>
   {% if view.bindings %}
     <ul>
-      {% for binding, node in view.bindings %}
-        <li>{{ binding.provider }} / {{ binding.purpose }}: <code>{{ node.canonical_scope_id }}</code></li>
+      {% for profile, binding, node in view.bindings %}
+        <li>{{ profile.display_name }} ({{ profile.provider }}) / {{ binding.purpose }}: <code>{{ node.canonical_scope_id }}</code></li>
       {% endfor %}
     </ul>
   {% else %}
     <p>Kein Billing-Scope gebunden.</p>
   {% endif %}
 
-  <h2>Billing-Schlüssel (OpenAI / OpenRouter)</h2>
-  <ul class="secret-list">
-    <li>OpenAI:
-      {% if view.billing_key_masks.openai %}
-        <code class="secret-mask">{{ view.billing_key_masks.openai }}</code>
-      {% else %}
-        nicht gespeichert
+  <h2>Accounts</h2>
+  {% for profile in view.profiles %}
+    <article>
+      <h3>{{ profile.display_name }} ({{ profile.provider }})</h3>
+      <p>Billing-Schlüssel:
+        {% if view.billing_key_masks[profile.id] %}
+          <code class="secret-mask">{{ view.billing_key_masks[profile.id] }}</code>
+        {% else %}
+          nicht gespeichert
+        {% endif %}
+      </p>
+      {% if profile.provider == "azure" %}
+        <p class="hint">Azure benötigt einen JSON-Service-Principal mit tenant_id, client_id und client_secret sowie Cost-Management-Leserechten am gebundenen Scope.</p>
       {% endif %}
-    </li>
-    <li>OpenRouter:
-      {% if view.billing_key_masks.openrouter %}
-        <code class="secret-mask">{{ view.billing_key_masks.openrouter }}</code>
-      {% else %}
-        nicht gespeichert
+      <form method="post" action="{{ url_for('admin.save_billing') }}" class="stack">
+        {{ billing_form.csrf_token }}
+        <input type="hidden" name="profile_id" value="{{ profile.id }}" />
+        <label>{{ billing_form.billing_secret.label }}{{ billing_form.billing_secret(autocomplete="new-password") }}</label>
+        <button type="submit">Billing-Schlüssel speichern</button>
+      </form>
+      {% if view.billing_key_masks[profile.id] %}
+        <form method="post" action="{{ url_for('admin.refresh_costs') }}">
+          {{ billing_form.csrf_token }}
+          <input type="hidden" name="profile_id" value="{{ profile.id }}" />
+          <button type="submit">Kosten aktualisieren</button>
+        </form>
       {% endif %}
-    </li>
-  </ul>
-  <form method="post" action="{{ url_for('admin.save_billing') }}" class="stack">
-    {{ billing_form.csrf_token }}
-    <label>{{ billing_form.provider.label }}{{ billing_form.provider() }}</label>
-    <label>{{ billing_form.billing_secret.label }}{{ billing_form.billing_secret() }}</label>
-    <button type="submit">Schlüssel speichern</button>
-  </form>
-
-  <h2>Aktualisieren</h2>
-  {% for provider in ["azure", "openai", "openrouter"] %}
-    <form method="post" action="{{ url_for('admin.refresh_costs') }}">
-      {{ billing_form.csrf_token }}
-      <input type="hidden" name="provider" value="{{ provider }}" />
-      <button type="submit">{{ provider }} aktualisieren</button>
-    </form>
+    </article>
   {% endfor %}
 
   {% if view.jobs %}
     <h2>Letzte Jobs</h2>
     <ul>
       {% for job in view.jobs %}
-        <li>{{ job.provider }} — {{ job.status }}{% if job.limitation %} ({{ job.limitation }}){% endif %}</li>
+        <li>{{ view.binding_profile_names.get(job.binding_id, job.provider) }} — {{ job.status }}{% if job.limitation %} ({{ job.limitation }}){% endif %}</li>
       {% endfor %}
     </ul>
   {% endif %}
@@ -60,7 +57,7 @@
     <h2>Datensätze</h2>
     <ul>
       {% for record in view.records %}
-        <li>{{ record.provider }} {{ record.kind }} {{ record.metric }}: {{ record.value }} {{ record.unit }}</li>
+        <li>{{ view.binding_profile_names.get(record.binding_id, record.provider) }} {{ record.kind }} {{ record.metric }}: {{ record.value }} {{ record.unit }}</li>
       {% endfor %}
     </ul>
   {% endif %}

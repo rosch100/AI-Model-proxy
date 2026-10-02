@@ -32,7 +32,18 @@ def run_migrations_offline() -> None:
 
 
 def run_migrations_online() -> None:
-    """Run migrations using the configured PostgreSQL connection pool."""
+    """Run migrations using an injected connection or configured PostgreSQL URL."""
+    connection = config.attributes.get("connection")
+    if connection is not None:
+        context.configure(
+            connection=connection,
+            target_metadata=target_metadata,
+            compare_type=True,
+        )
+        with context.begin_transaction():
+            context.run_migrations()
+        return
+
     url = os.environ.get("DATABASE_URL")
     if not url:
         raise RuntimeError("DATABASE_URL is required to run database migrations")

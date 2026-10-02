@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation
 
 import requests
 
@@ -124,9 +124,13 @@ def fetch_openrouter_costs(
 
 
 def fetch_azure_costs(
-    billing_secret: str, resource_group_id: str, start: datetime, end: datetime
+    billing_secret: str,
+    resource_group_id: str,
+    resource_id: str,
+    start: datetime,
+    end: datetime,
 ) -> list[CostBucket]:
-    """Query Azure Cost Management for the bound resource group scope."""
+    """Query one bound Azure resource within its billing resource group."""
     token = _azure_arm_token(billing_secret)
     url = (
         f"https://management.azure.com{resource_group_id}"
@@ -142,42 +146,98 @@ def fetch_azure_costs(
         "dataset": {
             "granularity": "Daily",
             "aggregation": {
-                "totalCost": {"name": "Cost", "function": "Sum"},
+                "totalCost": {"name": "PreTaxCost", "function": "Sum"},
             },
+            "filter": {
+                "dimensions": {
+                    "name": "ResourceId",
+                    "operator": "In",
+                    "values": [resource_id],
+                }
+            },
+            "grouping": [
+                {"type": "Dimension", "name": "ResourceId"},
+                {"type": "Dimension", "name": "Currency"},
+            ],
         },
     }
-    response = requests.post(
-        url,
-        headers={"Authorization": f"Bearer {token}"},
-        json=body,
-        timeout=60,
-    )
+    try:
+        response = requests.post(
+            url,
+            headers={"Authorization": f"Bearer {token}"},
+            json=body,
+            timeout=60,
+        )
+    except requests.RequestException as exc:
+        raise CostRefreshError("Azure costs request failed.") from exc
     if response.status_code == 429:
         raise CostRefreshError("Azure costs are rate limited.", status="unavailable")
+    if response.status_code == 204:
+        raise CostRefreshError(
+            "Azure costs are not available for this resource.", status="unavailable"
+        )
     if response.status_code >= 400:
         raise CostRefreshError(f"Azure costs HTTP {response.status_code}")
-    payload = response.json()
+    try:
+        payload = response.json()
+    except requests.exceptions.JSONDecodeError as exc:
+        raise CostRefreshError("Azure costs payload is invalid.") from exc
     properties = payload.get("properties") if isinstance(payload, dict) else None
+    columns = properties.get("columns") if isinstance(properties, dict) else None
     rows = properties.get("rows") if isinstance(properties, dict) else None
-    if not isinstance(rows, list):
+    if not isinstance(columns, list) or not isinstance(rows, list):
         raise CostRefreshError("Azure costs payload is invalid.")
-    total = Decimal("0")
+    column_indexes = {
+        column.get("name", "").casefold(): index
+        for index, column in enumerate(columns)
+        if isinstance(column, dict) and isinstance(column.get("name"), str)
+    }
+    cost_index = column_indexes.get("pretaxcost")
+    currency_index = column_indexes.get("currency")
+    resource_index = column_indexes.get("resourceid")
+    if cost_index is None or currency_index is None or resource_index is None:
+        raise CostRefreshError(
+            "Azure costs payload is missing cost, currency, or resource columns."
+        )
+    totals: dict[str, Decimal] = {}
     for row in rows:
-        if isinstance(row, list) and row:
-            total += Decimal(str(row[0]))
+        if (
+            not isinstance(row, list)
+            or len(row) <= max(cost_index, currency_index, resource_index)
+            or not isinstance(row[currency_index], str)
+            or not row[currency_index]
+            or not isinstance(row[resource_index], str)
+            or not row[resource_index]
+        ):
+            raise CostRefreshError("Azure costs payload contains an invalid row.")
+        if row[resource_index].casefold() != resource_id.casefold():
+            raise CostRefreshError(
+                "Azure costs payload contains a row for an unexpected resource."
+            )
+        try:
+            amount = Decimal(str(row[cost_index]))
+        except (InvalidOperation, ValueError) as exc:
+            raise CostRefreshError(
+                "Azure costs payload contains a non-numeric cost."
+            ) from exc
+        if not amount.is_finite():
+            raise CostRefreshError("Azure costs payload contains a non-finite cost.")
+        currency = row[currency_index].upper()
+        totals[currency] = totals.get(currency, Decimal("0")) + amount
     return [
         CostBucket(
             kind="actual",
             metric="cost",
             value=total,
             unit="currency",
-            currency="USD",
+            currency=currency,
             bucket_start=start,
             bucket_end=end,
             source="azure.costmanagement.query",
             granularity="window",
             dimensions={"scope": resource_group_id},
         )
+        for currency, total in sorted(totals.items())
     ]
 
 
@@ -188,6 +248,10 @@ def _azure_arm_token(billing_secret: str) -> str:
         raise CostRefreshError(
             "Azure billing credentials must be a JSON service principal."
         ) from exc
+    if not isinstance(payload, dict):
+        raise CostRefreshError(
+            "Azure billing credentials must be a JSON service principal object."
+        )
     tenant_id = payload.get("tenant_id")
     client_id = payload.get("client_id")
     client_secret = payload.get("client_secret")
@@ -197,19 +261,30 @@ def _azure_arm_token(billing_secret: str) -> str:
     ):
         raise CostRefreshError("Azure billing credentials are incomplete.")
     token_url = f"https://login.microsoftonline.com/{tenant_id}/oauth2/v2.0/token"
-    response = requests.post(
-        token_url,
-        data={
-            "grant_type": "client_credentials",
-            "client_id": client_id,
-            "client_secret": client_secret,
-            "scope": "https://management.azure.com/.default",
-        },
-        timeout=30,
-    )
+    try:
+        response = requests.post(
+            token_url,
+            data={
+                "grant_type": "client_credentials",
+                "client_id": client_id,
+                "client_secret": client_secret,
+                "scope": "https://management.azure.com/.default",
+            },
+            timeout=30,
+        )
+    except requests.RequestException as exc:
+        raise CostRefreshError("Azure billing authentication request failed.") from exc
     if response.status_code >= 400:
         raise CostRefreshError("Azure billing authentication failed.")
-    token = response.json().get("access_token")
+    try:
+        token_payload = response.json()
+    except requests.exceptions.JSONDecodeError as exc:
+        raise CostRefreshError(
+            "Azure billing authentication returned an invalid response."
+        ) from exc
+    token = (
+        token_payload.get("access_token") if isinstance(token_payload, dict) else None
+    )
     if not isinstance(token, str) or not token:
         raise CostRefreshError("Azure billing authentication returned no token.")
     return token

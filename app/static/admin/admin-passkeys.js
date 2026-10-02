@@ -123,12 +123,31 @@
     window.location.href = complete.redirect || "/admin/";
   }
 
+  function registrationErrorMessage(error) {
+    const name = error && error.name ? error.name : "";
+    if (name === "InvalidStateError") {
+      return (
+        "Dieser Authenticator ist bereits registriert. Nutze einen Security Key " +
+        "oder ein anderes Gerät (iCloud-Geräte teilen denselben Passkey)."
+      );
+    }
+    if (name === "NotAllowedError") {
+      return "Passkey-Registrierung abgebrochen oder vom Browser verweigert.";
+    }
+    return (error && error.message) || String(error);
+  }
+
   async function passkeyRegister(label) {
     setStatus("passkey-register-status", "Registrierung startet…", false);
     const begin = await postJson("/admin/webauthn/register/begin", {});
-    const credential = await navigator.credentials.create({
-      publicKey: publicKeyOptionsFromJson(begin.options),
-    });
+    let credential;
+    try {
+      credential = await navigator.credentials.create({
+        publicKey: publicKeyOptionsFromJson(begin.options),
+      });
+    } catch (error) {
+      throw new Error(registrationErrorMessage(error));
+    }
     if (!credential) {
       throw new Error("Registrierung abgebrochen.");
     }

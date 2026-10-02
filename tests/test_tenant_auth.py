@@ -187,6 +187,77 @@ def test_database_tenant_api_key_authenticates_against_persisted_profile(monkeyp
     engine.dispose()
 
 
+def test_database_tenant_without_active_profile_lists_no_models(monkeypatch):
+    """Explicit profile deactivation also clears the tenant model catalog."""
+    api_key = "inactive-tenant-cleartext-key"
+    database_config = type(
+        "InactiveDatabaseTenantConfig",
+        (),
+        {
+            "TESTING": True,
+            "AUTH_MODE": "tenant",
+            "TENANT_CONFIG_SOURCE": "database",
+            "TENANTS": (),
+            "SERVICE_API_KEY": None,
+            "DATABASE_URL": "postgresql+psycopg://user:password@localhost/proxy",
+            "PROVIDER_ENCRYPTION_KEY": "a2tra2tra2tra2tra2tra2tra2tra2tra2tra2tra2s=",
+            "ADMIN_SESSION_SECRET": "test-admin-session-secret-bytes-32",
+            "WEBAUTHN_RP_ID": "localhost",
+            "WEBAUTHN_RP_NAME": "Test Proxy",
+            "WEBAUTHN_ORIGINS": "http://localhost",
+            "ENABLE_AZURE": True,
+            "ENABLE_CODEX": False,
+            "AZURE_MODEL_DEPLOYMENTS": {},
+            "AZURE_RESPONSES_API_URL": "https://global.openai.azure.com/openai/v1/responses",
+            "AZURE_API_KEY": "global-azure-key",
+            "AZURE_SUMMARY_LEVEL": "detailed",
+            "AZURE_VERBOSITY_LEVEL": "medium",
+            "AZURE_TRUNCATION": "disabled",
+            "RECORD_TRAFFIC": False,
+            "LOG_CONTEXT": False,
+            "LOG_COMPLETION": False,
+            "REASONING_DISPLAY_MODE": "mdthinkblocks",
+            "TRUSTED_HOSTS": ["localhost"],
+        },
+    )
+    engine = create_engine("sqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    cipher = SecretCipher.from_key(database_config.PROVIDER_ENCRYPTION_KEY)
+    database = Database(
+        engine, sessionmaker(bind=engine, expire_on_commit=False), cipher
+    )
+    monkeypatch.setattr(Database, "from_config", lambda config: database)
+    with database.sessions.begin() as session:
+        profile = ProviderProfile(
+            id="profile-inactive",
+            tenant_id="inactive-tenant",
+            provider="azure",
+            settings={
+                "base_url": "https://inactive.openai.azure.com",
+                "model_deployments": {"gpt-5.4": "inactive-deployment"},
+            },
+            inference_secret_ciphertext=cipher.encrypt("inactive-azure-key"),
+        )
+        session.add_all(
+            (
+                Tenant(
+                    id="inactive-tenant",
+                    api_key_hash=hash_api_key(api_key),
+                    custom_model_id="cursor-inactive-model",
+                ),
+                profile,
+            )
+        )
+
+    app = create_app(database_config)
+    response = app.test_client().get(
+        "/v1/models", headers={"Authorization": f"Bearer {api_key}"}
+    )
+    assert response.status_code == 200
+    assert response.json["data"] == []
+    engine.dispose()
+
+
 def test_database_openai_provider_forwards_to_openai_compatible(monkeypatch):
     """Active OpenAI profiles use the OpenAI-compatible forwarder, not Azure."""
     api_key = "openai-tenant-cleartext-key"

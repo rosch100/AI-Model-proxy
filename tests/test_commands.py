@@ -1,5 +1,6 @@
 """Tests for click commands defined in the application."""
 
+import os
 import re
 
 import click
@@ -131,15 +132,24 @@ def test_tenants_bind_scope_rejects_azure_resource_outside_billing_group(usage_s
         ),
     )
     with Session(engine) as session:
-        session.add(
-            Tenant(id="acme", api_key_hash="a" * 64, custom_model_id="tenant-acme")
+        session.add_all(
+            (
+                Tenant(id="acme", api_key_hash="a" * 64, custom_model_id="tenant-acme"),
+                ProviderProfile(
+                    id="profile-acme",
+                    tenant_id="acme",
+                    provider="azure",
+                    display_name="Production",
+                    settings={},
+                ),
+            )
         )
         session.commit()
 
     result = app.test_cli_runner().invoke(
         args=["tenants", "bind-billing-scope"],
         input=(
-            "acme\nazure\n"
+            "acme\nprofile-acme\n"
             "/subscriptions/aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa/"
             "resourceGroups/acme-rg\n"
             f"{usage_scope}\n"
@@ -267,6 +277,14 @@ def test_tenants_bind_scope_creates_exclusive_bindings_and_audit(provider):
                     id="profile-acme",
                     tenant_id="acme",
                     provider=provider,
+                    display_name="Production",
+                    settings={},
+                ),
+                ProviderProfile(
+                    id="profile-staging",
+                    tenant_id="acme",
+                    provider=provider,
+                    display_name="Staging",
                     settings={},
                 ),
             )
@@ -276,9 +294,7 @@ def test_tenants_bind_scope_creates_exclusive_bindings_and_audit(provider):
     result = app.test_cli_runner().invoke(
         args=["tenants", "bind-billing-scope"],
         input=(
-            "acme\n"
-            + provider
-            + "\n"
+            "acme\nprofile-acme\n"
             + (
                 "/subscriptions/AAAAAAAA-AAAA-AAAA-AAAA-AAAAAAAAAAAA/"
                 "resourceGroups/Acme-RG\n"
@@ -299,6 +315,7 @@ def test_tenants_bind_scope_creates_exclusive_bindings_and_audit(provider):
         nodes = session.scalars(select(ProviderScopeNode)).all()
         events = session.scalars(select(AuditEvent)).all()
         assert len(bindings) == (2 if provider == "azure" else 1)
+        assert {binding.profile_id for binding in bindings} == {"profile-acme"}
         assert len(nodes) == (2 if provider == "azure" else 1)
         assert len(events) == 1
         if provider == "azure":
@@ -318,6 +335,7 @@ def test_tenants_bind_scope_creates_exclusive_bindings_and_audit(provider):
         else:
             assert nodes[0].scope_type == "account"
         assert events[0].action == "billing_scope.bind"
+        assert events[0].actor_id == f"uid:{os.getuid()}"
     engine.dispose()
 
 
@@ -357,11 +375,11 @@ def test_tenants_bind_scope_rejects_a_scope_owned_by_another_tenant():
 
     first = app.test_cli_runner().invoke(
         args=["tenants", "bind-billing-scope"],
-        input="acme\nopenrouter\nshared-account\nyes\n",
+        input="acme\nprofile-acme\nshared-account\nyes\n",
     )
     second = app.test_cli_runner().invoke(
         args=["tenants", "bind-billing-scope"],
-        input="beta\nopenrouter\nshared-account\nyes\n",
+        input="beta\nprofile-beta\nshared-account\nyes\n",
     )
 
     assert first.exit_code == 0, first.output
@@ -399,7 +417,7 @@ def test_tenants_bind_billing_scope_requires_exclusivity_confirmation():
 
     result = app.test_cli_runner().invoke(
         args=["tenants", "bind-billing-scope"],
-        input="acme\nopenrouter\naccount-id\nno\n",
+        input="acme\nprofile-acme\naccount-id\nno\n",
     )
 
     assert result.exit_code != 0

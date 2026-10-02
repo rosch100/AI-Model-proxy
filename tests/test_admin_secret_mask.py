@@ -38,8 +38,8 @@ def test_selectable_azure_catalog_keeps_supported_models_only():
     }
 
 
-def test_connection_page_puts_secret_in_password_field(admin_app):
-    """Stored keys fill a password input with a Klartext reveal control."""
+def test_connection_page_confirms_saved_secret_without_revealing_it(admin_app):
+    """Stored keys are confirmed but never rendered back into the page."""
     database = admin_app.extensions["database"]
     full_key = "azure-secret-key-value-xyz9"
     with database.sessions.begin() as session:
@@ -81,12 +81,7 @@ def test_connection_page_puts_secret_in_password_field(admin_app):
     response = client.get("/admin/settings/connection")
     body = response.get_data(as_text=True)
     assert response.status_code == 200
-    assert 'id="azure-api-key"' in body
-    assert 'type="password"' in body
-    assert f'value="{full_key}"' in body
-    assert 'data-reveal-secret="azure-api-key"' in body
-    assert "Klartext anzeigen" in body
-    assert "Wählbare Modelle" in body
+    assert "Schlüssel gespeichert" in body
+    assert full_key not in body
     assert "gpt-6-astra" in body
     assert "Modell-Deployments" not in body
-    assert "Pflichtfelder sind mit" in body

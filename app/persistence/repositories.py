@@ -62,6 +62,10 @@ class TenantRepository:
                 provider_settings={},
                 inference_secret=None,
                 default_model=None,
+                profile_id=None,
+                profile_name=None,
+                history_generation=None,
+                profile_deleted=False,
             )
 
         secret = (
@@ -77,6 +81,10 @@ class TenantRepository:
             provider_settings=dict(profile.settings),
             inference_secret=secret,
             default_model=profile.default_model,
+            profile_id=profile.id,
+            profile_name=profile.display_name,
+            history_generation=profile.history_generation,
+            profile_deleted=profile.deleted_at is not None,
         )
 
     def get_admin_snapshot(
@@ -117,12 +125,28 @@ def import_tenants(
                 raise ValueError(
                     f"Existing tenant {tenant_config.id!r} has a different API key hash"
                 )
-            profile = session.scalar(
-                select(ProviderProfile).where(
-                    ProviderProfile.tenant_id == tenant_config.id,
-                    ProviderProfile.provider == "azure",
+            profiles = list(
+                session.scalars(
+                    select(ProviderProfile).where(
+                        ProviderProfile.tenant_id == tenant_config.id,
+                        ProviderProfile.provider == "azure",
+                    )
                 )
             )
+            profile = next(
+                (
+                    candidate
+                    for candidate in profiles
+                    if candidate.id == existing.active_profile_id
+                    and candidate.deleted_at is None
+                ),
+                None,
+            )
+            if profile is None:
+                raise ValueError(
+                    f"Existing tenant {tenant_config.id!r} has ambiguous active "
+                    "Azure profile resolution for environment import"
+                )
             expected_settings = {
                 "base_url": tenant_config.azure_base_url,
                 "model_deployments": dict(tenant_config.azure_model_deployments),
@@ -160,6 +184,7 @@ def import_tenants(
             id=profile_id,
             tenant_id=tenant_config.id,
             provider="azure",
+            display_name="Azure",
             settings={
                 "base_url": tenant_config.azure_base_url,
                 "model_deployments": dict(tenant_config.azure_model_deployments),

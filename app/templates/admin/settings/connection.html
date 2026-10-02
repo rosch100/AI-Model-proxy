@@ -3,128 +3,68 @@
 {% block title %}Verbindung · Altanis Proxy{% endblock %}
 {% block content %}
 <section>
-  <h1>Verbindung</h1>
-  <p class="lede">Profile speichern, Katalog laden, danach genau einen Anbieter aktivieren.</p>
-  <p class="field-legend">Pflichtfelder sind mit <strong>*</strong> markiert.</p>
-  {% if view.active_provider %}
-    <p>Aktiver Anbieter: <strong>{{ view.active_provider }}</strong></p>
+  {% set labels = {"azure": "Azure", "openai": "OpenAI", "openrouter": "OpenRouter"} %}
+  <h1>Provider-Accounts</h1>
+  <p class="lede">Pro Anbieter können mehrere Accounts gespeichert werden. Neue Accounts bleiben inaktiv, bis sie ausdrücklich aktiviert werden.</p>
+  {% if view.active_profile_id %}
+    <p>Aktiver Account: <strong>{{ labels.get(view.active_provider, "Unbekannter Anbieter") }} · {{ view.active_profile_name or "Unbekannter Account" }}</strong></p>
   {% else %}
-    <p>Kein Anbieter aktiv.</p>
+    <p class="error-text">Kein Account aktiv. Proxy-Anfragen sind nicht verfügbar.</p>
   {% endif %}
+  <p><a href="{{ url_for('admin.create_connection_form') }}">Neuer Account</a></p>
 
-  <h2>Azure</h2>
-  <form method="post" action="{{ url_for('admin.save_azure_connection') }}" class="stack">
-    {{ azure_form.csrf_token }}
-    <label>{{ azure_form.base_url.label }}{{ azure_form.base_url(required=true) }}</label>
-    <div class="secret-field">
-      <label for="azure-api-key">{{ azure_form.api_key.label.text }}</label>
-      {{ azure_form.api_key(id="azure-api-key", autocomplete="off") }}
-      <label class="reveal-toggle">
-        <input type="checkbox" data-reveal-secret="azure-api-key" />
-        Klartext anzeigen
-      </label>
-    </div>
-    <label>{{ azure_form.default_model.label }}{{ azure_form.default_model() }}</label>
-    {% if view.selectable_models.azure %}
-      <div class="model-catalog">
-        <h3>Wählbare Modelle (automatisch aus Katalog)</h3>
-        <p class="hint">Proxy-unterstützte Deployments aus dem Azure-Katalog; Mapping Cursor-Modell → Deployment wird automatisch gesetzt.</p>
-        <ul>
-          {% for model_id, deployment_id in view.selectable_models.azure %}
-            <li>
-              <code>{{ model_id }}</code>
-              {% if deployment_id and deployment_id != model_id %}
-                → Deployment <code>{{ deployment_id }}</code>
-              {% endif %}
-            </li>
-          {% endfor %}
-        </ul>
-      </div>
+  {% for provider in ["azure", "openai", "openrouter"] %}
+    <h2>{{ labels[provider] }}</h2>
+    {% if view.profiles_by_provider[provider] %}
+      <ul class="provider-accounts">
+      {% for profile in view.profiles_by_provider[provider] %}
+        <li>
+          <h3>{{ profile.display_name }}</h3>
+          <p>
+            {% if profile.id == view.active_profile_id %}<strong>Aktiv</strong>{% else %}Inaktiv{% endif %}
+            · Modell: {{ profile.default_model or "nicht gesetzt" }}
+            · {% if profile.catalog_error %}Katalogfehler{% elif profile.catalog_refreshed_at %}Katalog aktualisiert{% else %}Katalog noch nicht geladen{% endif %}
+            · {% if profile.inference_secret_ciphertext %}Schlüssel gespeichert{% else %}Schlüssel fehlt{% endif %}
+          </p>
+          <p>
+            <a href="{{ url_for('admin.edit_connection_form', profile_id=profile.id) }}">Bearbeiten</a>
+            · <a href="{{ url_for('admin.settings_costs') }}">Kosten</a>
+          </p>
+          <form method="post" action="{{ url_for('admin.refresh_catalog', profile_id=profile.id) }}">
+            <input type="hidden" name="csrf_token" value="{{ csrf_token() }}" />
+            <button type="submit">Katalog aktualisieren</button>
+          </form>
+          {% if profile.id != view.active_profile_id %}
+            <form method="post" action="{{ url_for('admin.activate_connection', profile_id=profile.id) }}">
+              <input type="hidden" name="csrf_token" value="{{ csrf_token() }}" />
+              <input type="hidden" name="profile_id" value="{{ profile.id }}" />
+              <button type="submit" {% if not profile.inference_secret_ciphertext or profile.default_model not in view.selectable_model_ids[profile.id] %}disabled{% endif %}>Account aktivieren</button>
+            </form>
+          {% endif %}
+          {% if profile.catalog_error %}<p class="error-text">{{ profile.catalog_error }}</p>{% endif %}
+          {% if view.catalogs[profile.id] %}
+            <details>
+              <summary>Modelle im Katalog ({{ view.catalogs[profile.id]|length }})</summary>
+              <ul class="compact-catalog">
+              {% for entry in view.catalogs[profile.id] %}
+                <li><code>{{ entry.model_id }}</code>{% if entry.deployment_id and entry.deployment_id != entry.model_id %} → <code>{{ entry.deployment_id }}</code>{% endif %}</li>
+              {% endfor %}
+              </ul>
+            </details>
+          {% endif %}
+        </li>
+      {% endfor %}
+      </ul>
     {% else %}
-      <p class="hint">Noch keine wählbaren Azure-Modelle — Katalog aktualisieren.</p>
+      <p>Keine Accounts konfiguriert.</p>
     {% endif %}
-    <button type="submit">Azure speichern</button>
-  </form>
-  <form method="post" action="{{ url_for('admin.refresh_catalog') }}">
-    {{ azure_form.csrf_token }}
-    <input type="hidden" name="provider" value="azure" />
-    <button type="submit">Azure-Katalog aktualisieren</button>
-  </form>
-  {% if view.azure and view.azure.catalog_error %}
-    <p class="error-text">{{ view.azure.catalog_error }}</p>
+  {% endfor %}
+
+  {% if view.active_profile_id %}
+    <form method="post" action="{{ url_for('admin.deactivate_connection') }}">
+      <input type="hidden" name="csrf_token" value="{{ csrf_token() }}" />
+      <button type="submit">Aktiven Account deaktivieren</button>
+    </form>
   {% endif %}
-
-  <h2>OpenAI</h2>
-  <form method="post" action="{{ url_for('admin.save_openai_connection') }}" class="stack">
-    {{ openai_form.csrf_token }}
-    <div class="secret-field">
-      <label for="openai-api-key">{{ openai_form.api_key.label.text }}</label>
-      {{ openai_form.api_key(id="openai-api-key", autocomplete="off") }}
-      <label class="reveal-toggle">
-        <input type="checkbox" data-reveal-secret="openai-api-key" />
-        Klartext anzeigen
-      </label>
-    </div>
-    <label>{{ openai_form.default_model.label }}{{ openai_form.default_model() }}</label>
-    <label>{{ openai_form.organization.label }}{{ openai_form.organization() }}</label>
-    <label>{{ openai_form.project.label }}{{ openai_form.project() }}</label>
-    {% if view.selectable_models.openai %}
-      <div class="model-catalog">
-        <h3>Wählbare Modelle ({{ view.selectable_models.openai|length }} aus Katalog)</h3>
-        <ul class="compact-catalog">
-          {% for model_id, _ in view.selectable_models.openai %}
-            <li><code>{{ model_id }}</code></li>
-          {% endfor %}
-        </ul>
-      </div>
-    {% else %}
-      <p class="hint">Noch keine OpenAI-Modelle — Katalog aktualisieren.</p>
-    {% endif %}
-    <button type="submit">OpenAI speichern</button>
-  </form>
-  <form method="post" action="{{ url_for('admin.refresh_catalog') }}">
-    {{ openai_form.csrf_token }}
-    <input type="hidden" name="provider" value="openai" />
-    <button type="submit">OpenAI-Katalog aktualisieren</button>
-  </form>
-
-  <h2>OpenRouter</h2>
-  <form method="post" action="{{ url_for('admin.save_openrouter_connection') }}" class="stack">
-    {{ openrouter_form.csrf_token }}
-    <div class="secret-field">
-      <label for="openrouter-api-key">{{ openrouter_form.api_key.label.text }}</label>
-      {{ openrouter_form.api_key(id="openrouter-api-key", autocomplete="off") }}
-      <label class="reveal-toggle">
-        <input type="checkbox" data-reveal-secret="openrouter-api-key" />
-        Klartext anzeigen
-      </label>
-    </div>
-    <label>{{ openrouter_form.default_model.label }}{{ openrouter_form.default_model() }}</label>
-    {% if view.selectable_models.openrouter %}
-      <div class="model-catalog">
-        <h3>Wählbare Modelle ({{ view.selectable_models.openrouter|length }} aus Katalog)</h3>
-        <ul class="compact-catalog">
-          {% for model_id, _ in view.selectable_models.openrouter %}
-            <li><code>{{ model_id }}</code></li>
-          {% endfor %}
-        </ul>
-      </div>
-    {% else %}
-      <p class="hint">Noch keine OpenRouter-Modelle — Katalog aktualisieren.</p>
-    {% endif %}
-    <button type="submit">OpenRouter speichern</button>
-  </form>
-  <form method="post" action="{{ url_for('admin.refresh_catalog') }}">
-    {{ openrouter_form.csrf_token }}
-    <input type="hidden" name="provider" value="openrouter" />
-    <button type="submit">OpenRouter-Katalog aktualisieren</button>
-  </form>
-
-  <h2>Aktivieren</h2>
-  <form method="post" action="{{ url_for('admin.activate_connection') }}" class="stack">
-    {{ activate_form.csrf_token }}
-    <label>{{ activate_form.provider.label }}{{ activate_form.provider() }}</label>
-    <button type="submit">Anbieter aktivieren</button>
-  </form>
 </section>
 {% endblock %}

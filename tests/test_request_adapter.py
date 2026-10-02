@@ -285,6 +285,96 @@ def test_request_adapter_transforms_forced_function_tool_choice_for_responses(ap
     }
 
 
+def test_request_adapter_uses_explicit_snapshot_not_request_context_tenant(app):
+    """Forwarding honors the profile snapshot supplied at request entry."""
+    adapter = AzureAdapter().request_adapter
+    selected = DatabaseTenantSnapshot(
+        id="acme",
+        api_key_hash="a" * 64,
+        custom_model_id="cursor-acme-model",
+        provider="azure",
+        provider_settings={
+            "base_url": "https://selected.openai.azure.com",
+            "model_deployments": {"gpt-5.4": "selected-deployment"},
+        },
+        inference_secret="selected-key",
+        default_model="gpt-5.4",
+        profile_id="selected-profile",
+        profile_name="Production",
+        history_generation=2,
+    )
+    other = DatabaseTenantSnapshot(
+        id="acme",
+        api_key_hash="a" * 64,
+        custom_model_id="cursor-acme-model",
+        provider="azure",
+        provider_settings={
+            "base_url": "https://other.openai.azure.com",
+            "model_deployments": {"gpt-5.4": "other-deployment"},
+        },
+        inference_secret="other-key",
+        default_model="gpt-5.4",
+        profile_id="other-profile",
+        profile_name="Staging",
+        history_generation=0,
+    )
+    with app.test_request_context(
+        "/v1/chat/completions",
+        method="POST",
+        json={"model": "cursor-acme-model", "messages": [], "stream": True},
+        headers={"Authorization": "Bearer unused"},
+    ) as ctx:
+        g.tenant = other
+        g.auth_mode = "tenant"
+        request_kwargs = adapter.adapt(ctx.request, selected)
+
+    assert (
+        request_kwargs["url"] == "https://selected.openai.azure.com/openai/v1/responses"
+    )
+    assert request_kwargs["headers"]["api-key"] == "selected-key"
+    assert request_kwargs["json"]["model"] == "selected-deployment"
+
+
+@pytest.mark.parametrize(
+    ("profile_id", "profile_deleted", "message"),
+    [
+        (None, False, "No active provider profile"),
+        ("profile-deleted", True, "profile has been removed"),
+    ],
+)
+def test_request_adapter_rejects_missing_or_deleted_profile(
+    app, profile_id, profile_deleted, message
+):
+    """An absent or tombstoned profile never falls back to another credential."""
+    adapter = AzureAdapter().request_adapter
+    snapshot = DatabaseTenantSnapshot(
+        id="acme",
+        api_key_hash="a" * 64,
+        custom_model_id="cursor-acme-model",
+        provider="azure",
+        provider_settings={
+            "base_url": "https://other.openai.azure.com",
+            "model_deployments": {"gpt-5.4": "other-deployment"},
+        },
+        inference_secret="other-key",
+        default_model="gpt-5.4",
+        profile_id=profile_id,
+        profile_name=None,
+        history_generation=4,
+        profile_deleted=profile_deleted,
+    )
+    with app.test_request_context(
+        "/v1/chat/completions",
+        method="POST",
+        json={"model": "cursor-acme-model", "messages": [], "stream": True},
+        headers={"Authorization": "Bearer unused"},
+    ) as ctx:
+        g.tenant = snapshot
+        g.auth_mode = "tenant"
+        with pytest.raises(ServiceConfigurationError, match=message):
+            adapter.adapt(ctx.request, snapshot)
+
+
 def test_request_adapter_rejects_database_default_missing_from_deployments(app):
     """Fail closed when a DB tenant default model is absent from its map."""
     adapter = AzureAdapter().request_adapter
@@ -299,6 +389,9 @@ def test_request_adapter_rejects_database_default_missing_from_deployments(app):
         },
         inference_secret="azure-key",
         default_model="gpt-5.6-sol",
+        profile_id="profile-acme",
+        profile_name="Production",
+        history_generation=0,
     )
     with app.test_request_context(
         "/chat/completions",

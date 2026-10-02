@@ -17,6 +17,7 @@ from .common.recording import (
     record_payload,
 )
 from .exceptions import ConfigurationError, ServiceConfigurationError
+from .providers.openai_compat import forward_openai_compatible
 from .tenants import AUTH_MODE_TENANT, DatabaseTenantSnapshot
 
 blueprint = Blueprint("blueprint", __name__)
@@ -112,6 +113,18 @@ def catch_all(path: str):
     _ensure_provider_allowed_for_auth(provider)
     if provider == "codex":
         return CodexAdapter().forward(request, provider_path)
+    tenant = current_tenant()
+    if isinstance(tenant, DatabaseTenantSnapshot):
+        if tenant.provider in {"openai", "openrouter"}:
+            return forward_openai_compatible(request, tenant)
+        if tenant.provider is None:
+            raise ServiceConfigurationError(
+                "No active provider profile is configured for this tenant."
+            )
+        if tenant.provider != "azure":
+            raise ServiceConfigurationError(
+                f"Unsupported active provider {tenant.provider!r}."
+            )
     return AzureAdapter().forward(request)
 
 

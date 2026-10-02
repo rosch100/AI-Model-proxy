@@ -44,6 +44,26 @@ def test_catalog_refresh_parses_openai_models(requests_mock):
     assert entries == [("gpt-5.4", None), ("gpt-5.5", None)]
 
 
+def test_catalog_refresh_parses_azure_deployments(requests_mock):
+    """Azure catalog refresh uses the legacy deployments API version."""
+    requests_mock.get(
+        "https://example.openai.azure.com/openai/deployments" "?api-version=2022-12-01",
+        json={
+            "data": [
+                {"id": "gpt-6-astra", "model": "gpt-6-astra"},
+                {"id": "gpt-6-luna", "model": "gpt-6-luna"},
+            ]
+        },
+    )
+    entries = refresh_provider_catalog(
+        "azure",
+        {"base_url": "https://example.openai.azure.com"},
+        "azure-key",
+    )
+    assert entries == [("gpt-6-astra", "gpt-6-astra"), ("gpt-6-luna", "gpt-6-luna")]
+    assert requests_mock.request_history[0].headers["api-key"] == "azure-key"
+
+
 def test_activate_profile_writes_audit_and_active_id():
     """Profile activation updates the tenant in the same unit of work."""
     database = build_admin_database()

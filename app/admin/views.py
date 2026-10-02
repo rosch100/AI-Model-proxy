@@ -68,7 +68,6 @@ from app.persistence.admin_auth import (
 from app.persistence.admin_ops import (
     activate_provider_profile,
     change_admin_password,
-    parse_model_deployments_json,
     replace_catalog_entries,
     rotate_api_key,
     save_billing_secret,
@@ -96,7 +95,12 @@ from app.persistence.passkeys import (
     list_passkeys,
     store_challenge,
 )
-from app.providers.catalog import CatalogRefreshError, refresh_provider_catalog
+from app.providers.catalog import (
+    CatalogRefreshError,
+    azure_deployments_from_catalog,
+    refresh_provider_catalog,
+    selectable_catalog_models,
+)
 from app.providers.cost_jobs import (
     collect_provider_costs,
     load_billing_binding,
@@ -485,14 +489,21 @@ def settings_connection():
 @login_required
 def save_azure_connection():
     """Save Azure inference settings without activating the profile."""
+    database = _database()
+    with database.sessions() as session:
+        catalog_rows = _catalog_tuples(session, g.admin.tenant_id, "azure")
+    selectable = selectable_catalog_models("azure", catalog_rows)
     form = AzureConnectionForm()
+    form.default_model.choices = _model_choices(selectable)
+    if not form.default_model.choices:
+        flash("Zuerst den Azure-Katalog aktualisieren.", "error")
+        return redirect(url_for("admin.settings_connection"))
     if not form.validate_on_submit():
         flash("Azure-Verbindung ist unvollständig.", "error")
         return redirect(url_for("admin.settings_connection"))
-    try:
-        deployments = parse_model_deployments_json(form.model_deployments.data or "")
-    except (ValueError, json.JSONDecodeError):
-        flash("Modell-Deployments müssen ein gültiges JSON-Objekt sein.", "error")
+    deployments = azure_deployments_from_catalog(catalog_rows)
+    if form.default_model.data not in deployments:
+        flash("Standardmodell ist im Azure-Katalog nicht enthalten.", "error")
         return redirect(url_for("admin.settings_connection"))
     _save_profile(
         "azure",
@@ -511,7 +522,15 @@ def save_azure_connection():
 @login_required
 def save_openai_connection():
     """Save OpenAI inference settings without activating the profile."""
+    database = _database()
+    with database.sessions() as session:
+        catalog_rows = _catalog_tuples(session, g.admin.tenant_id, "openai")
+    selectable = selectable_catalog_models("openai", catalog_rows)
     form = OpenAIConnectionForm()
+    form.default_model.choices = _model_choices(selectable)
+    if not form.default_model.choices:
+        flash("Zuerst den OpenAI-Katalog aktualisieren.", "error")
+        return redirect(url_for("admin.settings_connection"))
     if not form.validate_on_submit():
         flash("OpenAI-Verbindung ist unvollständig.", "error")
         return redirect(url_for("admin.settings_connection"))
@@ -532,7 +551,15 @@ def save_openai_connection():
 @login_required
 def save_openrouter_connection():
     """Save OpenRouter inference settings without activating the profile."""
+    database = _database()
+    with database.sessions() as session:
+        catalog_rows = _catalog_tuples(session, g.admin.tenant_id, "openrouter")
+    selectable = selectable_catalog_models("openrouter", catalog_rows)
     form = OpenRouterConnectionForm()
+    form.default_model.choices = _model_choices(selectable)
+    if not form.default_model.choices:
+        flash("Zuerst den OpenRouter-Katalog aktualisieren.", "error")
+        return redirect(url_for("admin.settings_connection"))
     if not form.validate_on_submit():
         flash("OpenRouter-Verbindung ist unvollständig.", "error")
         return redirect(url_for("admin.settings_connection"))
@@ -596,10 +623,30 @@ def refresh_catalog():
     with database.sessions.begin() as session:
         profile = session.get(ProviderProfile, profile_id)
         replace_catalog_entries(session, profile, entries, error)
-    flash(
-        "Katalog aktualisiert." if error is None else error,
-        "info" if error is None else "error",
-    )
+        if error is None and provider == "azure":
+            deployments = azure_deployments_from_catalog(entries)
+            updated = dict(profile.settings)
+            updated["model_deployments"] = deployments
+            profile.settings = updated
+            if deployments and (
+                not profile.default_model or profile.default_model not in deployments
+            ):
+                profile.default_model = next(iter(deployments))
+        elif error is None and provider in {"openai", "openrouter"}:
+            selectable = selectable_catalog_models(provider, entries)
+            model_ids = [model_id for model_id, _ in selectable]
+            if model_ids and (
+                not profile.default_model or profile.default_model not in model_ids
+            ):
+                profile.default_model = model_ids[0]
+    if error is None:
+        selectable = selectable_catalog_models(provider, entries)
+        flash(
+            f"Katalog aktualisiert — {len(selectable)} wählbare Modelle übernommen.",
+            "info",
+        )
+    else:
+        flash(error, "error")
     return redirect(url_for("admin.settings_connection"))
 
 
@@ -806,6 +853,38 @@ def _save_profile(
         )
 
 
+def _catalog_tuples(
+    session, tenant_id: str, provider: str
+) -> list[tuple[str, str | None]]:
+    profile = session.scalar(
+        select(ProviderProfile).where(
+            ProviderProfile.tenant_id == tenant_id,
+            ProviderProfile.provider == provider,
+        )
+    )
+    if profile is None:
+        return []
+    rows = session.scalars(
+        select(ProviderCatalogEntry)
+        .where(ProviderCatalogEntry.profile_id == profile.id)
+        .order_by(ProviderCatalogEntry.model_id)
+    )
+    return [(row.model_id, row.deployment_id) for row in rows]
+
+
+def _model_choices(
+    selectable: list[tuple[str, str | None]],
+) -> list[tuple[str, str]]:
+    choices: list[tuple[str, str]] = []
+    for model_id, deployment_id in selectable:
+        if deployment_id and deployment_id != model_id:
+            label = f"{model_id} → {deployment_id}"
+        else:
+            label = model_id
+        choices.append((model_id, label))
+    return choices
+
+
 def _connection_context() -> dict[str, object]:
     database = _database()
     with database.sessions() as session:
@@ -816,19 +895,33 @@ def _connection_context() -> dict[str, object]:
                 select(ProviderProfile).where(ProviderProfile.tenant_id == tenant.id)
             )
         }
-        catalog = tuple(
-            session.scalars(
-                select(ProviderCatalogEntry).order_by(ProviderCatalogEntry.model_id)
+        catalogs: dict[str, tuple[ProviderCatalogEntry, ...]] = {}
+        selectable_models: dict[str, tuple[tuple[str, str | None], ...]] = {}
+        for name in ("azure", "openai", "openrouter"):
+            profile = profiles.get(name)
+            if profile is None:
+                catalogs[name] = ()
+                selectable_models[name] = ()
+                continue
+            rows = tuple(
+                session.scalars(
+                    select(ProviderCatalogEntry)
+                    .where(ProviderCatalogEntry.profile_id == profile.id)
+                    .order_by(ProviderCatalogEntry.model_id)
+                )
             )
-        )
+            catalogs[name] = rows
+            selectable_models[name] = tuple(
+                selectable_catalog_models(
+                    name, [(row.model_id, row.deployment_id) for row in rows]
+                )
+            )
         azure = profiles.get("azure")
         openai = profiles.get("openai")
         openrouter = profiles.get("openrouter")
-        inference_key_masks = {
+        inference_secrets = {
             name: (
-                mask_secret(
-                    database.secret_cipher.decrypt(profile.inference_secret_ciphertext)
-                )
+                database.secret_cipher.decrypt(profile.inference_secret_ciphertext)
                 if profile is not None and profile.inference_secret_ciphertext
                 else None
             )
@@ -840,20 +933,29 @@ def _connection_context() -> dict[str, object]:
         }
         azure_form = AzureConnectionForm(
             base_url=(azure.settings.get("base_url") if azure else "") or "",
+            api_key=inference_secrets["azure"] or "",
             default_model=azure.default_model if azure else "",
-            model_deployments=json.dumps(
-                (azure.settings.get("model_deployments") if azure else {}) or {},
-                indent=2,
-            ),
         )
+        azure_form.default_model.choices = _model_choices(
+            list(selectable_models["azure"])
+        ) or [("", "— Katalog aktualisieren —")]
         openai_form = OpenAIConnectionForm(
+            api_key=inference_secrets["openai"] or "",
             default_model=openai.default_model if openai else "",
             organization=(openai.settings.get("organization") if openai else "") or "",
             project=(openai.settings.get("project") if openai else "") or "",
         )
+        openai_form.default_model.choices = _model_choices(
+            list(selectable_models["openai"])
+        ) or [("", "— Katalog aktualisieren —")]
         openrouter_form = OpenRouterConnectionForm(
-            default_model=openrouter.default_model if openrouter else ""
+            api_key=inference_secrets["openrouter"] or "",
+            default_model=openrouter.default_model if openrouter else "",
         )
+        openrouter_form.default_model.choices = _model_choices(
+            list(selectable_models["openrouter"])
+        ) or [("", "— Katalog aktualisieren —")]
+        _set_api_key_labels(azure_form, openai_form, openrouter_form, inference_secrets)
         activate_form = ActivateProviderForm()
         session.expunge_all()
         return {
@@ -862,7 +964,8 @@ def _connection_context() -> dict[str, object]:
                 azure=azure,
                 openai=openai,
                 openrouter=openrouter,
-                catalog=catalog,
+                catalogs=catalogs,
+                selectable_models=selectable_models,
                 active_provider=next(
                     (
                         profile.provider
@@ -871,7 +974,7 @@ def _connection_context() -> dict[str, object]:
                     ),
                     None,
                 ),
-                inference_key_masks=inference_key_masks,
+                inference_secrets=inference_secrets,
             ),
             "azure_form": azure_form,
             "openai_form": openai_form,
@@ -879,6 +982,29 @@ def _connection_context() -> dict[str, object]:
             "activate_form": activate_form,
             "logout_form": LoginForm(),
         }
+
+
+def _set_api_key_labels(
+    azure_form: AzureConnectionForm,
+    openai_form: OpenAIConnectionForm,
+    openrouter_form: OpenRouterConnectionForm,
+    secrets: dict[str, str | None],
+) -> None:
+    azure_form.api_key.label.text = (
+        "Azure API-Schlüssel (optional — leer lässt den gespeicherten Wert)"
+        if secrets["azure"]
+        else "Azure API-Schlüssel *"
+    )
+    openai_form.api_key.label.text = (
+        "OpenAI API-Schlüssel (optional — leer lässt den gespeicherten Wert)"
+        if secrets["openai"]
+        else "OpenAI API-Schlüssel *"
+    )
+    openrouter_form.api_key.label.text = (
+        "OpenRouter API-Schlüssel (optional — leer lässt den gespeicherten Wert)"
+        if secrets["openrouter"]
+        else "OpenRouter API-Schlüssel *"
+    )
 
 
 def _costs_context() -> dict[str, object]:

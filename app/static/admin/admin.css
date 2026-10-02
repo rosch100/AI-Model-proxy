@@ -206,6 +206,49 @@ code {
   user-select: none;
 }
 
+.secret-field {
+  display: grid;
+  gap: 0.35rem;
+}
+
+.reveal-toggle {
+  display: flex;
+  align-items: center;
+  gap: 0.45rem;
+  font-size: 0.92rem;
+}
+
+.field-legend,
+.hint {
+  opacity: 0.85;
+  font-size: 0.95rem;
+}
+
+.model-catalog {
+  margin: 0.2rem 0 0.6rem;
+  padding: 0.8rem 1rem;
+  background: color-mix(in srgb, white 70%, var(--grain));
+  border-left: 3px solid var(--moss);
+}
+
+.model-catalog h3 {
+  margin: 0 0 0.4rem;
+  font-size: 1rem;
+}
+
+.compact-catalog {
+  max-height: 12rem;
+  overflow: auto;
+  margin: 0.4rem 0 0;
+  padding-left: 1.1rem;
+  columns: 2;
+  gap: 1.2rem;
+}
+
+.error-text {
+  color: var(--flash-error);
+}
+
 @media (max-width: 768px) {
   .hero-brand {
     font-size: 2rem;

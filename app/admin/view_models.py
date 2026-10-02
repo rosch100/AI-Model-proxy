@@ -42,9 +42,10 @@ class ConnectionView:
     azure: ProviderProfile | None
     openai: ProviderProfile | None
     openrouter: ProviderProfile | None
-    catalog: tuple[ProviderCatalogEntry, ...]
+    catalogs: dict[str, tuple[ProviderCatalogEntry, ...]]
+    selectable_models: dict[str, tuple[tuple[str, str | None], ...]]
     active_provider: str | None
-    inference_key_masks: dict[str, str | None]
+    inference_secrets: dict[str, str | None]
 
 
 @dataclass(frozen=True)

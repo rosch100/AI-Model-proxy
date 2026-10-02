@@ -2,7 +2,11 @@
 
 from __future__ import annotations
 
+from collections.abc import Iterable, Sequence
+
 import requests
+
+from app.models import SUPPORTED_MODELS
 
 
 class CatalogRefreshError(Exception):
@@ -25,6 +29,38 @@ def refresh_provider_catalog(
     if provider == "openrouter":
         return _refresh_openrouter(inference_secret)
     raise CatalogRefreshError(f"Unsupported provider {provider!r}")
+
+
+def selectable_catalog_models(
+    provider: str, entries: Sequence[tuple[str, str | None]]
+) -> list[tuple[str, str | None]]:
+    """Return catalog rows that the proxy can expose for query routing."""
+    if provider == "azure":
+        supported = set(SUPPORTED_MODELS)
+        selected: list[tuple[str, str | None]] = []
+        seen: set[str] = set()
+        for model_id, deployment_id in entries:
+            cursor_id = None
+            for candidate in (model_id, deployment_id):
+                if isinstance(candidate, str) and candidate in supported:
+                    cursor_id = candidate
+                    break
+            if cursor_id is None or cursor_id in seen:
+                continue
+            seen.add(cursor_id)
+            selected.append((cursor_id, deployment_id or cursor_id))
+        return selected
+    return [(model_id, deployment_id) for model_id, deployment_id in entries]
+
+
+def azure_deployments_from_catalog(
+    entries: Iterable[tuple[str, str | None]],
+) -> dict[str, str]:
+    """Build Cursor-model → Azure-deployment map from selectable catalog rows."""
+    return {
+        model_id: (deployment_id or model_id)
+        for model_id, deployment_id in selectable_catalog_models("azure", list(entries))
+    }
 
 
 def _refresh_azure(

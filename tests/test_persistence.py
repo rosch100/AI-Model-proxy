@@ -88,7 +88,7 @@ def test_openrouter_workspace_migration_updates_postgresql_binding_validator(
     config = Config(str(project_root / "alembic.ini"), output_buffer=output)
     config.set_main_option("script_location", str(project_root / "migrations"))
 
-    command.upgrade(config, "head", sql=True)
+    command.upgrade(config, "20261002_provider_accounts_usage:head", sql=True)
 
     generated_sql = output.getvalue()
     assert (

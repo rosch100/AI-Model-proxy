@@ -1,7 +1,7 @@
 """Allow OpenRouter billing bindings to use workspace scopes.
 
 Revision ID: 20261003_openrouter_workspace
-Revises: 20261002_passkeys
+Revises: 20261002_provider_accounts_usage
 Create Date: 2026-10-02
 """
 
@@ -10,7 +10,7 @@ from collections.abc import Sequence
 from alembic import op
 
 revision: str = "20261003_openrouter_workspace"
-down_revision: str | None = "20261002_passkeys"
+down_revision: str | None = "20261002_provider_accounts_usage"
 branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
 

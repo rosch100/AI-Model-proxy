@@ -28,6 +28,7 @@ SUPPORTED_MODELS: Final[tuple[str, ...]] = (
     "gpt-6-astra",
     "gpt-6-luna",
     "gpt-6-sol",
+    "gpt-6.1-sol",
 )
 
 SUPPORTED_MODELS_TEXT: Final[str] = "\n".join(

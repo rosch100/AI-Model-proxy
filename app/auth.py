@@ -5,9 +5,13 @@ from hmac import compare_digest
 
 from flask import Response, current_app, g, request
 
+from .exceptions import ServiceConfigurationError
+from .persistence.database import Database
 from .tenants import (
     AUTH_MODE_SINGLE,
     AUTH_MODE_TENANT,
+    TENANT_CONFIG_DATABASE,
+    DatabaseTenantSnapshot,
     TenantConfig,
     resolve_tenant_for_api_key,
 )
@@ -36,7 +40,7 @@ def _bearer_token() -> str | None:
     return token
 
 
-def authenticate_request() -> TenantConfig | None:
+def authenticate_request() -> TenantConfig | DatabaseTenantSnapshot | None:
     """Authenticate the request and return the tenant when in tenant mode.
 
     In single mode returns None after validating SERVICE_API_KEY.
@@ -48,8 +52,16 @@ def authenticate_request() -> TenantConfig | None:
 
     auth_mode = current_app.config.get("AUTH_MODE", AUTH_MODE_SINGLE)
     if auth_mode == AUTH_MODE_TENANT:
-        tenants = current_app.config.get("TENANTS") or ()
-        tenant = resolve_tenant_for_api_key(token, tenants)
+        if current_app.config.get("TENANT_CONFIG_SOURCE") == TENANT_CONFIG_DATABASE:
+            database = current_app.extensions.get("database")
+            if not isinstance(database, Database):
+                raise ServiceConfigurationError(
+                    "Database tenant mode has no configured database."
+                )
+            tenant = database.get_proxy_snapshot_by_api_key(token)
+        else:
+            tenants = current_app.config.get("TENANTS") or ()
+            tenant = resolve_tenant_for_api_key(token, tenants)
         if tenant is None:
             raise AuthenticationError()
         return tenant
@@ -84,7 +96,7 @@ def require_auth(func):
     return wrapper
 
 
-def current_tenant() -> TenantConfig | None:
+def current_tenant() -> TenantConfig | DatabaseTenantSnapshot | None:
     """Return the authenticated tenant for the current request, if any."""
     return getattr(g, "tenant", None)
 

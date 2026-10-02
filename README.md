@@ -124,6 +124,15 @@ Use this when multiple teams or Azure resources share one proxy host.
 - Unknown or invalid keys return the same generic **HTTP 401**.
 - `ENABLE_CODEX` must be `false`; the proxy refuses to start otherwise.
 
+### Tenant database mode (`TENANT_CONFIG_SOURCE=database`)
+
+Instead of `TENANTS` in the environment, persist tenants in PostgreSQL and manage
+them through `/admin`. Required settings include `DATABASE_URL`,
+`PROVIDER_ENCRYPTION_KEY`, `ADMIN_SESSION_SECRET`, and `WEBAUTHN_*` (RP ID, name,
+origins). After the first password bootstrap, admins must enroll a passkey;
+password login is then rejected. See [DEPLOYMENT.md](DEPLOYMENT.md#tenant-admin-ui-database-mode)
+for enrollment and operator recovery if the last passkey is lost.
+
 Generate a tenant cleartext key and hash:
 
 ```bash
@@ -324,6 +333,9 @@ Cursor’s servers must reach the proxy (reverse proxy, tunnel, or public host):
 ```bash
 cloudflared tunnel --url http://localhost:8082
 ```
+
+For a self-hosted server where multiple DNS names share one IP and need
+automatic HTTPS certificates, see the [Caddy Docker Compose setup](DEPLOYMENT.md#self-hosted-mehrere-dns-namen-auf-einer-ip).
 
 ### 4. Configure Cursor
 

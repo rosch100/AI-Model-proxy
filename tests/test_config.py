@@ -9,6 +9,7 @@ import sys
 
 import environs
 import pytest
+from flask import request
 
 from app import create_app
 from app.exceptions import ServiceConfigurationError
@@ -22,6 +23,83 @@ class TestConfig:
         app = testapp.app
         assert app.config["AZURE_BASE_URL"] != "change_me"
         assert app.config["AZURE_API_KEY"] != "change_me"
+
+    def test_untrusted_host_is_rejected(self, testapp):
+        """Reject Host headers not explicitly configured for the application."""
+        testapp.get("/health", headers={"Host": "attacker.example"}, status=400)
+
+    def test_proxy_headers_require_trusted_hosts(self):
+        """Refuse proxy-header trust unless the Host allowlist is configured."""
+        config = type(
+            "ProxyTrustConfig",
+            (),
+            {
+                "SERVICE_API_KEY": "test-service-api-key",
+                "TRUST_PROXY_HEADERS": True,
+                "TRUSTED_HOSTS": [],
+            },
+        )
+
+        with pytest.raises(ServiceConfigurationError, match="TRUSTED_HOSTS"):
+            create_app(config)
+
+    def test_trusted_hosts_must_be_a_sequence(self):
+        """Reject malformed allowlist config instead of splitting into chars."""
+        config = type(
+            "MalformedHostConfig",
+            (),
+            {
+                "SERVICE_API_KEY": "test-service-api-key",
+                "TRUSTED_HOSTS": "proxy.altanis.de",
+            },
+        )
+
+        with pytest.raises(ServiceConfigurationError, match="TRUSTED_HOSTS"):
+            create_app(config)
+
+    @pytest.mark.parametrize("public_host", ["proxy.altanis.de", "proxy.iffm-gmbh.de"])
+    def test_configured_proxy_hosts_are_accepted(self, app, public_host):
+        """Resolve both DNS names through the same application and tenant config."""
+        response = app.test_client().get("/v1/models", headers={"Host": public_host})
+
+        assert response.status_code == 401
+
+    def test_untrusted_forwarded_host_is_rejected(self, testapp):
+        """Reject a forwarded Host that is outside the configured allowlist."""
+        testapp.get(
+            "/health",
+            headers={
+                "Host": "proxy.altanis.de",
+                "X-Forwarded-Host": "attacker.example",
+            },
+            status=400,
+        )
+
+    def test_proxy_headers_reconstruct_public_request(self, testapp, app):
+        """Trust forwarding metadata from the configured reverse proxy hop."""
+        observed = {}
+
+        @app.before_request
+        def capture_request_metadata():
+            observed["host"] = request.host
+            observed["scheme"] = request.scheme
+            observed["remote_addr"] = request.remote_addr
+
+        testapp.get(
+            "/health",
+            headers={
+                "Host": "proxy.iffm-gmbh.de",
+                "X-Forwarded-For": "203.0.113.25",
+                "X-Forwarded-Proto": "https",
+            },
+            status=200,
+        )
+
+        assert observed == {
+            "host": "proxy.iffm-gmbh.de",
+            "scheme": "https",
+            "remote_addr": "203.0.113.25",
+        }
 
     def test_env_example_loads(self, monkeypatch):
         """Patch Env.read_env to read from .env.example and import settings."""

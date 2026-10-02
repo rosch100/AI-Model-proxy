@@ -1,0 +1,24 @@
+{% extends "admin/base.html" %}
+{% block title %}Passkey einrichten · Altanis Proxy{% endblock %}
+{% block content %}
+<section class="login-stage">
+  <p class="brand hero-brand">Altanis Proxy</p>
+  <h1>Passkey erforderlich</h1>
+  <p class="lede">Hallo {{ username }}. Richte jetzt einen Passkey ein, bevor du das Admin-Dashboard nutzen kannst.</p>
+  <div class="stack">
+    <label>
+      Bezeichnung
+      <input id="passkey-label" type="text" value="Hauptgerät" maxlength="128" />
+    </label>
+    <button type="button" id="passkey-register" class="primary-cta">Passkey registrieren</button>
+    <p id="passkey-register-status" class="status" hidden></p>
+  </div>
+  <form method="post" action="{{ url_for('admin.logout') }}" class="stack">
+    {{ logout_form.csrf_token }}
+    <button type="submit">Abmelden</button>
+  </form>
+</section>
+{% endblock %}
+{% block scripts %}
+<script src="{{ url_for('static', filename='admin/admin-passkeys.js') }}" defer></script>
+{% endblock %}

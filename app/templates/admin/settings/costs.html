@@ -1,0 +1,52 @@
+{% extends "admin/base.html" %}
+{% set current_user_nav = true %}
+{% block title %}Kosten · Altanis Proxy{% endblock %}
+{% block content %}
+<section>
+  <h1>Kosten</h1>
+  <p class="lede">Abrechnung nur für gebundenen Scope; Azure-Scope ist schreibgeschützt.</p>
+  {% if view.bindings %}
+    <ul>
+      {% for binding, node in view.bindings %}
+        <li>{{ binding.provider }} / {{ binding.purpose }}: <code>{{ node.canonical_scope_id }}</code></li>
+      {% endfor %}
+    </ul>
+  {% else %}
+    <p>Kein Billing-Scope gebunden.</p>
+  {% endif %}
+
+  <h2>Billing-Schlüssel (OpenAI / OpenRouter)</h2>
+  <form method="post" action="{{ url_for('admin.save_billing') }}" class="stack">
+    {{ billing_form.csrf_token }}
+    <label>{{ billing_form.provider.label }}{{ billing_form.provider() }}</label>
+    <label>{{ billing_form.billing_secret.label }}{{ billing_form.billing_secret() }}</label>
+    <button type="submit">Schlüssel speichern</button>
+  </form>
+
+  <h2>Aktualisieren</h2>
+  {% for provider in ["azure", "openai", "openrouter"] %}
+    <form method="post" action="{{ url_for('admin.refresh_costs') }}">
+      {{ billing_form.csrf_token }}
+      <input type="hidden" name="provider" value="{{ provider }}" />
+      <button type="submit">{{ provider }} aktualisieren</button>
+    </form>
+  {% endfor %}
+
+  {% if view.jobs %}
+    <h2>Letzte Jobs</h2>
+    <ul>
+      {% for job in view.jobs %}
+        <li>{{ job.provider }} — {{ job.status }}{% if job.limitation %} ({{ job.limitation }}){% endif %}</li>
+      {% endfor %}
+    </ul>
+  {% endif %}
+  {% if view.records %}
+    <h2>Datensätze</h2>
+    <ul>
+      {% for record in view.records %}
+        <li>{{ record.provider }} {{ record.kind }} {{ record.metric }}: {{ record.value }} {{ record.unit }}</li>
+      {% endfor %}
+    </ul>
+  {% endif %}
+</section>
+{% endblock %}

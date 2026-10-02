@@ -376,7 +376,11 @@ def replace_catalog_entries(
     entries: list[tuple[str, str | None]],
     error: str | None,
 ) -> None:
-    """Replace catalog rows for a profile after an out-of-band provider query."""
+    """Replace catalog rows after a successful provider query."""
+    profile.catalog_error = error
+    if error is not None:
+        return
+
     existing = session.scalars(
         select(ProviderCatalogEntry).where(
             ProviderCatalogEntry.profile_id == profile.id
@@ -395,7 +399,6 @@ def replace_catalog_entries(
             )
         )
     profile.catalog_refreshed_at = datetime.now(timezone.utc)
-    profile.catalog_error = error
 
 
 def save_billing_secret(

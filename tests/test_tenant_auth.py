@@ -276,7 +276,7 @@ def test_database_openai_provider_forwards_to_openai_compatible(monkeypatch):
             "WEBAUTHN_RP_ID": "localhost",
             "WEBAUTHN_RP_NAME": "Test Proxy",
             "WEBAUTHN_ORIGINS": "http://localhost",
-            "ENABLE_AZURE": True,
+            "ENABLE_AZURE": False,
             "ENABLE_CODEX": False,
             "AZURE_MODEL_DEPLOYMENTS": {},
             "AZURE_RESPONSES_API_URL": "https://global.openai.azure.com/openai/v1/responses",
@@ -332,6 +332,20 @@ def test_database_openai_provider_forwards_to_openai_compatible(monkeypatch):
     assert response.status_code == 200
     assert response.get_data(as_text=True) == "openai-ok"
     assert seen == {"provider": "openai", "default_model": "gpt-5.4"}
+
+    models = app.test_client().get(
+        "/v1/models", headers={"Authorization": f"Bearer {api_key}"}
+    )
+    assert models.status_code == 200
+    assert [item["id"] for item in models.json["data"]] == ["cursor-openai-model"]
+
+    azure = app.test_client().post(
+        "/azure/v1/chat/completions",
+        headers={"Authorization": f"Bearer {api_key}"},
+        json={"model": "cursor-openai-model", "messages": []},
+    )
+    assert azure.status_code == 400
+    assert "not available on the Azure route" in azure.text
     engine.dispose()
 
 

@@ -684,6 +684,36 @@ def test_catalog_entries_replace_previous_rows():
     database.engine.dispose()
 
 
+def test_failed_catalog_refresh_preserves_last_successful_entries():
+    """A failed provider query keeps the last known selectable catalog."""
+    database = build_admin_database()
+    seed_admin(database)
+    with database.sessions.begin() as session:
+        profile = create_provider_profile(
+            session,
+            database.secret_cipher,
+            "acme",
+            "openai",
+            "Work",
+            {},
+            "gpt-5.4",
+            "sk-test",
+            "ada",
+        )
+        replace_catalog_entries(session, profile, [("gpt-5.4", None)], None)
+        replace_catalog_entries(session, profile, [], "Provider catalog HTTP 503")
+        models = list(
+            session.scalars(
+                select(ProviderCatalogEntry.model_id).where(
+                    ProviderCatalogEntry.profile_id == profile.id
+                )
+            )
+        )
+        assert models == ["gpt-5.4"]
+        assert profile.catalog_error == "Provider catalog HTTP 503"
+    database.engine.dispose()
+
+
 def test_cost_refresh_persists_job_and_records():
     """Successful cost refresh writes job, event, records, and audit together."""
     database = build_admin_database()

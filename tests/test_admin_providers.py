@@ -1508,7 +1508,10 @@ def test_openai_billing_rejects_invalid_token_values(requests_mock, invalid_valu
         fetch_openai_costs("admin-key", "project-1", start, end)
 
 
-def test_openrouter_activity_returns_daily_costs_and_token_usage(requests_mock):
+@pytest.mark.parametrize("activity_date", ["2026-09-01", "2026-09-01 00:00:00"])
+def test_openrouter_activity_returns_daily_costs_and_token_usage(
+    requests_mock, activity_date
+):
     """Fetch daily costs and token usage from OpenRouter activity."""
     start = datetime(2026, 9, 1, tzinfo=timezone.utc)
     end = datetime(2026, 9, 2, tzinfo=timezone.utc)
@@ -1517,7 +1520,7 @@ def test_openrouter_activity_returns_daily_costs_and_token_usage(requests_mock):
         json={
             "data": [
                 {
-                    "date": "2026-09-01",
+                    "date": activity_date,
                     "model": "openai/gpt-5",
                     "endpoint_id": "endpoint-1",
                     "prompt_tokens": 100,
@@ -1560,6 +1563,34 @@ def test_openrouter_activity_returns_daily_costs_and_token_usage(requests_mock):
         "workspace_id": ["550e8400-e29b-41d4-a716-446655440000"]
     }
     assert request.headers["Authorization"] == "Bearer management-key"
+
+
+@pytest.mark.parametrize(
+    "activity_date",
+    [
+        None,
+        "not-a-date",
+        "20260901",
+        "2026-09-01 trailing-data",
+        "2026-09-01 12:00:00",
+        "2026-09-01T00:00:00",
+        "2026-09-01 00:00:00Z",
+    ],
+)
+def test_openrouter_activity_rejects_noncanonical_dates(requests_mock, activity_date):
+    """Reject activity dates outside the documented UTC day representations."""
+    requests_mock.get(
+        "https://openrouter.ai/api/v1/activity",
+        json={"data": [{"date": activity_date}]},
+    )
+
+    with pytest.raises(CostRefreshError, match="activity date is invalid"):
+        fetch_openrouter_costs(
+            "management-key",
+            "550e8400-e29b-41d4-a716-446655440000",
+            datetime(2026, 9, 1, tzinfo=timezone.utc),
+            datetime(2026, 9, 2, tzinfo=timezone.utc),
+        )
 
 
 @pytest.mark.parametrize("invalid_value", ["1e18", "0.00000000001"])

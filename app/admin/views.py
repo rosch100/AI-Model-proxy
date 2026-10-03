@@ -679,6 +679,9 @@ def save_billing():
     except LookupError as exc:
         flash(str(exc), "error")
         return redirect(url_for("admin.settings_costs"))
+    except ValueError as exc:
+        flash(str(exc), "error")
+        return redirect(url_for("admin.settings_costs"))
     flash("Billing-Schlüssel gespeichert.", "info")
     return redirect(url_for("admin.settings_costs"))
 
@@ -700,6 +703,29 @@ def refresh_costs():
             binding_id = binding.id
             job_id = job.id
             canonical_scope_id = node.canonical_scope_id
+            usage_scope_id = None
+            if provider == "azure":
+                usage_binding = session.scalar(
+                    select(ProviderScopeBinding).where(
+                        ProviderScopeBinding.tenant_id == g.admin.tenant_id,
+                        ProviderScopeBinding.provider == "azure",
+                        ProviderScopeBinding.purpose == "usage",
+                    )
+                )
+                if (
+                    usage_binding is None
+                    or usage_binding.profile_id != profile.id
+                    or usage_binding.parent_binding_id != binding.id
+                ):
+                    raise LookupError(
+                        "Azure Cognitive Services usage scope is not bound"
+                    )
+                usage_node = session.get(ProviderScopeNode, usage_binding.node_id)
+                if usage_node is None or usage_node.parent_node_id != binding.node_id:
+                    raise LookupError(
+                        "Azure Cognitive Services usage scope is not bound"
+                    )
+                usage_scope_id = usage_node.canonical_scope_id
     except LookupError as exc:
         flash(str(exc), "error")
         return redirect(url_for("admin.settings_costs"))
@@ -708,7 +734,12 @@ def refresh_costs():
         profile = session.get(ProviderProfile, profile_id)
         try:
             buckets = collect_provider_costs(
-                database.secret_cipher, profile, canonical_scope_id, start, end
+                database.secret_cipher,
+                profile,
+                canonical_scope_id,
+                start,
+                end,
+                usage_scope_id=usage_scope_id,
             )
             error = None
         except CostRefreshError as exc:
@@ -1063,6 +1094,21 @@ def _costs_context() -> dict[str, object]:
                 .order_by(CostUsageRecord.id.desc())
             )
         )
+        azure_bindings = {
+            binding.purpose: (binding, node)
+            for binding, node in bindings
+            if binding.provider == "azure"
+        }
+        azure_billing = azure_bindings.get("billing")
+        azure_usage = azure_bindings.get("usage")
+        azure_costs_ready = (
+            profiles.get("azure") is not None
+            and azure_billing is not None
+            and azure_usage is not None
+            and azure_usage[0].profile_id == azure_billing[0].profile_id
+            and azure_usage[0].parent_binding_id == azure_billing[0].id
+            and azure_usage[1].parent_node_id == azure_billing[0].node_id
+        )
         session.expunge_all()
         return {
             "view": CostsView(
@@ -1071,8 +1117,14 @@ def _costs_context() -> dict[str, object]:
                 jobs=jobs,
                 records=records,
                 billing_key_masks=billing_key_masks,
+                azure_profile_configured=profiles.get("azure") is not None,
+                azure_costs_ready=azure_costs_ready,
             ),
             "billing_form": BillingCredentialsForm(),
+            "billing_forms": {
+                provider: BillingCredentialsForm(data={"provider": provider})
+                for provider in ("openai", "openrouter")
+            },
             "logout_form": LoginForm(),
         }
 

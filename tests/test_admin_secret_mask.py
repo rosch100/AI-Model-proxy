@@ -8,6 +8,11 @@ import secrets
 from app.admin.security import ADMIN_COOKIE_NAME, mask_secret
 from app.persistence.admin_auth import authenticate_admin, create_admin_session
 from app.persistence.admin_ops import replace_catalog_entries, upsert_provider_profile
+from app.persistence.models import (
+    ProviderProfile,
+    ProviderScopeBinding,
+    ProviderScopeNode,
+)
 from app.persistence.passkeys import insert_passkey
 from app.providers.catalog import (
     azure_deployments_from_catalog,
@@ -125,13 +130,167 @@ def test_costs_page_explains_provider_specific_credentials_and_limits(admin_app)
     body = response.get_data(as_text=True)
 
     assert response.status_code == 200
-    assert "Es gibt keinen providerübergreifenden „Billing-Key“." in body
+    assert "Billing-Zugangsdaten sind vom Inference-Schlüssel getrennt." in body
     assert "Admin API Key" in body
     assert "Management Key" in body
-    assert "Workspace-ID enthalten" in body
+    assert "Workspace-ID dieses Kontos enthalten" in body
     assert "als Filter verwendet" in body
-    assert "Azure-API-Key reicht nicht" in body
+    assert "keine Tenant-Credential eingegeben" in body
     assert "letzten 30 abgeschlossenen UTC-Tage" in body
-    assert "OpenRouter-Guthabenverbrauch und BYOK-Kosten getrennt" in body
-    assert "Prompt-, Completion- und Reasoning-Tokens" in body
-    assert "Kosten und Tokenverbrauch" in body
+    assert "OpenRouter- und BYOK-Kosten sowie Tokenverbrauch" in body
+    assert "Kosten und Input-/Output-Tokens" in body
+    assert 'id="openai-billing-secret"' in body
+    assert 'name="provider" type="hidden" value="openai"' in body
+    assert 'id="openrouter-billing-secret"' in body
+    assert 'name="provider" type="hidden" value="openrouter"' in body
+
+
+def test_azure_cost_refresh_rejects_usage_scope_outside_billing_scope(
+    admin_app, monkeypatch
+):
+    """Azure refresh does not query a usage node from another resource group."""
+    database = admin_app.extensions["database"]
+    with database.sessions.begin() as session:
+        session.add(
+            ProviderProfile(
+                id="azure-profile",
+                tenant_id="acme",
+                provider="azure",
+                settings={},
+            )
+        )
+        session.add_all(
+            (
+                ProviderScopeNode(
+                    id="azure-rg-node",
+                    tenant_id="acme",
+                    provider="azure",
+                    scope_type="resource_group",
+                    canonical_scope_id="/subscriptions/sub/resourceGroups/acme-rg",
+                ),
+                ProviderScopeNode(
+                    id="other-rg-node",
+                    tenant_id="acme",
+                    provider="azure",
+                    scope_type="resource_group",
+                    canonical_scope_id="/subscriptions/sub/resourceGroups/other-rg",
+                ),
+                ProviderScopeNode(
+                    id="azure-resource-node",
+                    tenant_id="acme",
+                    provider="azure",
+                    scope_type="cognitive_resource",
+                    canonical_scope_id=(
+                        "/subscriptions/sub/resourceGroups/other-rg/providers/"
+                        "microsoft.cognitiveservices/accounts/acme-ai"
+                    ),
+                    parent_node_id="other-rg-node",
+                ),
+            )
+        )
+        session.flush()
+        session.add_all(
+            (
+                ProviderScopeBinding(
+                    id="azure-billing-binding",
+                    tenant_id="acme",
+                    provider="azure",
+                    profile_id="azure-profile",
+                    purpose="billing",
+                    node_id="azure-rg-node",
+                ),
+                ProviderScopeBinding(
+                    id="azure-usage-binding",
+                    tenant_id="acme",
+                    provider="azure",
+                    profile_id="azure-profile",
+                    purpose="usage",
+                    node_id="azure-resource-node",
+                    parent_binding_id="azure-billing-binding",
+                ),
+            )
+        )
+
+    queried_scopes = []
+    monkeypatch.setattr(
+        "app.admin.views.collect_provider_costs",
+        lambda *args, **kwargs: queried_scopes.append(kwargs.get("usage_scope_id"))
+        or [],
+    )
+    client = _authenticated_admin_client(admin_app)
+    page = client.get("/admin/settings/costs").get_data(as_text=True)
+    csrf_token = re.search(r'name="csrf_token" type="hidden" value="([^"]+)"', page)
+    assert csrf_token is not None
+
+    client.post(
+        "/admin/settings/costs/refresh",
+        data={"provider": "azure", "csrf_token": csrf_token.group(1)},
+    )
+
+    assert queried_scopes == []
+
+
+def test_costs_page_shows_azure_host_identity_and_bound_scope_controls(admin_app):
+    """Azure uses read-only operator identity information, not tenant secrets."""
+    database = admin_app.extensions["database"]
+    with database.sessions.begin() as session:
+        session.add(
+            ProviderProfile(
+                id="azure-profile",
+                tenant_id="acme",
+                provider="azure",
+                settings={},
+            )
+        )
+        resource_group = ProviderScopeNode(
+            id="azure-rg-node",
+            tenant_id="acme",
+            provider="azure",
+            scope_type="resource_group",
+            canonical_scope_id="/subscriptions/sub/resourcegroups/acme-rg",
+        )
+        resource = ProviderScopeNode(
+            id="azure-resource-node",
+            tenant_id="acme",
+            provider="azure",
+            scope_type="cognitive_services",
+            canonical_scope_id=(
+                "/subscriptions/sub/resourcegroups/acme-rg/providers/"
+                "microsoft.cognitiveservices/accounts/acme-ai"
+            ),
+            parent_node_id="azure-rg-node",
+        )
+        session.add_all((resource_group, resource))
+        session.flush()
+        billing_binding = ProviderScopeBinding(
+            id="azure-billing-binding",
+            tenant_id="acme",
+            provider="azure",
+            profile_id="azure-profile",
+            purpose="billing",
+            node_id=resource_group.id,
+        )
+        usage_binding = ProviderScopeBinding(
+            id="azure-usage-binding",
+            tenant_id="acme",
+            provider="azure",
+            profile_id="azure-profile",
+            purpose="usage",
+            node_id=resource.id,
+            parent_binding_id="azure-billing-binding",
+        )
+        session.add_all((billing_binding, usage_binding))
+
+    body = (
+        _authenticated_admin_client(admin_app)
+        .get("/admin/settings/costs")
+        .get_data(as_text=True)
+    )
+
+    assert "Hostidentität" in body
+    assert "Managed Identity" in body
+    assert "Workload Identity" in body
+    assert "Azure-Kosten aktualisieren" in body
+    assert 'name="client_secret"' not in body
+    assert "Azure-Service-Principal" not in body
+    assert "acme-rg" in body

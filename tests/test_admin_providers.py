@@ -20,6 +20,7 @@ from app.persistence.admin_ops import (
     activate_provider_profile,
     change_admin_password,
     replace_catalog_entries,
+    save_billing_secret,
     upsert_provider_profile,
 )
 from app.persistence.models import (
@@ -32,12 +33,13 @@ from app.persistence.models import (
     ProviderScopeNode,
     Tenant,
 )
-from app.providers import cost_jobs
+from app.providers import cost_jobs, costs
 from app.providers.catalog import refresh_provider_catalog
 from app.providers.cost_jobs import collect_provider_costs, persist_cost_refresh
 from app.providers.costs import (
     CostBucket,
     CostRefreshError,
+    fetch_azure_costs,
     fetch_openai_costs,
     fetch_openrouter_costs,
 )
@@ -916,6 +918,335 @@ def test_openrouter_activity_excludes_records_outside_requested_period(requests_
     }
 
 
+def test_azure_cost_query_filters_and_verifies_the_bound_resource(
+    requests_mock, monkeypatch
+):
+    """Azure actual costs use a filtered daily query and return exact dimensions."""
+    resource_group_id = (
+        "/subscriptions/aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa/" "resourcegroups/acme-rg"
+    )
+    resource_id = (
+        f"{resource_group_id}/providers/microsoft.cognitiveservices/accounts/acme-ai"
+    )
+    start = datetime(2026, 9, 1, tzinfo=timezone.utc)
+    end = datetime(2026, 9, 3, tzinfo=timezone.utc)
+    monkeypatch.setattr("app.providers.costs._azure_arm_token", lambda: "arm-token")
+    requests_mock.post(
+        f"https://management.azure.com{resource_group_id}"
+        "/providers/Microsoft.CostManagement/query?api-version=2026-06-01",
+        json={
+            "properties": {
+                "columns": [
+                    {"name": "PreTaxCost"},
+                    {"name": "ResourceId"},
+                    {"name": "UsageDate"},
+                    {"name": "Currency"},
+                ],
+                "rows": [
+                    ["0.125", resource_id, 20260901, "USD"],
+                    ["1.50", resource_id, 20260902, "EUR"],
+                ],
+            }
+        },
+    )
+
+    buckets = fetch_azure_costs(resource_group_id, resource_id, start, end)
+
+    assert [(bucket.value, bucket.currency) for bucket in buckets] == [
+        (Decimal("0.125"), "USD"),
+        (Decimal("1.50"), "EUR"),
+    ]
+    assert [bucket.bucket_start for bucket in buckets] == [
+        start,
+        datetime(2026, 9, 2, tzinfo=timezone.utc),
+    ]
+    assert all(
+        bucket.kind == "actual" and bucket.granularity == "day" for bucket in buckets
+    )
+    assert all(bucket.dimensions == {"resource_id": resource_id} for bucket in buckets)
+    request = requests_mock.last_request
+    assert request.headers["Authorization"] == "Bearer arm-token"
+    assert request.json() == {
+        "type": "ActualCost",
+        "timeframe": "Custom",
+        "timePeriod": {"from": "2026-09-01", "to": "2026-09-02"},
+        "dataset": {
+            "granularity": "Daily",
+            "aggregation": {"totalCost": {"name": "PreTaxCost", "function": "Sum"}},
+            "filter": {
+                "dimensions": {
+                    "name": "ResourceId",
+                    "operator": "In",
+                    "values": [resource_id],
+                }
+            },
+            "grouping": [
+                {"type": "Dimension", "name": "ResourceId"},
+                {"type": "Dimension", "name": "Currency"},
+            ],
+        },
+    }
+
+
+@pytest.mark.parametrize("currency", ["ßaa", "1SD", "U$D"])
+def test_azure_cost_query_rejects_non_ascii_or_non_alphabetic_currency(
+    requests_mock, monkeypatch, currency
+):
+    """Azure currency must be three ASCII letters before persistence."""
+    resource_group_id = "/subscriptions/sub/resourcegroups/acme-rg"
+    resource_id = (
+        f"{resource_group_id}/providers/microsoft.cognitiveservices/accounts/acme-ai"
+    )
+    monkeypatch.setattr(costs, "_azure_arm_token", lambda: "arm-token")
+    requests_mock.post(
+        f"https://management.azure.com{resource_group_id}"
+        "/providers/Microsoft.CostManagement/query?api-version=2026-06-01",
+        json={
+            "properties": {
+                "columns": [
+                    {"name": "PreTaxCost"},
+                    {"name": "ResourceId"},
+                    {"name": "UsageDate"},
+                    {"name": "Currency"},
+                ],
+                "rows": [[1.25, resource_id, 20260901, currency]],
+            }
+        },
+    )
+
+    with pytest.raises(CostRefreshError, match="currency is invalid"):
+        fetch_azure_costs(
+            resource_group_id,
+            resource_id,
+            datetime(2026, 9, 1, tzinfo=timezone.utc),
+            datetime(2026, 9, 2, tzinfo=timezone.utc),
+        )
+
+
+@pytest.mark.parametrize("usage_date", ["202691", "2026-09-01", 202691, 20260901.0])
+def test_azure_cost_query_rejects_noncanonical_usage_date(
+    requests_mock, monkeypatch, usage_date
+):
+    """Azure UsageDate must be an exact eight-digit calendar date."""
+    resource_group_id = "/subscriptions/sub/resourcegroups/acme-rg"
+    resource_id = (
+        f"{resource_group_id}/providers/microsoft.cognitiveservices/accounts/acme-ai"
+    )
+    monkeypatch.setattr(costs, "_azure_arm_token", lambda: "arm-token")
+    requests_mock.post(
+        f"https://management.azure.com{resource_group_id}"
+        "/providers/Microsoft.CostManagement/query?api-version=2026-06-01",
+        json={
+            "properties": {
+                "columns": [
+                    {"name": "PreTaxCost"},
+                    {"name": "ResourceId"},
+                    {"name": "UsageDate"},
+                    {"name": "Currency"},
+                ],
+                "rows": [[1.25, resource_id, usage_date, "USD"]],
+            }
+        },
+    )
+
+    with pytest.raises(CostRefreshError, match="invalid values"):
+        fetch_azure_costs(
+            resource_group_id,
+            resource_id,
+            datetime(2026, 9, 1, tzinfo=timezone.utc),
+            datetime(2026, 9, 2, tzinfo=timezone.utc),
+        )
+
+
+def test_azure_cost_query_rejects_unbound_resource_rows(requests_mock, monkeypatch):
+    """A scope-level row without the exact bound resource is unavailable."""
+    resource_group_id = (
+        "/subscriptions/aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa/" "resourcegroups/acme-rg"
+    )
+    resource_id = (
+        f"{resource_group_id}/providers/microsoft.cognitiveservices/accounts/acme-ai"
+    )
+    monkeypatch.setattr("app.providers.costs._azure_arm_token", lambda: "arm-token")
+    requests_mock.post(
+        f"https://management.azure.com{resource_group_id}"
+        "/providers/Microsoft.CostManagement/query?api-version=2026-06-01",
+        json={
+            "properties": {
+                "columns": [
+                    {"name": "PreTaxCost"},
+                    {"name": "ResourceId"},
+                    {"name": "UsageDate"},
+                    {"name": "Currency"},
+                ],
+                "rows": [
+                    [
+                        1.25,
+                        f"{resource_group_id}/providers/other/resource",
+                        20260901,
+                        "USD",
+                    ]
+                ],
+            }
+        },
+    )
+
+    with pytest.raises(CostRefreshError, match="does not confirm the bound resource"):
+        fetch_azure_costs(
+            resource_group_id,
+            resource_id,
+            datetime(2026, 9, 1, tzinfo=timezone.utc),
+            datetime(2026, 9, 2, tzinfo=timezone.utc),
+        )
+
+
+def test_azure_cost_query_treats_no_content_as_no_costs(requests_mock, monkeypatch):
+    """A successful Azure 204 response represents an empty cost result."""
+    resource_group_id = "/subscriptions/sub/resourcegroups/acme-rg"
+    resource_id = (
+        f"{resource_group_id}/providers/microsoft.cognitiveservices/accounts/acme-ai"
+    )
+    monkeypatch.setattr(costs, "_azure_arm_token", lambda: "arm-token")
+    requests_mock.post(
+        f"https://management.azure.com{resource_group_id}"
+        "/providers/Microsoft.CostManagement/query?api-version=2026-06-01",
+        status_code=204,
+    )
+
+    assert (
+        fetch_azure_costs(
+            resource_group_id,
+            resource_id,
+            datetime(2026, 9, 1, tzinfo=timezone.utc),
+            datetime(2026, 9, 2, tzinfo=timezone.utc),
+        )
+        == []
+    )
+
+
+def test_azure_cost_query_rejects_non_string_column_names(requests_mock, monkeypatch):
+    """Malformed Azure column metadata fails as a typed provider error."""
+    resource_group_id = "/subscriptions/sub/resourcegroups/acme-rg"
+    resource_id = (
+        f"{resource_group_id}/providers/microsoft.cognitiveservices/accounts/acme-ai"
+    )
+    monkeypatch.setattr(costs, "_azure_arm_token", lambda: "arm-token")
+    requests_mock.post(
+        f"https://management.azure.com{resource_group_id}"
+        "/providers/Microsoft.CostManagement/query?api-version=2026-06-01",
+        json={
+            "properties": {
+                "columns": [
+                    {"name": ["PreTaxCost"]},
+                    {"name": "ResourceId"},
+                    {"name": "UsageDate"},
+                    {"name": "Currency"},
+                ],
+                "rows": [],
+            }
+        },
+    )
+
+    with pytest.raises(CostRefreshError, match="column names are invalid") as exc_info:
+        fetch_azure_costs(
+            resource_group_id,
+            resource_id,
+            datetime(2026, 9, 1, tzinfo=timezone.utc),
+            datetime(2026, 9, 2, tzinfo=timezone.utc),
+        )
+
+    assert exc_info.value.status == "unavailable"
+
+
+def test_azure_cost_query_marks_missing_resource_dimension_unavailable(
+    requests_mock, monkeypatch
+):
+    """Do not report costs when the response cannot prove the bound resource."""
+    resource_group_id = "/subscriptions/sub/resourcegroups/acme-rg"
+    resource_id = (
+        f"{resource_group_id}/providers/microsoft.cognitiveservices/accounts/acme-ai"
+    )
+    monkeypatch.setattr(costs, "_azure_arm_token", lambda: "arm-token")
+    requests_mock.post(
+        f"https://management.azure.com{resource_group_id}"
+        "/providers/Microsoft.CostManagement/query?api-version=2026-06-01",
+        json={
+            "properties": {
+                "columns": [
+                    {"name": "PreTaxCost"},
+                    {"name": "UsageDate"},
+                    {"name": "Currency"},
+                ],
+                "rows": [[1.25, 20260901, "USD"]],
+            }
+        },
+    )
+
+    with pytest.raises(
+        CostRefreshError, match="missing required dimensions"
+    ) as exc_info:
+        fetch_azure_costs(
+            resource_group_id,
+            resource_id,
+            datetime(2026, 9, 1, tzinfo=timezone.utc),
+            datetime(2026, 9, 2, tzinfo=timezone.utc),
+        )
+
+    assert exc_info.value.status == "unavailable"
+
+
+def test_azure_cost_refresh_uses_host_identity_without_tenant_secret(monkeypatch):
+    """Azure costs use the two bound scopes and never decrypt a tenant secret."""
+    start = datetime(2026, 9, 1, tzinfo=timezone.utc)
+    end = datetime(2026, 9, 2, tzinfo=timezone.utc)
+    resource_group_id = "/subscriptions/sub/resourcegroups/acme-rg"
+    resource_id = (
+        f"{resource_group_id}/providers/microsoft.cognitiveservices/accounts/acme-ai"
+    )
+    profile = ProviderProfile(
+        id=str(uuid4()),
+        tenant_id="acme",
+        provider="azure",
+        settings={},
+    )
+    requested = []
+
+    def fetch_costs(group_id, bound_resource_id, requested_start, requested_end):
+        requested.append((group_id, bound_resource_id, requested_start, requested_end))
+        return []
+
+    monkeypatch.setattr(cost_jobs, "fetch_azure_costs", fetch_costs)
+
+    result = collect_provider_costs(
+        build_admin_database().secret_cipher,
+        profile,
+        resource_group_id,
+        start,
+        end,
+        usage_scope_id=resource_id,
+    )
+
+    assert result == []
+    assert requested == [(resource_group_id, resource_id, start, end)]
+
+
+def test_azure_profile_rejects_tenant_billing_secret():
+    """Azure billing credentials are owned by the operator host identity."""
+    database = build_admin_database()
+    try:
+        with database.sessions.begin() as session:
+            with pytest.raises(ValueError, match="operator host identity"):
+                save_billing_secret(
+                    session,
+                    database.secret_cipher,
+                    "acme",
+                    "azure",
+                    "tenant-secret",
+                    "ada",
+                )
+    finally:
+        database.engine.dispose()
+
+
 def test_cost_refresh_requires_separate_billing_credential(requests_mock):
     """Cost refresh never sends the inference credential to a billing API."""
     database = build_admin_database()
@@ -968,6 +1299,110 @@ def test_cost_refresh_requires_separate_billing_credential(requests_mock):
         assert requests_mock.request_history == []
     finally:
         database.engine.dispose()
+
+
+def test_azure_token_uses_user_assigned_managed_identity(monkeypatch):
+    """The operator-selected client ID is passed to managed identity auth."""
+    for name in (
+        "AZURE_FEDERATED_TOKEN_FILE",
+        "IDENTITY_ENDPOINT",
+        "MSI_ENDPOINT",
+        "WEBSITE_HOSTNAME",
+        "CONTAINER_APP_HOSTNAME",
+        "AZURE_TENANT_ID",
+        "AZURE_CLIENT_CERTIFICATE_PATH",
+    ):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("AZURE_CLIENT_ID", "user-assigned-client-id")
+    credentials = []
+
+    class FakeCredential:
+        def __init__(self, **kwargs):
+            credentials.append(kwargs)
+
+        def get_token(self, scope):
+            return type("Token", (), {"token": "arm-token"})()
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(costs, "ManagedIdentityCredential", FakeCredential)
+
+    assert costs._azure_arm_token() == "arm-token"
+    assert credentials == [{"client_id": "user-assigned-client-id"}]
+
+
+def test_azure_token_uses_managed_identity_without_platform_markers(monkeypatch):
+    """Managed identity credential can discover an Azure VM through IMDS."""
+    for name in (
+        "AZURE_FEDERATED_TOKEN_FILE",
+        "IDENTITY_ENDPOINT",
+        "MSI_ENDPOINT",
+        "WEBSITE_HOSTNAME",
+        "CONTAINER_APP_HOSTNAME",
+        "AZURE_TENANT_ID",
+        "AZURE_CLIENT_ID",
+        "AZURE_CLIENT_CERTIFICATE_PATH",
+    ):
+        monkeypatch.delenv(name, raising=False)
+    calls = []
+
+    class FakeCredential:
+        def __init__(self, client_id=None):
+            assert client_id is None
+
+        def get_token(self, scope):
+            calls.append(("get_token", scope))
+            return type("Token", (), {"token": "arm-token"})()
+
+        def close(self):
+            calls.append(("close",))
+
+    monkeypatch.setattr(costs, "ManagedIdentityCredential", FakeCredential)
+
+    assert costs._azure_arm_token() == "arm-token"
+    assert calls == [
+        ("get_token", "https://management.azure.com/.default"),
+        ("close",),
+    ]
+
+
+def test_azure_token_uses_operator_certificate_identity(monkeypatch):
+    """Off-Azure certificate identity uses the Azure Identity SDK credential."""
+    for name in (
+        "AZURE_FEDERATED_TOKEN_FILE",
+        "IDENTITY_ENDPOINT",
+        "MSI_ENDPOINT",
+        "WEBSITE_HOSTNAME",
+        "CONTAINER_APP_HOSTNAME",
+    ):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("AZURE_TENANT_ID", "tenant-id")
+    monkeypatch.setenv("AZURE_CLIENT_ID", "client-id")
+    monkeypatch.setenv("AZURE_CLIENT_CERTIFICATE_PATH", "/operator/id.pem")
+    credentials = []
+
+    class FakeCredential:
+        def __init__(self, **kwargs):
+            credentials.append(kwargs)
+
+        def get_token(self, scope):
+            return type("Token", (), {"token": "arm-token"})()
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(costs, "CertificateCredential", FakeCredential)
+
+    assert costs._azure_arm_token() == "arm-token"
+    assert credentials == [
+        {
+            "tenant_id": "tenant-id",
+            "client_id": "client-id",
+            "certificate_path": "/operator/id.pem",
+            "password": None,
+        }
+    ]
 
 
 def test_password_change_revokes_other_sessions(admin_app):

@@ -135,8 +135,18 @@ def collect_provider_costs(
     canonical_scope_id: str,
     start: datetime,
     end: datetime,
+    usage_scope_id: str | None = None,
 ) -> list[CostBucket]:
-    """Call the provider billing API using decrypted credentials."""
+    """Call provider billing APIs using stored credentials or host identity."""
+    if profile.provider == "azure":
+        if not usage_scope_id:
+            raise CostRefreshError(
+                "Azure usage scope is missing.", status="unavailable"
+            )
+        try:
+            return fetch_azure_costs(canonical_scope_id, usage_scope_id, start, end)
+        except requests.RequestException as exc:
+            raise CostRefreshError("Azure billing request failed.") from exc
     if profile.billing_secret_ciphertext is None:
         raise CostRefreshError("Billing credentials are missing.")
     try:
@@ -148,8 +158,6 @@ def collect_provider_costs(
             return fetch_openai_costs(secret, canonical_scope_id, start, end)
         if profile.provider == "openrouter":
             return fetch_openrouter_costs(secret, canonical_scope_id, start, end)
-        if profile.provider == "azure":
-            return fetch_azure_costs(secret, canonical_scope_id, start, end)
     except requests.RequestException as exc:
         raise CostRefreshError(
             f"{profile.provider.capitalize()} billing request failed."

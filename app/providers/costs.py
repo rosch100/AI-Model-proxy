@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import json
+import os
+import re
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
@@ -10,6 +12,12 @@ from time import monotonic
 from uuid import UUID
 
 import requests
+from azure.core.exceptions import AzureError
+from azure.identity import (
+    CertificateCredential,
+    ManagedIdentityCredential,
+    WorkloadIdentityCredential,
+)
 
 OPENAI_MAX_PAGES = 5
 OPENAI_REQUEST_BUDGET_SECONDS = 45
@@ -378,26 +386,53 @@ def fetch_openrouter_costs(
 
 
 def fetch_azure_costs(
-    billing_secret: str, resource_group_id: str, start: datetime, end: datetime
+    resource_group_id: str,
+    resource_id: str,
+    start: datetime,
+    end: datetime,
 ) -> list[CostBucket]:
-    """Query Azure Cost Management for the bound resource group scope."""
-    token = _azure_arm_token(billing_secret)
+    """Query daily actual cost for exactly the bound Azure Cognitive Services resource."""
+    if start.tzinfo is None or end.tzinfo is None:
+        raise CostRefreshError("Azure billing period must use timezone-aware UTC days.")
+    period_start = start.astimezone(timezone.utc)
+    period_end = end.astimezone(timezone.utc)
+    if (
+        period_start.time() != datetime.min.time()
+        or period_end.time() != datetime.min.time()
+        or period_start >= period_end
+    ):
+        raise CostRefreshError("Azure billing period must use full UTC days.")
+    resource_group_prefix = resource_group_id.rstrip("/").casefold() + "/"
+    if not resource_id.casefold().startswith(resource_group_prefix):
+        raise CostRefreshError(
+            "Azure usage resource is outside the billing Resource Group."
+        )
+    token = _azure_arm_token()
     url = (
         f"https://management.azure.com{resource_group_id}"
-        "/providers/Microsoft.CostManagement/query?api-version=2023-11-01"
+        "/providers/Microsoft.CostManagement/query?api-version=2026-06-01"
     )
     body = {
         "type": "ActualCost",
         "timeframe": "Custom",
         "timePeriod": {
-            "from": start.astimezone(timezone.utc).date().isoformat(),
-            "to": end.astimezone(timezone.utc).date().isoformat(),
+            "from": period_start.date().isoformat(),
+            "to": (period_end.date() - timedelta(days=1)).isoformat(),
         },
         "dataset": {
             "granularity": "Daily",
-            "aggregation": {
-                "totalCost": {"name": "Cost", "function": "Sum"},
+            "aggregation": {"totalCost": {"name": "PreTaxCost", "function": "Sum"}},
+            "filter": {
+                "dimensions": {
+                    "name": "ResourceId",
+                    "operator": "In",
+                    "values": [resource_id],
+                }
             },
+            "grouping": [
+                {"type": "Dimension", "name": "ResourceId"},
+                {"type": "Dimension", "name": "Currency"},
+            ],
         },
     }
     response = requests.post(
@@ -406,64 +441,144 @@ def fetch_azure_costs(
         json=body,
         timeout=PROVIDER_REQUEST_TIMEOUT,
     )
+    if response.status_code == 204:
+        return []
     if response.status_code == 429:
         raise CostRefreshError("Azure costs are rate limited.", status="unavailable")
+    if response.status_code in {401, 403}:
+        raise CostRefreshError(
+            "Azure Cost Management access is unavailable for the bound scope.",
+            status="unavailable",
+        )
     if response.status_code >= 400:
         raise CostRefreshError(f"Azure costs HTTP {response.status_code}")
-    payload = response.json()
-    properties = payload.get("properties") if isinstance(payload, dict) else None
-    rows = properties.get("rows") if isinstance(properties, dict) else None
-    if not isinstance(rows, list):
-        raise CostRefreshError("Azure costs payload is invalid.")
-    total = Decimal("0")
-    for row in rows:
-        if isinstance(row, list) and row:
-            total += Decimal(str(row[0]))
-    return [
-        CostBucket(
-            kind="actual",
-            metric="cost",
-            value=total,
-            unit="currency",
-            currency="USD",
-            bucket_start=start,
-            bucket_end=end,
-            source="azure.costmanagement.query",
-            granularity="window",
-            dimensions={"scope": resource_group_id},
-        )
-    ]
-
-
-def _azure_arm_token(billing_secret: str) -> str:
     try:
-        payload = json.loads(billing_secret)
-    except json.JSONDecodeError as exc:
+        payload = response.json()
+    except (requests.JSONDecodeError, ValueError) as exc:
+        raise CostRefreshError("Azure costs payload is invalid.") from exc
+    properties = payload.get("properties") if isinstance(payload, dict) else None
+    if isinstance(properties, dict) and properties.get("nextLink"):
         raise CostRefreshError(
-            "Azure billing credentials must be a JSON service principal."
-        ) from exc
-    tenant_id = payload.get("tenant_id")
-    client_id = payload.get("client_id")
-    client_secret = payload.get("client_secret")
-    if not all(
-        isinstance(value, str) and value
-        for value in (tenant_id, client_id, client_secret)
+            "Azure costs response is paginated and cannot be shown as a complete snapshot.",
+            status="unavailable",
+        )
+    columns = properties.get("columns") if isinstance(properties, dict) else None
+    rows = properties.get("rows") if isinstance(properties, dict) else None
+    if not isinstance(columns, list) or not isinstance(rows, list):
+        raise CostRefreshError("Azure costs payload is invalid.")
+    column_names = [
+        column.get("name") if isinstance(column, dict) else None for column in columns
+    ]
+    if any(not isinstance(name, str) for name in column_names):
+        raise CostRefreshError(
+            "Azure costs column names are invalid.", status="unavailable"
+        )
+    required_columns = {"PreTaxCost", "ResourceId", "UsageDate", "Currency"}
+    if len(set(column_names)) != len(column_names) or not required_columns.issubset(
+        column_names
     ):
-        raise CostRefreshError("Azure billing credentials are incomplete.")
-    token_url = f"https://login.microsoftonline.com/{tenant_id}/oauth2/v2.0/token"
-    response = requests.post(
-        token_url,
-        data={
-            "grant_type": "client_credentials",
-            "client_id": client_id,
-            "client_secret": client_secret,
-            "scope": "https://management.azure.com/.default",
-        },
-        timeout=30,
-    )
-    if response.status_code >= 400:
-        raise CostRefreshError("Azure billing authentication failed.")
-    token = response.json().get("access_token")
-    if not isinstance(token, str) or not token:
-        raise CostRefreshError("Azure billing authentication returned no token.")
-    return token
+        raise CostRefreshError(
+            "Azure costs response is missing required dimensions.",
+            status="unavailable",
+        )
+    positions = {name: column_names.index(name) for name in required_columns}
+    buckets: list[CostBucket] = []
+    for row in rows:
+        if not isinstance(row, list) or len(row) != len(column_names):
+            raise CostRefreshError("Azure costs row is invalid.")
+        returned_resource_id = row[positions["ResourceId"]]
+        if (
+            not isinstance(returned_resource_id, str)
+            or returned_resource_id.casefold() != resource_id.casefold()
+        ):
+            raise CostRefreshError(
+                "Azure costs response does not confirm the bound resource.",
+                status="unavailable",
+            )
+        currency = row[positions["Currency"]]
+        if (
+            not isinstance(currency, str)
+            or re.fullmatch(r"[A-Za-z]{3}", currency) is None
+        ):
+            raise CostRefreshError("Azure costs currency is invalid.")
+        raw_usage_date = row[positions["UsageDate"]]
+        usage_date_text = str(raw_usage_date)
+        if (
+            isinstance(raw_usage_date, bool)
+            or not usage_date_text.isascii()
+            or re.fullmatch(r"[0-9]{8}", usage_date_text) is None
+        ):
+            raise CostRefreshError("Azure costs row contains invalid values.")
+        try:
+            value = Decimal(str(row[positions["PreTaxCost"]]))
+            usage_date = datetime.strptime(usage_date_text, "%Y%m%d").replace(
+                tzinfo=timezone.utc
+            )
+        except (InvalidOperation, TypeError, ValueError) as exc:
+            raise CostRefreshError("Azure costs row contains invalid values.") from exc
+        if not value.is_finite():
+            raise CostRefreshError("Azure costs row contains invalid values.")
+        _validate_storage_decimal(value, "Azure", "costs", "PreTaxCost")
+        bucket_end = usage_date + timedelta(days=1)
+        if usage_date < period_start or bucket_end > period_end:
+            raise CostRefreshError("Azure costs row is outside the requested period.")
+        buckets.append(
+            CostBucket(
+                kind="actual",
+                metric="cost",
+                value=value,
+                unit="currency",
+                currency=currency.upper(),
+                bucket_start=usage_date,
+                bucket_end=bucket_end,
+                source="azure.costmanagement.query",
+                granularity="day",
+                dimensions={"resource_id": resource_id},
+            )
+        )
+    return buckets
+
+
+def _azure_arm_token() -> str:
+    """Acquire an ARM token from operator-managed host identity."""
+    credential = None
+    try:
+        if os.getenv("AZURE_FEDERATED_TOKEN_FILE"):
+            credential = WorkloadIdentityCredential()
+        elif any(
+            os.getenv(name)
+            for name in (
+                "IDENTITY_ENDPOINT",
+                "MSI_ENDPOINT",
+                "WEBSITE_HOSTNAME",
+                "CONTAINER_APP_HOSTNAME",
+            )
+        ):
+            credential = ManagedIdentityCredential(
+                client_id=os.getenv("AZURE_CLIENT_ID")
+            )
+        elif all(
+            os.getenv(name)
+            for name in (
+                "AZURE_TENANT_ID",
+                "AZURE_CLIENT_ID",
+                "AZURE_CLIENT_CERTIFICATE_PATH",
+            )
+        ):
+            credential = CertificateCredential(
+                tenant_id=os.environ["AZURE_TENANT_ID"],
+                client_id=os.environ["AZURE_CLIENT_ID"],
+                certificate_path=os.environ["AZURE_CLIENT_CERTIFICATE_PATH"],
+                password=os.getenv("AZURE_CLIENT_CERTIFICATE_PASSWORD"),
+            )
+        else:
+            # Azure VMs expose managed identity through IMDS without environment markers.
+            credential = ManagedIdentityCredential(
+                client_id=os.getenv("AZURE_CLIENT_ID")
+            )
+        return credential.get_token("https://management.azure.com/.default").token
+    except (AzureError, OSError, ValueError) as exc:
+        raise CostRefreshError("Azure host identity authentication failed.") from exc
+    finally:
+        if credential is not None:
+            credential.close()

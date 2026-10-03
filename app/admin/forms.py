@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from flask_wtf import FlaskForm
-from wtforms import PasswordField, SelectField, StringField
+from wtforms import HiddenField, PasswordField, SelectField, StringField
 from wtforms.validators import DataRequired, Length, Optional, ValidationError
 from wtforms.widgets import PasswordInput
 
@@ -99,13 +99,7 @@ class ActivateProviderForm(FlaskForm):
 
 
 class BillingCredentialsForm(FlaskForm):
-    """Optional billing credentials for OpenAI or OpenRouter cost refresh."""
+    """Billing credential form bound to an explicit provider in the view."""
 
-    provider = SelectField(
-        "Anbieter *",
-        choices=[("openai", "OpenAI"), ("openrouter", "OpenRouter")],
-        validators=[DataRequired()],
-    )
-    billing_secret = PasswordField(
-        "Provider-Schlüssel mit Billing-Rechten *", validators=[Optional()]
-    )
+    provider = HiddenField(validators=[DataRequired()])
+    billing_secret = PasswordField(validators=[Optional()])

@@ -57,6 +57,8 @@ class CostsView:
     jobs: tuple[CostRefreshJob, ...]
     records: tuple[CostUsageRecord, ...]
     billing_key_masks: dict[str, str | None]
+    azure_profile_configured: bool
+    azure_costs_ready: bool
 
 
 def provider_state(profile: ProviderProfile | None) -> str:

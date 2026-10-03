@@ -174,6 +174,11 @@ def save_billing_secret(
     actor_id: str,
 ) -> ProviderProfile:
     """Store an encrypted billing credential on an existing provider profile."""
+    if provider not in {"openai", "openrouter"}:
+        raise ValueError(
+            "Billing secrets are supported only for OpenAI and OpenRouter; "
+            "Azure uses operator host identity."
+        )
     profile = session.scalar(
         select(ProviderProfile).where(
             ProviderProfile.tenant_id == tenant_id,

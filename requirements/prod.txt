@@ -7,9 +7,10 @@ Flask==3.1.3
 # Logging
 rich==14.3.3
 
-# Requests
+# Requests and Azure host identity
 idna==3.20
 requests==2.34.2
+azure-identity==1.26.0
 
 # Deployment
 gevent==25.9.1

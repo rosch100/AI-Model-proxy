@@ -578,7 +578,10 @@ def dashboard():
                     InferenceActivityEvent.tenant_id == tenant.id,
                     InferenceActivityEvent.occurred_at >= lookback_start,
                 )
-                .order_by(InferenceActivityEvent.occurred_at.desc())
+                .order_by(
+                    InferenceActivityEvent.occurred_at.desc(),
+                    InferenceActivityEvent.id.desc(),
+                )
             )
         )
         view = dashboard_view(
@@ -609,7 +612,10 @@ def dashboard_activity():
                     InferenceActivityEvent.tenant_id == tenant.id,
                     InferenceActivityEvent.occurred_at >= lookback_start,
                 )
-                .order_by(InferenceActivityEvent.occurred_at.desc())
+                .order_by(
+                    InferenceActivityEvent.occurred_at.desc(),
+                    InferenceActivityEvent.id.desc(),
+                )
             )
         )
         activity = activity_board(

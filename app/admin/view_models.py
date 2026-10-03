@@ -72,9 +72,10 @@ class ModelActivityRow:
     model: str
     inbound_model: str
     routed_model: str | None
-    tokens_per_minute: float | None
-    tokens_per_minute_label: str | None
+    tokens_per_request: float | None
+    tokens_per_request_label: str | None
     requests_in_window: int
+    requests_with_usage_in_window: int
     last_request_at: datetime
     last_request_label: str
     bar_percent: int
@@ -91,14 +92,31 @@ class ProviderActivityGroup:
 
 
 @dataclass(frozen=True)
+class ActivityRequestRow:
+    """One recent inference request for the tenant activity list."""
+
+    provider: str
+    provider_label: str
+    requested_model: str
+    routed_model: str | None
+    occurred_at: datetime
+    time_label: str
+    total_tokens_label: str | None
+    input_tokens_label: str | None
+    output_tokens_label: str | None
+
+
+@dataclass(frozen=True)
 class ActivityBoard:
-    """Current proxy throughput for the tenant overview."""
+    """Recent proxy requests and aggregate status for the overview."""
 
     window_minutes: int
     generated_at: datetime
-    total_tokens_per_minute: float | None
-    total_tokens_per_minute_label: str | None
+    requests: tuple[ActivityRequestRow, ...]
+    total_tokens_per_request: float | None
+    total_tokens_per_request_label: str | None
     total_requests_in_window: int
+    total_requests_with_usage_in_window: int
     last_request_at: datetime | None
     last_request_label: str | None
     providers: tuple[ProviderActivityGroup, ...]
@@ -164,6 +182,7 @@ class CostsView:
 
 
 _PROVIDER_LABELS = {"azure": "Azure", "openai": "OpenAI", "openrouter": "OpenRouter"}
+_ACTIVITY_REQUEST_LIST_LIMIT = 50
 _COST_METRIC_LABELS = {"cost": "Providerkosten", "byok_inference_cost": "BYOK-Kosten"}
 _USAGE_METRIC_LABELS = {
     "input_tokens": "Eingabe-Tokens",
@@ -397,13 +416,12 @@ def _aware_utc(moment: datetime) -> datetime:
     return moment.astimezone(timezone.utc)
 
 
-def format_activity_rate(value: float) -> str:
-    """Format tokens or requests per minute with German grouping."""
-    if value >= 100:
-        return format(round(value), ",.0f").replace(",", ".")
-    formatted = format(value, ".1f")
-    integer, _separator, fraction = formatted.partition(".")
-    return f"{integer},{fraction}"
+def format_token_count(value: int | float) -> str:
+    """Format a token count with German digit grouping."""
+    if isinstance(value, int) or value.is_integer():
+        return format(int(value), ",").replace(",", ".")
+    integer, fraction = format(value, ",.1f").split(".")
+    return f"{integer.replace(',', '.')},{fraction}"
 
 
 def format_relative_time(moment: datetime, now: datetime) -> str:
@@ -458,17 +476,46 @@ def activity_board(
     window_minutes: int = ACTIVITY_WINDOW_MINUTES,
     lookback_hours: int = ACTIVITY_LOOKBACK_HOURS,
 ) -> ActivityBoard:
-    """Aggregate recent inferences into provider/model throughput bars."""
+    """Prepare recent request rows and provider recency for the overview."""
     clock = now or datetime.now(timezone.utc)
     if clock.tzinfo is None:
         raise ValueError("Activity board clock must be timezone-aware")
     window_start = clock - timedelta(minutes=window_minutes)
     lookback_start = clock - timedelta(hours=lookback_hours)
     buckets: dict[tuple[str, str], _ActivityAccumulator] = {}
+    request_rows: list[ActivityRequestRow] = []
+    total_tokens = 0
+    total_requests = 0
+    total_requests_with_usage = 0
     for event in events:
         occurred_at = _aware_utc(event.occurred_at)
         if occurred_at < lookback_start:
             continue
+        request_rows.append(
+            ActivityRequestRow(
+                provider=event.provider,
+                provider_label=_PROVIDER_LABELS[event.provider],
+                requested_model=event.inbound_model,
+                routed_model=event.routed_model,
+                occurred_at=occurred_at,
+                time_label=occurred_at.strftime("%d.%m.%Y %H:%M:%S UTC"),
+                total_tokens_label=(
+                    None
+                    if event.total_tokens is None
+                    else format_token_count(event.total_tokens)
+                ),
+                input_tokens_label=(
+                    None
+                    if event.input_tokens is None
+                    else format_token_count(event.input_tokens)
+                ),
+                output_tokens_label=(
+                    None
+                    if event.output_tokens is None
+                    else format_token_count(event.output_tokens)
+                ),
+            )
+        )
         display = _display_model(
             event.inbound_model, event.routed_model, custom_model_id
         )
@@ -488,46 +535,46 @@ def activity_board(
         if occurred_at < window_start:
             continue
         bucket.window_requests += 1
+        total_requests += 1
         if event.total_tokens is None:
             continue
         bucket.window_tokens += event.total_tokens
         bucket.window_with_usage += 1
+        total_tokens += event.total_tokens
+        total_requests_with_usage += 1
 
     prepared: list[tuple[str, str, _ActivityAccumulator, float | None]] = []
     scale = 0.0
     for (provider, model), bucket in buckets.items():
-        tokens_per_minute = (
-            bucket.window_tokens / window_minutes if bucket.window_with_usage else None
+        tokens_per_request = (
+            bucket.window_tokens / bucket.window_with_usage
+            if bucket.window_with_usage
+            else None
         )
-        weight = (
-            tokens_per_minute
-            if tokens_per_minute is not None
-            else float(bucket.window_requests)
-        )
+        weight = tokens_per_request or 0.0
         scale = max(scale, weight)
-        prepared.append((provider, model, bucket, tokens_per_minute))
+        prepared.append((provider, model, bucket, tokens_per_request))
+
+    request_rows.sort(key=lambda row: row.occurred_at, reverse=True)
 
     grouped: dict[str, list[ModelActivityRow]] = {
         name: [] for name in ("azure", "openai", "openrouter")
     }
-    for provider, model, bucket, tokens_per_minute in prepared:
-        weight = (
-            tokens_per_minute
-            if tokens_per_minute is not None
-            else float(bucket.window_requests)
-        )
+    for provider, model, bucket, tokens_per_request in prepared:
+        weight = tokens_per_request or 0.0
         grouped.setdefault(provider, []).append(
             ModelActivityRow(
                 model=model,
                 inbound_model=bucket.inbound_model,
                 routed_model=bucket.routed_model,
-                tokens_per_minute=tokens_per_minute,
-                tokens_per_minute_label=(
+                tokens_per_request=tokens_per_request,
+                tokens_per_request_label=(
                     None
-                    if tokens_per_minute is None
-                    else format_activity_rate(tokens_per_minute)
+                    if tokens_per_request is None
+                    else format_token_count(tokens_per_request)
                 ),
                 requests_in_window=bucket.window_requests,
+                requests_with_usage_in_window=bucket.window_with_usage,
                 last_request_at=bucket.last_request_at,
                 last_request_label=format_relative_time(bucket.last_request_at, clock),
                 bar_percent=0 if scale <= 0 else round(100 * weight / scale),
@@ -536,16 +583,13 @@ def activity_board(
         )
 
     providers = []
-    total_tokens = 0.0
-    total_with_usage = 0
-    total_requests = 0
     last_request_at = None
     for provider, rows in grouped.items():
         ordered = tuple(
             sorted(
                 rows,
                 key=lambda row: (
-                    -(row.tokens_per_minute or 0.0),
+                    -(row.tokens_per_request or 0.0),
                     -row.requests_in_window,
                     -row.last_request_at.timestamp(),
                     row.model,
@@ -562,26 +606,24 @@ def activity_board(
             )
         )
         for row in ordered:
-            total_requests += row.requests_in_window
-            if row.tokens_per_minute is not None:
-                total_tokens += row.tokens_per_minute * window_minutes
-                total_with_usage += 1
             if last_request_at is None or row.last_request_at > last_request_at:
                 last_request_at = row.last_request_at
 
-    total_tokens_per_minute = (
-        total_tokens / window_minutes if total_with_usage else None
+    total_tokens_per_request = (
+        total_tokens / total_requests_with_usage if total_requests_with_usage else None
     )
     return ActivityBoard(
         window_minutes=window_minutes,
         generated_at=clock,
-        total_tokens_per_minute=total_tokens_per_minute,
-        total_tokens_per_minute_label=(
+        requests=tuple(request_rows[:_ACTIVITY_REQUEST_LIST_LIMIT]),
+        total_tokens_per_request=total_tokens_per_request,
+        total_tokens_per_request_label=(
             None
-            if total_tokens_per_minute is None
-            else format_activity_rate(total_tokens_per_minute)
+            if total_tokens_per_request is None
+            else format_token_count(total_tokens_per_request)
         ),
         total_requests_in_window=total_requests,
+        total_requests_with_usage_in_window=total_requests_with_usage,
         last_request_at=last_request_at,
         last_request_label=(
             format_relative_time(last_request_at, clock)

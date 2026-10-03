@@ -278,6 +278,25 @@ def _openai_bucket_period(bucket: dict[str, object]) -> tuple[datetime, datetime
     )
 
 
+def _parse_openrouter_activity_date(activity_date: object) -> date:
+    """Parse a canonical activity day or OpenRouter's UTC-midnight timestamp."""
+    if not isinstance(activity_date, str):
+        raise CostRefreshError("OpenRouter activity date is invalid.")
+
+    activity_day = activity_date[:10]
+    try:
+        parsed_date = date.fromisoformat(activity_day)
+    except ValueError as exc:
+        raise CostRefreshError("OpenRouter activity date is invalid.") from exc
+
+    if parsed_date.isoformat() != activity_day or activity_date not in (
+        activity_day,
+        f"{activity_day} 00:00:00",
+    ):
+        raise CostRefreshError("OpenRouter activity date is invalid.")
+    return parsed_date
+
+
 def fetch_openrouter_costs(
     api_key: str, workspace_id: str, start: datetime, end: datetime
 ) -> list[CostBucket]:
@@ -322,13 +341,7 @@ def fetch_openrouter_costs(
     for item in activity:
         if not isinstance(item, dict):
             raise CostRefreshError("OpenRouter activity item is invalid.")
-        activity_date = item.get("date")
-        try:
-            parsed_date = date.fromisoformat(activity_date)
-        except (TypeError, ValueError) as exc:
-            raise CostRefreshError("OpenRouter activity date is invalid.") from exc
-        if parsed_date.isoformat() != activity_date:
-            raise CostRefreshError("OpenRouter activity date is invalid.")
+        parsed_date = _parse_openrouter_activity_date(item.get("date"))
         bucket_start = datetime.combine(parsed_date, datetime.min.time(), timezone.utc)
         bucket_end = bucket_start + timedelta(days=1)
         if bucket_end <= period_start or bucket_start >= period_end:

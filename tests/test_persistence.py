@@ -2,12 +2,16 @@
 
 import base64
 import hashlib
+from datetime import datetime, timezone
 from io import StringIO
 from pathlib import Path
 
 import pytest
 from alembic import command
 from alembic.config import Config
+from alembic.migration import MigrationContext
+from alembic.operations import Operations
+from alembic.script import ScriptDirectory
 from cryptography.exceptions import InvalidTag
 from sqlalchemy import create_engine, event, select
 from sqlalchemy.orm import Session
@@ -101,6 +105,32 @@ def test_openrouter_workspace_migration_updates_postgresql_binding_validator(
     assert "NEW.created_at = OLD.created_at" in generated_sql
     assert "AND NOT EXISTS" in generated_sql
     assert "JOIN cost_refresh_jobs j ON j.binding_id = b.id" in generated_sql
+
+
+def test_azure_billing_secret_cleanup_migration_is_explicit(monkeypatch):
+    """The Azure identity migration permanently clears obsolete tenant secrets."""
+    project_root = Path(__file__).resolve().parents[1]
+    monkeypatch.setenv(
+        "DATABASE_URL", "postgresql+psycopg://user:password@localhost/proxy"
+    )
+    output = StringIO()
+    config = Config(str(project_root / "alembic.ini"), output_buffer=output)
+    config.set_main_option("script_location", str(project_root / "migrations"))
+
+    script = ScriptDirectory.from_config(config)
+    migration = script.get_revision("20261004_clear_azure_billing").module
+    migration_context = MigrationContext.configure(
+        dialect_name="postgresql",
+        opts={"as_sql": True, "output_buffer": output},
+    )
+    with Operations.context(migration_context):
+        migration.upgrade()
+
+    generated_sql = output.getvalue()
+    assert (
+        "UPDATE provider_profiles SET billing_secret_ciphertext = NULL "
+        "WHERE provider = 'azure' AND billing_secret_ciphertext IS NOT NULL"
+    ) in generated_sql
 
 
 def test_persistence_schema_creates_on_sqlite_for_portable_constraint_checks():
@@ -303,6 +333,213 @@ def test_tenant_import_conflicts_roll_back_without_partial_rows():
                     cipher,
                 )
         assert session.get(Tenant, "beta") is None
+    engine.dispose()
+
+
+def test_environment_import_uses_the_active_azure_profile_without_mutating_peers():
+    """An idempotent import targets the active Azure account by profile ID."""
+    engine = create_engine("sqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    cipher = SecretCipher.from_key(base64.urlsafe_b64encode(b"k" * 32).decode("ascii"))
+    source = TenantConfig(
+        id="acme",
+        api_key_hash=hashlib.sha256(b"cursor-key").hexdigest(),
+        azure_base_url="https://acme.openai.azure.com",
+        azure_api_key="azure-secret",
+        azure_model_deployments={"gpt-5.4": "acme-gpt54"},
+        azure_default_model="gpt-5.4",
+    )
+    with Session(engine) as session, session.begin():
+        tenant = Tenant(
+            id="acme",
+            api_key_hash=source.api_key_hash,
+            custom_model_id="cursor-acme-model",
+        )
+        session.add(tenant)
+        session.flush()
+        active_profile = ProviderProfile(
+            id="azure-active",
+            tenant_id="acme",
+            provider="azure",
+            display_name="Production",
+            settings={
+                "base_url": source.azure_base_url,
+                "model_deployments": dict(source.azure_model_deployments),
+            },
+            default_model=source.azure_default_model,
+            inference_secret_ciphertext=cipher.encrypt(source.azure_api_key),
+        )
+        peer_profile = ProviderProfile(
+            id="azure-peer",
+            tenant_id="acme",
+            provider="azure",
+            display_name="Staging",
+            settings={"base_url": "https://staging.openai.azure.com"},
+            default_model="gpt-5.5",
+            inference_secret_ciphertext=cipher.encrypt("peer-secret"),
+        )
+        session.add_all((active_profile, peer_profile))
+        session.flush()
+        tenant.active_profile_id = active_profile.id
+        session.flush()
+
+        assert import_tenants((source,), session, cipher) == 0
+        assert tenant.active_profile_id == active_profile.id
+        assert active_profile.display_name == "Production"
+        assert peer_profile.settings == {"base_url": "https://staging.openai.azure.com"}
+        assert peer_profile.default_model == "gpt-5.5"
+        assert cipher.decrypt(peer_profile.inference_secret_ciphertext) == "peer-secret"
+    engine.dispose()
+
+
+def test_environment_import_rejects_ambiguous_active_azure_profile():
+    """Environment import fails closed if it cannot identify one active Azure account."""
+    engine = create_engine("sqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    cipher = SecretCipher.from_key(base64.urlsafe_b64encode(b"k" * 32).decode("ascii"))
+    source = TenantConfig(
+        id="acme",
+        api_key_hash=hashlib.sha256(b"cursor-key").hexdigest(),
+        azure_base_url="https://acme.openai.azure.com",
+        azure_api_key="azure-secret",
+        azure_model_deployments={"gpt-5.4": "acme-gpt54"},
+        azure_default_model="gpt-5.4",
+    )
+    with Session(engine) as session:
+        with session.begin():
+            tenant = Tenant(
+                id="acme",
+                api_key_hash=source.api_key_hash,
+                custom_model_id="cursor-acme-model",
+            )
+            session.add(tenant)
+            session.flush()
+            session.add_all(
+                ProviderProfile(
+                    id=profile_id,
+                    tenant_id="acme",
+                    provider="azure",
+                    display_name=profile_id,
+                    settings={
+                        "base_url": source.azure_base_url,
+                        "model_deployments": dict(source.azure_model_deployments),
+                    },
+                    default_model=source.azure_default_model,
+                    inference_secret_ciphertext=cipher.encrypt(source.azure_api_key),
+                )
+                for profile_id in ("azure-one", "azure-two")
+            )
+        with pytest.raises(ValueError, match="ambiguous active Azure profile"):
+            with session.begin():
+                import_tenants((source,), session, cipher)
+    engine.dispose()
+
+
+def test_proxy_snapshot_freezes_active_profile_identity_and_generation():
+    """A proxy snapshot retains the profile selected by its initial lookup."""
+    engine = create_engine("sqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    cipher = SecretCipher.from_key(base64.urlsafe_b64encode(b"k" * 32).decode("ascii"))
+    with Session(engine) as session, session.begin():
+        session.add_all(
+            (
+                Tenant(
+                    id="acme",
+                    api_key_hash=hashlib.sha256(b"cursor-key").hexdigest(),
+                    custom_model_id="cursor-acme",
+                    active_profile_id="profile-a",
+                ),
+                ProviderProfile(
+                    id="profile-a",
+                    tenant_id="acme",
+                    provider="azure",
+                    display_name="Production",
+                    settings={"base_url": "https://production.example"},
+                    default_model="gpt-5.4",
+                    history_generation=3,
+                    inference_secret_ciphertext=cipher.encrypt("production-key"),
+                ),
+                ProviderProfile(
+                    id="profile-b",
+                    tenant_id="acme",
+                    provider="azure",
+                    display_name="Staging",
+                    settings={"base_url": "https://staging.example"},
+                    default_model="gpt-5.5",
+                    history_generation=0,
+                    inference_secret_ciphertext=cipher.encrypt("staging-key"),
+                ),
+            )
+        )
+
+    with Session(engine) as session:
+        snapshot = TenantRepository(session).get_proxy_snapshot_by_api_key(
+            "cursor-key", cipher
+        )
+        assert snapshot is not None
+        assert snapshot.profile_id == "profile-a"
+        assert snapshot.profile_name == "Production"
+        assert snapshot.history_generation == 3
+        assert snapshot.profile_deleted is False
+
+    with Session(engine) as session, session.begin():
+        tenant = session.get(Tenant, "acme")
+        tenant.active_profile_id = "profile-b"
+
+    assert snapshot.profile_id == "profile-a"
+    assert snapshot.profile_name == "Production"
+    assert snapshot.inference_secret == "production-key"
+    engine.dispose()
+
+
+def test_proxy_snapshot_distinguishes_missing_profile_and_deleted_tombstone():
+    """No active profile and a deleted profile remain explicit configurations."""
+    engine = create_engine("sqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    cipher = SecretCipher.from_key(base64.urlsafe_b64encode(b"k" * 32).decode("ascii"))
+    with Session(engine) as session, session.begin():
+        session.add_all(
+            (
+                Tenant(
+                    id="without-profile",
+                    api_key_hash=hashlib.sha256(b"no-profile").hexdigest(),
+                    custom_model_id="cursor-no-profile",
+                ),
+                Tenant(
+                    id="deleted-profile",
+                    api_key_hash=hashlib.sha256(b"deleted-profile").hexdigest(),
+                    custom_model_id="cursor-deleted",
+                    active_profile_id="profile-deleted",
+                ),
+                ProviderProfile(
+                    id="profile-deleted",
+                    tenant_id="deleted-profile",
+                    provider="azure",
+                    display_name=None,
+                    deleted_at=datetime.now(timezone.utc),
+                    history_generation=4,
+                    settings={},
+                    default_model=None,
+                    inference_secret_ciphertext=None,
+                ),
+            )
+        )
+
+    with Session(engine) as session:
+        no_profile = TenantRepository(session).get_proxy_snapshot_by_api_key(
+            "no-profile", cipher
+        )
+        deleted = TenantRepository(session).get_proxy_snapshot_by_api_key(
+            "deleted-profile", cipher
+        )
+
+    assert no_profile is not None
+    assert no_profile.profile_id is None
+    assert no_profile.provider is None
+    assert deleted is not None
+    assert deleted.profile_id == "profile-deleted"
+    assert deleted.profile_deleted is True
+    assert deleted.history_generation == 4
     engine.dispose()
 
 

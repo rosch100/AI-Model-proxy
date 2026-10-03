@@ -4,87 +4,80 @@
 {% block content %}
 <section>
   <h1>Kosten</h1>
-  <p class="lede">Abrechnungs- und Nutzungsdaten hängen von den Rechten und Filtermöglichkeiten des jeweiligen Anbieter-Endpunkts ab.</p>
+  <p class="lede">Abrechnungs- und Nutzungsdaten hängen von den Rechten und Filtermöglichkeiten des jeweiligen Anbieter-Endpunkts ab. Jeder Refresh bleibt dem ausgewählten Account und dessen operatorseitig gebundenem Scope zugeordnet.</p>
+  <p>Billing-Zugangsdaten sind vom Inference-Schlüssel getrennt. Tenant-eigene Scope-IDs werden hier nur angezeigt; ihre Bindung erfolgt ausschließlich operatorseitig.</p>
+  <ul>
+    <li><strong>OpenAI:</strong> Admin API Key mit Organisationsrechten. Kosten und Input-/Output-Tokens werden auf das gebundene Projekt gefiltert.</li>
+    <li><strong>OpenRouter:</strong> Management Key. Die Activity-API liefert OpenRouter- und BYOK-Kosten sowie Tokenverbrauch der letzten 30 abgeschlossenen UTC-Tage; die operatorseitige Billing-Bindung muss die Workspace-ID dieses Kontos enthalten und sie wird als Filter verwendet.</li>
+    <li><strong>Azure-Hostidentität:</strong> Es wird keine Tenant-Credential eingegeben. Der Proxy verwendet seine operatorseitig konfigurierte Managed Identity (einschließlich User-assigned Managed Identity) auf Azure oder Workload Identity bzw. Zertifikatsidentität außerhalb Azure. Die gebundene Resource Group benötigt Cost Management Reader; die gebundene Cognitive-Services-Ressource benötigt Monitoring Reader für separat abgefragte Usage-Metriken.</li>
+  </ul>
+
+  <h2>Gebundene Scopes</h2>
   {% if view.bindings %}
     <ul>
-      {% for binding, node in view.bindings %}
-        <li>{{ binding.provider }} / {{ binding.purpose }}: <code>{{ node.canonical_scope_id }}</code></li>
+      {% for profile, binding, node in view.bindings %}
+        <li>{{ profile.display_name }} ({{ profile.provider }}) / {{ binding.purpose }}: <code>{{ node.canonical_scope_id }}</code></li>
       {% endfor %}
     </ul>
   {% else %}
-    <p>Kein Billing-Scope gebunden.</p>
+    <p>Kein Billing- oder Usage-Scope gebunden.</p>
   {% endif %}
 
-  <h2>Zugriff und Scopes</h2>
-  <p>Billing-Zugangsdaten sind vom Inference-Schlüssel getrennt. Tenant-eigene Scope-IDs werden hier nur angezeigt; ihre Bindung erfolgt ausschließlich operatorseitig.</p>
-  <ul>
-    <li><strong>OpenAI:</strong> Admin API Key mit Organisationsrechten. Der Abruf filtert Kosten und Input-/Output-Tokens auf das gebundene Projekt.</li>
-    <li><strong>OpenRouter:</strong> Management Key. Die Activity-API liefert OpenRouter- und BYOK-Kosten sowie Tokenverbrauch der letzten 30 abgeschlossenen UTC-Tage; die gebundene Workspace-ID wird als Filter verwendet.</li>
-    <li><strong>Azure-Hostidentität:</strong> Es wird keine Tenant-Credential eingegeben. Der Proxy verwendet seine operatorseitig konfigurierte Managed Identity auf Azure oder Workload Identity bzw. Zertifikatsidentität außerhalb Azure. Die gebundene Resource Group benötigt Cost Management Reader; die gebundene Cognitive-Services-Ressource benötigt Monitoring Reader für separat abgefragte Usage-Metriken.</li>
-  </ul>
-
-  <h3>OpenAI- und OpenRouter-Billing-Zugangsdaten</h3>
-  <ul class="secret-list">
-    <li>OpenAI:
-      {% if view.billing_key_masks.openai %}
-        <code class="secret-mask">{{ view.billing_key_masks.openai }}</code>
-      {% else %}
-        nicht gespeichert
+  <h2>Accounts</h2>
+  {% for profile in view.profiles %}
+    <article>
+      <h3>{{ profile.display_name }} ({{ profile.provider }})</h3>
+      {% if profile.provider in ["openai", "openrouter"] %}
+        <p>Billing-Schlüssel:
+          {% if view.billing_key_masks[profile.id] %}
+            <code class="secret-mask">{{ view.billing_key_masks[profile.id] }}</code>
+          {% else %}
+            nicht gespeichert
+          {% endif %}
+        </p>
+        <form method="post" action="{{ url_for('admin.save_billing') }}" class="stack">
+          {{ billing_form.csrf_token }}
+          <input type="hidden" name="profile_id" value="{{ profile.id }}" />
+          {% if profile.provider == "openai" %}
+            <label for="openai-billing-secret-{{ profile.id }}">OpenAI Admin API Key *
+              {{ billing_form.billing_secret(id="openai-billing-secret-" ~ profile.id, autocomplete="off", aria_describedby="openai-billing-hint-" ~ profile.id) }}
+            </label>
+            <p id="openai-billing-hint-{{ profile.id }}" class="hint">Der Schlüssel benötigt Organisationsrechte und bleibt vom OpenAI-Inference-Key getrennt.</p>
+          {% else %}
+            <label for="openrouter-billing-secret-{{ profile.id }}">OpenRouter Management Key *
+              {{ billing_form.billing_secret(id="openrouter-billing-secret-" ~ profile.id, autocomplete="off", aria_describedby="openrouter-billing-hint-" ~ profile.id) }}
+            </label>
+            <p id="openrouter-billing-hint-{{ profile.id }}" class="hint">Die operatorseitige Billing-Bindung muss die Workspace-ID dieses Kontos enthalten und wird als Filter verwendet.</p>
+          {% endif %}
+          <button type="submit">{{ profile.provider }} Billing-Zugang speichern</button>
+        </form>
+        {% if view.billing_key_masks[profile.id] %}
+          <form method="post" action="{{ url_for('admin.refresh_costs') }}">
+            {{ billing_form.csrf_token }}
+            <input type="hidden" name="profile_id" value="{{ profile.id }}" />
+            <button type="submit">{{ profile.provider }} aktualisieren</button>
+          </form>
+        {% endif %}
+      {% elif profile.provider == "azure" %}
+        <p class="hint">Azure-Kosten verwenden die operatorseitige Hostidentität; ein Azure-Inference-Key oder Tenant-Service-Principal wird nicht für Billing verwendet.</p>
+        {% if profile.id in view.azure_costs_ready_profile_ids %}
+          <form method="post" action="{{ url_for('admin.refresh_costs') }}">
+            {{ billing_form.csrf_token }}
+            <input type="hidden" name="profile_id" value="{{ profile.id }}" />
+            <button type="submit">Azure-Kosten aktualisieren</button>
+          </form>
+        {% else %}
+          <p class="hint">Kosten sind noch nicht abrufbereit. Operatorseitig müssen eine tenantdedizierte Resource Group als Billing-Scope und die darin liegende Cognitive-Services-Ressource als Usage-Scope an dieses Profil gebunden sein.</p>
+        {% endif %}
       {% endif %}
-    </li>
-    <li>OpenRouter:
-      {% if view.billing_key_masks.openrouter %}
-        <code class="secret-mask">{{ view.billing_key_masks.openrouter }}</code>
-      {% else %}
-        nicht gespeichert
-      {% endif %}
-    </li>
-  </ul>
-  {% for provider, credential_form in billing_forms.items() %}
-    <form method="post" action="{{ url_for('admin.save_billing') }}" class="stack">
-      {{ credential_form.csrf_token }}
-      {{ credential_form.provider() }}
-      {% if provider == "openai" %}
-        <label for="openai-billing-secret">OpenAI Admin API Key *
-          {{ credential_form.billing_secret(id="openai-billing-secret", autocomplete="off", aria_describedby="openai-billing-hint") }}
-        </label>
-        <p id="openai-billing-hint" class="hint">Der Schlüssel benötigt Organisationsrechte und bleibt vom OpenAI-Inference-Key getrennt.</p>
-      {% else %}
-        <label for="openrouter-billing-secret">OpenRouter Management Key *
-          {{ credential_form.billing_secret(id="openrouter-billing-secret", autocomplete="off", aria_describedby="openrouter-billing-hint") }}
-        </label>
-        <p id="openrouter-billing-hint" class="hint">Die operatorseitige Billing-Bindung muss die Workspace-ID dieses Kontos enthalten.</p>
-      {% endif %}
-      <button type="submit">{{ provider }} Billing-Zugang speichern</button>
-    </form>
+    </article>
   {% endfor %}
-
-  <h2>Aktualisieren</h2>
-  {% for provider in ["openai", "openrouter"] %}
-    <form method="post" action="{{ url_for('admin.refresh_costs') }}">
-      {{ billing_form.csrf_token }}
-      <input type="hidden" name="provider" value="{{ provider }}" />
-      <button type="submit">{{ provider }} aktualisieren</button>
-    </form>
-  {% endfor %}
-  {% if view.azure_costs_ready %}
-    <form method="post" action="{{ url_for('admin.refresh_costs') }}">
-      {{ billing_form.csrf_token }}
-      <input type="hidden" name="provider" value="azure" />
-      <button type="submit">Azure-Kosten aktualisieren</button>
-    </form>
-    <p class="hint">Azure-Kosten verwenden die operatorseitige Hostidentität und die oben angezeigten unveränderlichen Bindungen. Es werden nur tatsächliche Kosten abgefragt; Azure-Monitor-Tokenverbrauch ist separat und wird hier nicht als Kosten ausgegeben.</p>
-  {% elif view.azure_profile_configured %}
-    <p class="hint">Azure-Kosten sind noch nicht abrufbereit. Operatorseitig müssen eine tenantdedizierte Resource Group als Billing-Scope und die darin liegende Cognitive-Services-Ressource als Usage-Scope gebunden sein.</p>
-  {% else %}
-    <p class="hint">Ein Azure-Kostenabruf wird verfügbar, sobald ein Azure-Profil und dessen operatorseitige Scope-Bindungen eingerichtet sind.</p>
-  {% endif %}
 
   {% if view.jobs %}
     <h2>Letzte Jobs</h2>
     <ul>
       {% for job in view.jobs %}
-        <li>{{ job.provider }} — {{ job.status }}{% if job.limitation %} ({{ job.limitation }}){% endif %}</li>
+        <li>{{ view.binding_profile_names.get(job.binding_id, job.provider) }} — {{ job.status }}{% if job.limitation %} ({{ job.limitation }}){% endif %}</li>
       {% endfor %}
     </ul>
   {% endif %}
@@ -92,7 +85,7 @@
     <h2>Datensätze</h2>
     <ul>
       {% for record in view.records %}
-        <li>{{ record.provider }} {{ record.kind }} {{ record.metric }}: {{ record.value }} {{ record.unit }}</li>
+        <li>{{ view.binding_profile_names.get(record.binding_id, record.provider) }} {{ record.kind }} {{ record.metric }}: {{ record.value }} {{ record.unit }}</li>
       {% endfor %}
     </ul>
   {% endif %}

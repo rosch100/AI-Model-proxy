@@ -9,3 +9,15 @@ document.querySelectorAll("[data-reveal-secret]").forEach((checkbox) => {
     input.type = checkbox.checked ? "text" : "password";
   });
 });
+
+const providerSelect = document.querySelector("[data-provider-switch]");
+if (providerSelect) {
+  const providerGroups = document.querySelectorAll("[data-provider-fields]");
+  const updateProviderFields = () => {
+    providerGroups.forEach((group) => {
+      group.hidden = group.dataset.providerFields !== providerSelect.value;
+    });
+  };
+  providerSelect.addEventListener("change", updateProviderFields);
+  updateProviderFields();
+}

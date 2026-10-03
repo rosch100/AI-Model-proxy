@@ -8,7 +8,7 @@ from webtest import TestApp
 
 from app import create_app
 
-pytest_plugins = ["tests.admin_app"]
+pytest_plugins = ["tests.admin_app", "tests.postgres_test_utils"]
 
 
 @pytest.fixture

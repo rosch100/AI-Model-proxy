@@ -27,6 +27,12 @@ def forward_openai_compatible(
     req: Request, snapshot: DatabaseTenantSnapshot
 ) -> Response:
     """Forward a Cursor request to OpenAI or OpenRouter Chat Completions."""
+    if snapshot.profile_id is None:
+        raise ServiceConfigurationError(
+            "No active provider profile is configured for this tenant."
+        )
+    if snapshot.profile_deleted:
+        raise ServiceConfigurationError("The active provider profile has been removed.")
     if snapshot.inference_secret is None or snapshot.default_model is None:
         raise ServiceConfigurationError(
             "The active provider profile is missing credentials or a default model."

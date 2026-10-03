@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import re
+import secrets
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from urllib.parse import parse_qs, urlparse
@@ -11,6 +13,8 @@ import pytest
 import requests
 from sqlalchemy import select
 
+from app.admin.forms import ProviderProfileForm
+from app.admin.security import ADMIN_COOKIE_NAME
 from app.persistence.admin_auth import (
     authenticate_admin,
     create_admin_session,
@@ -19,8 +23,11 @@ from app.persistence.admin_auth import (
 from app.persistence.admin_ops import (
     activate_provider_profile,
     change_admin_password,
+    create_provider_profile,
+    delete_provider_profile,
     replace_catalog_entries,
     save_billing_secret,
+    update_provider_profile,
     upsert_provider_profile,
 )
 from app.persistence.models import (
@@ -33,8 +40,9 @@ from app.persistence.models import (
     ProviderScopeNode,
     Tenant,
 )
+from app.persistence.passkeys import insert_passkey
 from app.providers import cost_jobs, costs
-from app.providers.catalog import refresh_provider_catalog
+from app.providers.catalog import CatalogRefreshError, refresh_provider_catalog
 from app.providers.cost_jobs import collect_provider_costs, persist_cost_refresh
 from app.providers.costs import (
     CostBucket,
@@ -57,6 +65,344 @@ def test_catalog_refresh_parses_openai_models(requests_mock):
     assert entries == [("gpt-5.4", None), ("gpt-5.5", None)]
 
 
+def test_catalog_refresh_wraps_openrouter_transport_errors(requests_mock):
+    """Catalog transport failures become provider-scoped OpenRouter errors."""
+    requests_mock.get(
+        "https://openrouter.ai/api/v1/models",
+        exc=requests.exceptions.ConnectTimeout,
+    )
+
+    with pytest.raises(CatalogRefreshError, match="OpenRouter catalog request failed"):
+        refresh_provider_catalog("openrouter", {}, "sk-or-test")
+
+
+def test_catalog_refresh_rejects_invalid_openrouter_json(requests_mock):
+    """Catalog parsing failures become safe OpenRouter errors."""
+    requests_mock.get(
+        "https://openrouter.ai/api/v1/models",
+        text="not-json",
+    )
+
+    with pytest.raises(
+        CatalogRefreshError, match="OpenRouter catalog payload is invalid"
+    ):
+        refresh_provider_catalog("openrouter", {}, "sk-or-secret")
+
+
+def test_catalog_refresh_rejects_empty_openrouter_catalog(requests_mock):
+    """An empty OpenRouter response must not look like a successful refresh."""
+    requests_mock.get(
+        "https://openrouter.ai/api/v1/models",
+        json={"data": []},
+    )
+
+    with pytest.raises(CatalogRefreshError, match="contains no models"):
+        refresh_provider_catalog("openrouter", {}, "sk-or-secret")
+
+
+def test_catalog_refresh_parses_openrouter_models(requests_mock):
+    """Refresh the OpenRouter catalog from its versioned models endpoint."""
+    requests_mock.get(
+        "https://openrouter.ai/api/v1/models",
+        json={"data": [{"id": "openai/gpt-4o"}, {"id": "anthropic/claude-sonnet-4"}]},
+    )
+
+    entries = refresh_provider_catalog("openrouter", {}, "sk-or-test")
+
+    assert entries == [
+        ("openai/gpt-4o", None),
+        ("anthropic/claude-sonnet-4", None),
+    ]
+    assert (
+        requests_mock.request_history[0].headers["Authorization"] == "Bearer sk-or-test"
+    )
+
+
+def test_openrouter_account_key_survives_save_and_catalog_refresh(
+    admin_app, requests_mock
+):
+    """Saving then refreshing an OpenRouter account keeps its key and catalog."""
+    database = admin_app.extensions["database"]
+    with database.sessions.begin() as session:
+        account = authenticate_admin(session, "ada", "correct-horse-battery")
+        insert_passkey(
+            session,
+            account_id=account.id,
+            credential_id=secrets.token_bytes(32),
+            public_key=secrets.token_bytes(64),
+            sign_count=0,
+            user_handle=secrets.token_bytes(32),
+            label="Primary",
+            aaguid=None,
+            backed_up=False,
+        )
+        principal = create_admin_session(session, account, enrollment_only=False)
+
+    client = admin_app.test_client()
+    client.set_cookie(ADMIN_COOKIE_NAME, principal.token, path="/admin")
+    create_page = client.get("/admin/settings/connection/create?provider=openrouter")
+    create_body = create_page.get_data(as_text=True)
+    assert 'data-provider-fields="azure" hidden' in create_body
+    assert 'data-provider-fields="openrouter"' in create_body
+    assert 'name="base_url" required' not in create_body
+    csrf = re.search(
+        r'name="csrf_token" type="hidden" value="([^"]+)"',
+        create_page.get_data(as_text=True),
+    ).group(1)
+    key = "sk-or-v1-integration-test"
+    saved = client.post(
+        "/admin/settings/connection/create",
+        data={
+            "csrf_token": csrf,
+            "provider": "openrouter",
+            "display_name": "Production",
+            "default_model": "",
+            "api_key": key,
+        },
+    )
+    assert saved.status_code == 302
+
+    requests_mock.get(
+        "https://openrouter.ai/api/v1/models",
+        json={"data": [{"id": "openai/gpt-4o"}, {"id": "anthropic/claude-sonnet-4"}]},
+    )
+    with database.sessions() as session:
+        profile = session.scalar(
+            select(ProviderProfile).where(
+                ProviderProfile.tenant_id == "acme",
+                ProviderProfile.provider == "openrouter",
+            )
+        )
+        profile_id = profile.id
+        assert (
+            database.secret_cipher.decrypt(profile.inference_secret_ciphertext) == key
+        )
+
+    refreshed = client.post(
+        f"/admin/settings/connection/{profile_id}/catalog",
+        data={"csrf_token": csrf},
+    )
+    assert refreshed.status_code == 302
+    assert requests_mock.request_history[-1].headers["Authorization"] == f"Bearer {key}"
+
+    with database.sessions() as session:
+        profile = session.get(ProviderProfile, profile_id)
+        models = list(
+            session.scalars(
+                select(ProviderCatalogEntry.model_id).where(
+                    ProviderCatalogEntry.profile_id == profile_id
+                )
+            )
+        )
+        assert (
+            database.secret_cipher.decrypt(profile.inference_secret_ciphertext) == key
+        )
+        assert profile.default_model == "openai/gpt-4o"
+    assert sorted(models) == ["anthropic/claude-sonnet-4", "openai/gpt-4o"]
+    page = client.get("/admin/settings/connection")
+    page_body = page.get_data(as_text=True)
+    assert "openai/gpt-4o" in page_body
+    assert "Schlüssel gespeichert" in page_body
+    assert key not in page_body
+
+    edit_page = client.get(f"/admin/settings/connection/{profile_id}/edit")
+    edit_body = edit_page.get_data(as_text=True)
+    assert "gespeicherten Schlüssel beizubehalten" in edit_body
+    assert "API-Schlüssel ist gespeichert" in edit_body
+    assert key not in edit_body
+
+    activated = client.post(
+        f"/admin/settings/connection/{profile_id}/activate",
+        data={"csrf_token": csrf, "profile_id": profile_id},
+    )
+    assert activated.status_code == 302
+    active_page = client.get("/admin/settings/connection")
+    assert "Aktiver Account: <strong>OpenRouter · Production</strong>" in (
+        active_page.get_data(as_text=True)
+    )
+
+
+def test_catalog_refresh_does_not_store_results_for_changed_profile(
+    admin_app, monkeypatch
+):
+    """A catalog response is discarded if profile settings change during I/O."""
+    database = admin_app.extensions["database"]
+    with database.sessions.begin() as session:
+        account = authenticate_admin(session, "ada", "correct-horse-battery")
+        insert_passkey(
+            session,
+            account_id=account.id,
+            credential_id=secrets.token_bytes(32),
+            public_key=secrets.token_bytes(64),
+            sign_count=0,
+            user_handle=secrets.token_bytes(32),
+            label="Primary",
+            aaguid=None,
+            backed_up=False,
+        )
+        principal = create_admin_session(session, account, enrollment_only=False)
+        profile = create_provider_profile(
+            session,
+            database.secret_cipher,
+            "acme",
+            "openrouter",
+            "Production",
+            {},
+            "openai/gpt-4o",
+            "sk-or-test",
+            "ada",
+        )
+        profile_id = profile.id
+
+    client = admin_app.test_client()
+    client.set_cookie(ADMIN_COOKIE_NAME, principal.token, path="/admin")
+    page = client.get("/admin/settings/connection")
+    csrf = re.search(
+        r'name="csrf_token" type="hidden" value="([^"]+)"',
+        page.get_data(as_text=True),
+    ).group(1)
+
+    def refresh_with_profile_change(provider, settings, inference_secret):
+        with database.sessions.begin() as session:
+            changed_profile = session.get(ProviderProfile, profile_id)
+            changed_profile.settings = {"changed_during_refresh": True}
+        return [("openai/gpt-4o", None)]
+
+    monkeypatch.setattr(
+        "app.admin.views.refresh_provider_catalog", refresh_with_profile_change
+    )
+    response = client.post(
+        f"/admin/settings/connection/{profile_id}/catalog",
+        data={"csrf_token": csrf},
+    )
+
+    assert response.status_code == 302
+    with database.sessions() as session:
+        changed_profile = session.get(ProviderProfile, profile_id)
+        assert changed_profile.settings == {"changed_during_refresh": True}
+        assert changed_profile.catalog_refreshed_at is None
+        assert not list(
+            session.scalars(
+                select(ProviderCatalogEntry).where(
+                    ProviderCatalogEntry.profile_id == profile_id
+                )
+            )
+        )
+
+
+def test_older_catalog_refresh_cannot_overwrite_newer_refresh(admin_app, monkeypatch):
+    """A later-started refresh supersedes an earlier response on same config."""
+    database = admin_app.extensions["database"]
+    with database.sessions.begin() as session:
+        account = authenticate_admin(session, "ada", "correct-horse-battery")
+        insert_passkey(
+            session,
+            account_id=account.id,
+            credential_id=secrets.token_bytes(32),
+            public_key=secrets.token_bytes(64),
+            sign_count=0,
+            user_handle=secrets.token_bytes(32),
+            label="Primary",
+            aaguid=None,
+            backed_up=False,
+        )
+        principal = create_admin_session(session, account, enrollment_only=False)
+        profile = create_provider_profile(
+            session,
+            database.secret_cipher,
+            "acme",
+            "openrouter",
+            "Production",
+            {},
+            "openai/gpt-4o",
+            "sk-or-test",
+            "ada",
+        )
+        profile_id = profile.id
+
+    client = admin_app.test_client()
+    client.set_cookie(ADMIN_COOKIE_NAME, principal.token, path="/admin")
+    page = client.get("/admin/settings/connection")
+    csrf = re.search(
+        r'name="csrf_token" type="hidden" value="([^"]+)"',
+        page.get_data(as_text=True),
+    ).group(1)
+    older_request_generation = None
+
+    def start_older_refresh(provider, settings, inference_secret):
+        nonlocal older_request_generation
+        with database.sessions() as session:
+            older_request_generation = session.get(
+                ProviderProfile, profile_id
+            ).catalog_generation
+        with database.sessions.begin() as session:
+            session.get(ProviderProfile, profile_id).catalog_generation += 1
+        return [("older/model", None)]
+
+    monkeypatch.setattr("app.admin.views.refresh_provider_catalog", start_older_refresh)
+    first_response = client.post(
+        f"/admin/settings/connection/{profile_id}/catalog",
+        data={"csrf_token": csrf},
+    )
+    assert first_response.status_code == 302
+    with database.sessions() as session:
+        profile = session.get(ProviderProfile, profile_id)
+        assert profile.catalog_generation == older_request_generation + 1
+        assert profile.catalog_refreshed_at is None
+
+    monkeypatch.setattr(
+        "app.admin.views.refresh_provider_catalog",
+        lambda provider, settings, inference_secret: [("newer/model", None)],
+    )
+    second_response = client.post(
+        f"/admin/settings/connection/{profile_id}/catalog",
+        data={"csrf_token": csrf},
+    )
+    assert second_response.status_code == 302
+    with database.sessions() as session:
+        assert (
+            session.scalar(
+                select(ProviderCatalogEntry.model_id).where(
+                    ProviderCatalogEntry.profile_id == profile_id
+                )
+            )
+            == "newer/model"
+        )
+
+
+def test_provider_profile_form_requires_azure_base_url_but_not_for_openrouter(
+    admin_app,
+):
+    """Only Azure submissions require the Azure endpoint field."""
+    with admin_app.app_context():
+        azure_form = ProviderProfileForm(
+            data={
+                "provider": "azure",
+                "display_name": "Azure account",
+                "base_url": "",
+                "default_model": "",
+                "api_key": "azure-key",
+            },
+            meta={"csrf": False},
+        )
+        azure_form.provider.choices = [("azure", "Azure")]
+        assert not azure_form.validate()
+        assert "Azure Base-URL ist erforderlich." in azure_form.errors["base_url"]
+
+        openrouter_form = ProviderProfileForm(
+            data={
+                "provider": "openrouter",
+                "display_name": "OpenRouter account",
+                "base_url": "",
+                "default_model": "",
+                "api_key": "openrouter-key",
+            },
+            meta={"csrf": False},
+        )
+        openrouter_form.provider.choices = [("openrouter", "OpenRouter")]
+        assert openrouter_form.validate()
+
+
 def test_catalog_refresh_parses_azure_deployments(requests_mock):
     """Azure catalog refresh uses the legacy deployments API version."""
     requests_mock.get(
@@ -77,24 +423,387 @@ def test_catalog_refresh_parses_azure_deployments(requests_mock):
     assert requests_mock.request_history[0].headers["api-key"] == "azure-key"
 
 
+def test_connection_page_lists_every_same_provider_account(admin_app):
+    """The connection page must not collapse profiles by provider."""
+    database = admin_app.extensions["database"]
+    with database.sessions.begin() as session:
+        profiles = {
+            display_name: create_provider_profile(
+                session,
+                database.secret_cipher,
+                "acme",
+                "openrouter",
+                display_name,
+                {},
+                "openai/gpt-5",
+                f"inference-{display_name.casefold()}",
+                "ada",
+            )
+            for display_name in ("Production", "Staging")
+        }
+        node = ProviderScopeNode(
+            id="bound-workspace-node",
+            tenant_id="acme",
+            provider="openrouter",
+            scope_type="workspace",
+            canonical_scope_id="a1b2c3d4-1111-4111-8111-123456789abc",
+        )
+        session.add(node)
+        session.flush()
+        session.add(
+            ProviderScopeBinding(
+                id="bound-workspace-binding",
+                tenant_id="acme",
+                provider="openrouter",
+                profile_id=profiles["Production"].id,
+                purpose="billing",
+                node_id=node.id,
+            )
+        )
+        account = authenticate_admin(session, "ada", "correct-horse-battery")
+        insert_passkey(
+            session,
+            account_id=account.id,
+            credential_id=secrets.token_bytes(32),
+            public_key=secrets.token_bytes(64),
+            sign_count=0,
+            user_handle=secrets.token_bytes(32),
+            label="Primary",
+            aaguid=None,
+            backed_up=False,
+        )
+        principal = create_admin_session(session, account, enrollment_only=False)
+
+    client = admin_app.test_client()
+    client.set_cookie(ADMIN_COOKIE_NAME, principal.token, path="/admin")
+    response = client.get("/admin/settings/connection")
+
+    assert response.status_code == 200
+    page = response.get_data(as_text=True)
+    assert page.count("<h3>Production</h3>") == 1
+    assert page.count("<h3>Staging</h3>") == 1
+    assert "Dieser Account kann nicht entfernt werden" in page
+    assert page.count(">Account entfernen</button>") == 1
+    database.engine.dispose()
+
+
 def test_activate_profile_writes_audit_and_active_id():
     """Profile activation updates the tenant in the same unit of work."""
     database = build_admin_database()
     seed_admin(database)
     with database.sessions.begin() as session:
-        profile = upsert_provider_profile(
+        profile = create_provider_profile(
             session,
             database.secret_cipher,
             "acme",
             "openai",
+            "Primary",
             {},
             "gpt-5.4",
             "sk-test",
             "ada",
         )
         tenant = session.get(Tenant, "acme")
-        activate_provider_profile(session, tenant, "openai", "ada")
+        with pytest.raises(ValueError, match="not in its available catalog"):
+            activate_provider_profile(session, tenant, profile.id, "ada")
+        replace_catalog_entries(session, profile, [("gpt-5.4", None)], None)
+        activate_provider_profile(session, tenant, profile.id, "ada")
         assert tenant.active_profile_id == profile.id
+    database.engine.dispose()
+
+
+def test_create_provider_profile_is_inactive_and_tenant_scoped():
+    """Creating another named account never changes the active profile."""
+    database = build_admin_database()
+    seed_admin(database)
+    with database.sessions.begin() as session:
+        tenant = session.get(Tenant, "acme")
+        original = create_provider_profile(
+            session,
+            database.secret_cipher,
+            "acme",
+            "openai",
+            "Personal",
+            {"organization": "org-1"},
+            "gpt-5.4",
+            "sk-first",
+            "ada",
+        )
+        tenant.active_profile_id = original.id
+        second = create_provider_profile(
+            session,
+            database.secret_cipher,
+            "acme",
+            "openai",
+            "Work",
+            {"organization": "org-2"},
+            "gpt-5.5",
+            "sk-second",
+            "ada",
+        )
+        assert original.id != second.id
+        assert original.display_name == "Personal"
+        assert second.display_name == "Work"
+        assert tenant.active_profile_id == original.id
+        assert (
+            session.scalar(
+                select(ProviderProfile).where(
+                    ProviderProfile.tenant_id == "other",
+                    ProviderProfile.id == second.id,
+                )
+            )
+            is None
+        )
+    database.engine.dispose()
+
+
+def test_bound_provider_profile_cannot_be_deleted():
+    """Immutable scope ownership prevents deleting a profile with bindings."""
+    database = build_admin_database()
+    seed_admin(database)
+    with database.sessions.begin() as session:
+        profile = create_provider_profile(
+            session,
+            database.secret_cipher,
+            "acme",
+            "openrouter",
+            "Production",
+            {},
+            "openai/gpt-5",
+            "sk-test",
+            "ada",
+        )
+        node = ProviderScopeNode(
+            id="bound-workspace-node",
+            tenant_id="acme",
+            provider="openrouter",
+            scope_type="workspace",
+            canonical_scope_id="a1b2c3d4-1111-4111-8111-123456789abc",
+        )
+        session.add(node)
+        session.flush()
+        session.add(
+            ProviderScopeBinding(
+                id="bound-workspace-binding",
+                tenant_id="acme",
+                provider="openrouter",
+                profile_id=profile.id,
+                purpose="billing",
+                node_id=node.id,
+            )
+        )
+        session.flush()
+
+        with pytest.raises(
+            ValueError, match="cannot be deleted while scopes are bound"
+        ):
+            delete_provider_profile(session, "acme", profile.id, "ada")
+
+        assert session.get(ProviderProfile, profile.id).deleted_at is None
+    database.engine.dispose()
+
+
+def test_deleted_unbound_profile_erases_stored_credentials():
+    """Soft deletion also removes credentials that must no longer be used."""
+    database = build_admin_database()
+    seed_admin(database)
+    with database.sessions.begin() as session:
+        profile = create_provider_profile(
+            session,
+            database.secret_cipher,
+            "acme",
+            "openrouter",
+            "Retired",
+            {},
+            "openai/gpt-5",
+            "sk-inference",
+            "ada",
+        )
+        profile.billing_secret_ciphertext = database.secret_cipher.encrypt("sk-billing")
+        profile_id = profile.id
+
+    with database.sessions.begin() as session:
+        delete_provider_profile(session, "acme", profile_id, "ada")
+
+    with database.sessions() as session:
+        profile = session.get(ProviderProfile, profile_id)
+        assert profile.deleted_at is not None
+        assert profile.inference_secret_ciphertext is None
+        assert profile.billing_secret_ciphertext is None
+    database.engine.dispose()
+
+
+def test_azure_profile_updates_validate_url_and_keep_model_deployments():
+    """Azure profile updates validate endpoints and retain catalog mappings."""
+    database = build_admin_database()
+    seed_admin(database)
+    with database.sessions.begin() as session:
+        profile = create_provider_profile(
+            session,
+            database.secret_cipher,
+            "acme",
+            "azure",
+            "Production",
+            {
+                "base_url": "https://resource.openai.azure.com",
+                "model_deployments": {"gpt-6-astra": "deployment-a"},
+            },
+            "gpt-6-astra",
+            "azure-key",
+            "ada",
+        )
+        tenant = session.get(Tenant, "acme")
+        tenant.active_profile_id = profile.id
+        replace_catalog_entries(
+            session, profile, [("gpt-6-astra", "deployment-a")], None
+        )
+        with pytest.raises(ValueError, match="HTTPS-Adresse"):
+            create_provider_profile(
+                session,
+                database.secret_cipher,
+                "acme",
+                "azure",
+                "Invalid",
+                {"base_url": "http://resource.openai.azure.com"},
+                "gpt-6-astra",
+                "azure-key",
+                "ada",
+            )
+        updated = update_provider_profile(
+            session,
+            database.secret_cipher,
+            "acme",
+            profile.id,
+            "Production",
+            {"base_url": "https://new-resource.openai.azure.com/"},
+            "gpt-6-astra",
+            None,
+            "ada",
+        )
+        assert updated.settings == {"base_url": "https://new-resource.openai.azure.com"}
+        assert updated.default_model is None
+        assert updated.catalog_refreshed_at is None
+        assert tenant.active_profile_id is None
+        assert not list(
+            session.scalars(
+                select(ProviderCatalogEntry).where(
+                    ProviderCatalogEntry.profile_id == profile.id
+                )
+            )
+        )
+        with pytest.raises(ValueError, match="HTTPS-Adresse"):
+            update_provider_profile(
+                session,
+                database.secret_cipher,
+                "acme",
+                profile.id,
+                "Production",
+                {"base_url": "https://user:password@resource.openai.azure.com"},
+                "gpt-6-astra",
+                None,
+                "ada",
+            )
+    database.engine.dispose()
+
+
+def test_update_provider_profile_preserves_secret_and_provider_identity():
+    """Blank secret updates preserve ciphertext and provider identity is fixed."""
+    database = build_admin_database()
+    seed_admin(database)
+    with database.sessions.begin() as session:
+        profile = create_provider_profile(
+            session,
+            database.secret_cipher,
+            "acme",
+            "openai",
+            "Work",
+            {},
+            "gpt-5.4",
+            "sk-original",
+            "ada",
+        )
+        ciphertext = profile.inference_secret_ciphertext
+        updated = update_provider_profile(
+            session,
+            database.secret_cipher,
+            "acme",
+            profile.id,
+            "Work account",
+            {"project": "proj-1"},
+            "gpt-5.5",
+            None,
+            "ada",
+        )
+        assert updated.provider == "openai"
+        assert updated.display_name == "Work account"
+        assert updated.inference_secret_ciphertext == ciphertext
+        assert database.secret_cipher.decrypt(ciphertext) == "sk-original"
+    database.engine.dispose()
+
+
+def test_provider_profile_rejects_duplicate_names_and_foreign_ids():
+    """Names are case insensitive and profile access remains tenant scoped."""
+    database = build_admin_database()
+    seed_admin(database)
+    with database.sessions.begin() as session:
+        profile = create_provider_profile(
+            session,
+            database.secret_cipher,
+            "acme",
+            "openai",
+            "Work",
+            {},
+            "gpt-5.4",
+            "sk-original",
+            "ada",
+        )
+        with pytest.raises(ValueError, match="already exists"):
+            create_provider_profile(
+                session,
+                database.secret_cipher,
+                "acme",
+                "openai",
+                "work",
+                {},
+                "gpt-5.4",
+                "sk-other",
+                "ada",
+            )
+        create_provider_profile(
+            session,
+            database.secret_cipher,
+            "acme",
+            "openai",
+            "Straße",
+            {},
+            "gpt-5.4",
+            "sk-german",
+            "ada",
+        )
+        with pytest.raises(ValueError, match="already exists"):
+            create_provider_profile(
+                session,
+                database.secret_cipher,
+                "acme",
+                "openai",
+                "STRASSE",
+                {},
+                "gpt-5.4",
+                "sk-other-german",
+                "ada",
+            )
+        with pytest.raises(LookupError):
+            update_provider_profile(
+                session,
+                database.secret_cipher,
+                "other",
+                profile.id,
+                "Other",
+                {},
+                "gpt-5.4",
+                None,
+                "ada",
+            )
     database.engine.dispose()
 
 
@@ -124,6 +833,36 @@ def test_catalog_entries_replace_previous_rows():
             )
         ]
         assert models == ["gpt-5.5"]
+    database.engine.dispose()
+
+
+def test_failed_catalog_refresh_preserves_last_successful_entries():
+    """A failed provider query keeps the last known selectable catalog."""
+    database = build_admin_database()
+    seed_admin(database)
+    with database.sessions.begin() as session:
+        profile = create_provider_profile(
+            session,
+            database.secret_cipher,
+            "acme",
+            "openai",
+            "Work",
+            {},
+            "gpt-5.4",
+            "sk-test",
+            "ada",
+        )
+        replace_catalog_entries(session, profile, [("gpt-5.4", None)], None)
+        replace_catalog_entries(session, profile, [], "Provider catalog HTTP 503")
+        models = list(
+            session.scalars(
+                select(ProviderCatalogEntry.model_id).where(
+                    ProviderCatalogEntry.profile_id == profile.id
+                )
+            )
+        )
+        assert models == ["gpt-5.4"]
+        assert profile.catalog_error == "Provider catalog HTTP 503"
     database.engine.dispose()
 
 
@@ -162,7 +901,7 @@ def test_cost_refresh_persists_job_and_records():
         )
         session.add(binding)
         session.flush()
-        job = cost_jobs.start_cost_refresh(session, "acme", "openai", start, end)[3]
+        job = cost_jobs.start_cost_refresh(session, "acme", profile.id, start, end)[4]
         persist_cost_refresh(
             session,
             "acme",
@@ -226,14 +965,14 @@ def test_cost_refresh_reserves_running_job_before_provider_io():
         session.add(binding)
 
     with database.sessions.begin() as session:
-        _, _, _, job = cost_jobs.start_cost_refresh(
-            session, "acme", "openrouter", start, end
+        _, _, _, _, job = cost_jobs.start_cost_refresh(
+            session, "acme", profile.id, start, end
         )
         job_id = job.id
 
     with pytest.raises(LookupError, match="already running"):
         with database.sessions.begin() as session:
-            cost_jobs.start_cost_refresh(session, "acme", "openrouter", start, end)
+            cost_jobs.start_cost_refresh(session, "acme", profile.id, start, end)
 
     with database.sessions() as session:
         job = session.get(CostRefreshJob, job_id)
@@ -279,8 +1018,8 @@ def test_cost_refresh_expires_stale_running_job_before_new_attempt():
         session.add(binding)
 
     with database.sessions.begin() as session:
-        _, _, _, stale_job = cost_jobs.start_cost_refresh(
-            session, "acme", "openrouter", start, end
+        _, _, _, _, stale_job = cost_jobs.start_cost_refresh(
+            session, "acme", profile.id, start, end
         )
         stale_job_id = stale_job.id
     with database.sessions.begin() as session:
@@ -288,8 +1027,8 @@ def test_cost_refresh_expires_stale_running_job_before_new_attempt():
         stale_job.created_at = datetime.now(timezone.utc) - timedelta(minutes=10)
 
     with database.sessions.begin() as session:
-        _, _, _, next_job = cost_jobs.start_cost_refresh(
-            session, "acme", "openrouter", start, end
+        _, _, _, _, next_job = cost_jobs.start_cost_refresh(
+            session, "acme", profile.id, start, end
         )
         next_job_id = next_job.id
     with database.sessions() as session:
@@ -400,10 +1139,10 @@ def test_cost_refresh_marks_provider_transport_errors_failed(requests_mock):
         exc=requests.Timeout,
     )
     with database.sessions.begin() as session:
-        profile, binding, node, job = cost_jobs.start_cost_refresh(
+        profile, binding, node, usage_node, job = cost_jobs.start_cost_refresh(
             session,
             "acme",
-            "openrouter",
+            profile.id,
             datetime(2026, 9, 1, tzinfo=timezone.utc),
             datetime(2026, 10, 1, tzinfo=timezone.utc),
         )
@@ -1090,7 +1829,7 @@ def test_azure_cost_query_rejects_unbound_resource_rows(requests_mock, monkeypat
         },
     )
 
-    with pytest.raises(CostRefreshError, match="does not confirm the bound resource"):
+    with pytest.raises(CostRefreshError, match="unexpected resource"):
         fetch_azure_costs(
             resource_group_id,
             resource_id,
@@ -1232,14 +1971,25 @@ def test_azure_cost_refresh_uses_host_identity_without_tenant_secret(monkeypatch
 def test_azure_profile_rejects_tenant_billing_secret():
     """Azure billing credentials are owned by the operator host identity."""
     database = build_admin_database()
+    seed_admin(database)
     try:
+        with database.sessions.begin() as session:
+            session.add(
+                ProviderProfile(
+                    id="azure-profile",
+                    tenant_id="acme",
+                    provider="azure",
+                    display_name="Production",
+                    settings={},
+                )
+            )
         with database.sessions.begin() as session:
             with pytest.raises(ValueError, match="operator host identity"):
                 save_billing_secret(
                     session,
                     database.secret_cipher,
                     "acme",
-                    "azure",
+                    "azure-profile",
                     "tenant-secret",
                     "ada",
                 )

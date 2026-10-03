@@ -99,11 +99,20 @@ class RequestAdapter:
 
         return headers
 
-    def _azure_runtime_settings(self) -> tuple[str, str, dict[str, str]]:
-        """Resolve Azure URL, API key, and deployment map for this request."""
-        tenant = current_tenant()
+    def _azure_runtime_settings(
+        self, tenant: TenantConfig | DatabaseTenantSnapshot | None
+    ) -> tuple[str, str, dict[str, str]]:
+        """Resolve Azure URL, API key, and deployment map for this snapshot."""
         if tenant is not None:
             if isinstance(tenant, DatabaseTenantSnapshot):
+                if tenant.profile_id is None:
+                    raise ServiceConfigurationError(
+                        "No active provider profile is configured for this tenant."
+                    )
+                if tenant.profile_deleted:
+                    raise ServiceConfigurationError(
+                        "The active provider profile has been removed."
+                    )
                 if tenant.provider != "azure":
                     raise ServiceConfigurationError(
                         "The active tenant provider is not available on the Azure route."
@@ -323,7 +332,11 @@ class RequestAdapter:
         }
 
     # ---- Main adaptation (always streaming completions-like) ----
-    def adapt(self, req: Request) -> Dict[str, Any]:
+    def adapt(
+        self,
+        req: Request,
+        tenant: TenantConfig | DatabaseTenantSnapshot | None = None,
+    ) -> Dict[str, Any]:
         """Build requests.request kwargs for the Azure Responses API call.
 
         Maps inputs to the Responses schema and returns a dict suitable for
@@ -340,8 +353,9 @@ class RequestAdapter:
         self.adapter.inbound_model = inbound_model
 
         settings = current_app.config
-        tenant = current_tenant()
-        azure_url, azure_api_key, deployment_map = self._azure_runtime_settings()
+        if tenant is None:
+            tenant = current_tenant()
+        azure_url, azure_api_key, deployment_map = self._azure_runtime_settings(tenant)
         if (
             isinstance(tenant, DatabaseTenantSnapshot)
             and inbound_model == tenant.custom_model_id

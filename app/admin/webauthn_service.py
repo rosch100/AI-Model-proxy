@@ -21,6 +21,7 @@ from webauthn.authentication.verify_authentication_response import (
 from webauthn.helpers.structs import (
     AuthenticatorSelectionCriteria,
     PublicKeyCredentialDescriptor,
+    PublicKeyCredentialHint,
     ResidentKeyRequirement,
     UserVerificationRequirement,
 )
@@ -65,6 +66,17 @@ def begin_registration(
 ) -> tuple[bytes, dict[str, Any]]:
     """Return challenge bytes and JSON-serializable creation options."""
     challenge = secrets.token_bytes(32)
+    # Additional passkeys should prefer a different authenticator (security key /
+    # another device) once the platform credential is already excluded.
+    hints = (
+        [
+            PublicKeyCredentialHint.SECURITY_KEY,
+            PublicKeyCredentialHint.CLIENT_DEVICE,
+            PublicKeyCredentialHint.HYBRID,
+        ]
+        if exclude_credential_ids
+        else None
+    )
     options = generate_registration_options(
         rp_id=config.rp_id,
         rp_name=config.rp_name,
@@ -80,6 +92,7 @@ def begin_registration(
             for credential_id in exclude_credential_ids
         ]
         or None,
+        hints=hints,
     )
     return challenge, json.loads(options_to_json(options))
 

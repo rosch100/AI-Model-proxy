@@ -72,10 +72,31 @@ def _ensure_provider_allowed_for_auth(provider: str) -> None:
         )
 
 
+def _is_explicit_azure_path(path: str) -> bool:
+    """Return whether a request explicitly targets the Azure path prefix."""
+    clean_path = path.strip("/")
+    return clean_path == "azure" or clean_path.startswith("azure/")
+
+
+def _ensure_database_profile_enabled(path: str, tenant: DatabaseTenantSnapshot) -> None:
+    """Apply provider switches to the selected database-backed profile."""
+    if _is_explicit_azure_path(path):
+        if tenant.provider != "azure":
+            raise ServiceConfigurationError(
+                "The active tenant provider is not available on the Azure route."
+            )
+        _ensure_provider_enabled("azure")
+        return
+    if tenant.provider == "azure":
+        _ensure_provider_enabled("azure")
+
+
 def _azure_model_ids() -> list[str]:
     """Return Cursor-facing Azure model ids for the authenticated principal."""
     tenant = current_tenant()
     if isinstance(tenant, DatabaseTenantSnapshot):
+        if tenant.profile_id is None or tenant.profile_deleted:
+            return []
         return [tenant.custom_model_id]
     if tenant is not None:
         return list(tenant.azure_model_deployments)
@@ -109,12 +130,21 @@ def catch_all(path: str):
         console.print("[yellow]Logging failed but continuing with request[/yellow]")
 
     provider, provider_path = _provider_for_path(path)
-    _ensure_provider_enabled(provider)
     _ensure_provider_allowed_for_auth(provider)
     if provider == "codex":
+        _ensure_provider_enabled(provider)
         return CodexAdapter().forward(request, provider_path)
     tenant = current_tenant()
     if isinstance(tenant, DatabaseTenantSnapshot):
+        _ensure_database_profile_enabled(path, tenant)
+        if tenant.profile_id is None:
+            raise ServiceConfigurationError(
+                "No active provider profile is configured for this tenant."
+            )
+        if tenant.profile_deleted:
+            raise ServiceConfigurationError(
+                "The active provider profile has been removed."
+            )
         if tenant.provider in {"openai", "openrouter"}:
             return forward_openai_compatible(request, tenant)
         if tenant.provider is None:
@@ -125,7 +155,10 @@ def catch_all(path: str):
             raise ServiceConfigurationError(
                 f"Unsupported active provider {tenant.provider!r}."
             )
-    return AzureAdapter().forward(request)
+    azure_adapter = AzureAdapter()
+    if isinstance(tenant, DatabaseTenantSnapshot):
+        return azure_adapter.forward(request, tenant)
+    return azure_adapter.forward(request)
 
 
 # ── Model list ──────────────────────────────────────────────────────────────
@@ -141,10 +174,15 @@ def catch_all(path: str):
 def models():
     """Return a list of available models."""
     provider, _ = _provider_for_path(request.path)
-    _ensure_provider_enabled(provider)
     _ensure_provider_allowed_for_auth(provider)
     if provider == "codex":
+        _ensure_provider_enabled(provider)
         return jsonify(codex_model_payload())
+    tenant = current_tenant()
+    if isinstance(tenant, DatabaseTenantSnapshot):
+        _ensure_database_profile_enabled(request.path, tenant)
+    else:
+        _ensure_provider_enabled(provider)
     return jsonify(
         {
             "object": "list",

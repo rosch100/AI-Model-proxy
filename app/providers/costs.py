@@ -482,7 +482,7 @@ def fetch_azure_costs(
             status="unavailable",
         )
     positions = {name: column_names.index(name) for name in required_columns}
-    buckets: list[CostBucket] = []
+    totals: dict[tuple[datetime, str], Decimal] = {}
     for row in rows:
         if not isinstance(row, list) or len(row) != len(column_names):
             raise CostRefreshError("Azure costs row is invalid.")
@@ -492,7 +492,7 @@ def fetch_azure_costs(
             or returned_resource_id.casefold() != resource_id.casefold()
         ):
             raise CostRefreshError(
-                "Azure costs response does not confirm the bound resource.",
+                "Azure costs response contains an unexpected resource.",
                 status="unavailable",
             )
         currency = row[positions["Currency"]]
@@ -517,26 +517,29 @@ def fetch_azure_costs(
         except (InvalidOperation, TypeError, ValueError) as exc:
             raise CostRefreshError("Azure costs row contains invalid values.") from exc
         if not value.is_finite():
-            raise CostRefreshError("Azure costs row contains invalid values.")
+            raise CostRefreshError("Azure costs row contains a non-finite cost.")
         _validate_storage_decimal(value, "Azure", "costs", "PreTaxCost")
         bucket_end = usage_date + timedelta(days=1)
         if usage_date < period_start or bucket_end > period_end:
             raise CostRefreshError("Azure costs row is outside the requested period.")
-        buckets.append(
-            CostBucket(
-                kind="actual",
-                metric="cost",
-                value=value,
-                unit="currency",
-                currency=currency.upper(),
-                bucket_start=usage_date,
-                bucket_end=bucket_end,
-                source="azure.costmanagement.query",
-                granularity="day",
-                dimensions={"resource_id": resource_id},
-            )
+        bucket_key = (usage_date, currency.upper())
+        totals[bucket_key] = totals.get(bucket_key, Decimal("0")) + value
+        _validate_storage_decimal(totals[bucket_key], "Azure", "costs", "total")
+    return [
+        CostBucket(
+            kind="actual",
+            metric="cost",
+            value=total,
+            unit="currency",
+            currency=currency,
+            bucket_start=bucket_start,
+            bucket_end=bucket_start + timedelta(days=1),
+            source="azure.costmanagement.query",
+            granularity="day",
+            dimensions={"resource_id": resource_id},
         )
-    return buckets
+        for (bucket_start, currency), total in sorted(totals.items())
+    ]
 
 
 def _azure_arm_token() -> str:

@@ -112,19 +112,30 @@ def _refresh_openai(api_key: str) -> list[tuple[str, str | None]]:
 
 
 def _refresh_openrouter(api_key: str) -> list[tuple[str, str | None]]:
-    response = requests.get(
-        "https://openrouter.ai/api/v1/models",
-        headers={"Authorization": f"Bearer {api_key}"},
-        timeout=30,
-    )
+    try:
+        response = requests.get(
+            "https://openrouter.ai/api/v1/models",
+            headers={"Authorization": f"Bearer {api_key}"},
+            timeout=30,
+        )
+    except requests.RequestException as exc:
+        raise CatalogRefreshError("OpenRouter catalog request failed.") from exc
     if response.status_code >= 400:
         raise CatalogRefreshError(f"OpenRouter catalog HTTP {response.status_code}")
-    payload = response.json()
+    try:
+        payload = response.json()
+    except requests.exceptions.JSONDecodeError as exc:
+        raise CatalogRefreshError("OpenRouter catalog payload is invalid.") from exc
     data = payload.get("data") if isinstance(payload, dict) else None
     if not isinstance(data, list):
         raise CatalogRefreshError("OpenRouter catalog payload is invalid.")
-    return [
-        (item["id"], None)
+    models = [
+        item["id"]
         for item in data
-        if isinstance(item, dict) and isinstance(item.get("id"), str)
+        if isinstance(item, dict)
+        and isinstance(item.get("id"), str)
+        and item["id"].strip()
     ]
+    if not models:
+        raise CatalogRefreshError("OpenRouter catalog contains no models.")
+    return [(model_id, None) for model_id in models]

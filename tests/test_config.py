@@ -216,6 +216,7 @@ class TestConfig:
 
     def test_legacy_single_deployment_env_is_ignored(self, monkeypatch):
         """Do not silently backfill the old single-deployment env var."""
+        monkeypatch.setattr(environs.Env, "read_env", lambda *args, **kwargs: None)
         monkeypatch.delenv("AZURE_MODEL_DEPLOYMENTS", raising=False)
         monkeypatch.setenv("AZURE_DEPLOYMENT", "legacy-custom-deployment")
 

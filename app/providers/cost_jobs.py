@@ -31,6 +31,63 @@ from app.providers.costs import (
 REFRESH_STALE_AFTER = timedelta(seconds=180)
 
 
+def load_billing_binding(session: Session, tenant_id: str, profile_id: str) -> tuple[
+    ProviderProfile,
+    ProviderScopeBinding,
+    ProviderScopeNode,
+    ProviderScopeNode | None,
+]:
+    """Return one account's billing scope and optional Azure usage resource."""
+    profile = session.scalar(
+        select(ProviderProfile).where(
+            ProviderProfile.tenant_id == tenant_id,
+            ProviderProfile.id == profile_id,
+            ProviderProfile.deleted_at.is_(None),
+        )
+    )
+    if profile is None:
+        raise LookupError("Provider account was not found")
+    binding = session.scalar(
+        select(ProviderScopeBinding)
+        .where(
+            ProviderScopeBinding.tenant_id == tenant_id,
+            ProviderScopeBinding.profile_id == profile.id,
+            ProviderScopeBinding.provider == profile.provider,
+            ProviderScopeBinding.purpose == "billing",
+        )
+        .with_for_update()
+    )
+    if binding is None:
+        raise LookupError(f"No billing scope is bound to {profile.display_name}")
+    node = session.get(ProviderScopeNode, binding.node_id)
+    if node is None:
+        raise LookupError(f"No {profile.provider} billing scope node is bound")
+    usage_node = None
+    if profile.provider == "azure":
+        usage_binding = session.scalar(
+            select(ProviderScopeBinding).where(
+                ProviderScopeBinding.tenant_id == tenant_id,
+                ProviderScopeBinding.profile_id == profile.id,
+                ProviderScopeBinding.provider == profile.provider,
+                ProviderScopeBinding.purpose == "usage",
+            )
+        )
+        if usage_binding is None:
+            raise LookupError(
+                f"No Azure usage resource is bound to {profile.display_name}"
+            )
+        if usage_binding.parent_binding_id != binding.id:
+            raise LookupError(
+                f"Azure usage resource is not bound to {profile.display_name}'s billing scope"
+            )
+        usage_node = session.get(ProviderScopeNode, usage_binding.node_id)
+        if usage_node is None or usage_node.parent_node_id != node.id:
+            raise LookupError(
+                f"Azure usage resource is not bound to {profile.display_name}'s billing scope"
+            )
+    return profile, binding, node, usage_node
+
+
 def fail_stale_running_jobs(
     session: Session, binding_id: str, now: datetime | None = None
 ) -> bool:
@@ -72,33 +129,21 @@ def fail_stale_running_jobs(
 def start_cost_refresh(
     session: Session,
     tenant_id: str,
-    provider: str,
+    profile_id: str,
     start: datetime,
     end: datetime,
-) -> tuple[ProviderProfile, ProviderScopeBinding, ProviderScopeNode, CostRefreshJob]:
-    """Reserve a refresh attempt and lock its binding before provider I/O."""
-    profile = session.scalar(
-        select(ProviderProfile).where(
-            ProviderProfile.tenant_id == tenant_id,
-            ProviderProfile.provider == provider,
-        )
+) -> tuple[
+    ProviderProfile,
+    ProviderScopeBinding,
+    ProviderScopeNode,
+    ProviderScopeNode | None,
+    CostRefreshJob,
+]:
+    """Reserve a profile-specific refresh before provider I/O."""
+    profile, binding, node, usage_node = load_billing_binding(
+        session, tenant_id, profile_id
     )
-    if profile is None:
-        raise LookupError(f"No {provider} profile is configured")
-    binding = session.scalar(
-        select(ProviderScopeBinding)
-        .where(
-            ProviderScopeBinding.tenant_id == tenant_id,
-            ProviderScopeBinding.provider == provider,
-            ProviderScopeBinding.purpose == "billing",
-        )
-        .with_for_update()
-    )
-    if binding is None:
-        raise LookupError(f"No {provider} billing scope is bound")
-    node = session.get(ProviderScopeNode, binding.node_id)
-    if node is None:
-        raise LookupError(f"No {provider} billing scope node is bound")
+    provider = profile.provider
     if fail_stale_running_jobs(session, binding.id):
         raise LookupError(f"A {provider} cost refresh is already running")
 
@@ -110,7 +155,7 @@ def start_cost_refresh(
         period_start=start,
         period_end=end,
         source_api=provider,
-        operation_key=f"{provider}:{uuid4()}",
+        operation_key=f"{profile.id}:{binding.id}:{uuid4()}",
         status="running",
         retry_at=None,
         limitation=None,
@@ -126,7 +171,7 @@ def start_cost_refresh(
             reason="refresh started",
         )
     )
-    return profile, binding, node, job
+    return profile, binding, node, usage_node, job
 
 
 def collect_provider_costs(
@@ -135,6 +180,7 @@ def collect_provider_costs(
     canonical_scope_id: str,
     start: datetime,
     end: datetime,
+    *,
     usage_scope_id: str | None = None,
 ) -> list[CostBucket]:
     """Call provider billing APIs using stored credentials or host identity."""
@@ -229,10 +275,14 @@ def persist_cost_refresh(
         AuditEvent(
             tenant_id=tenant_id,
             actor_id=actor_id,
-            target=f"costs:{profile.provider}",
+            target=f"costs:{profile.id}",
             action="costs.refresh",
             outcome=status,
-            details={"provider": profile.provider, "job_id": job.id},
+            details={
+                "provider": profile.provider,
+                "profile_id": profile.id,
+                "job_id": job.id,
+            },
         )
     )
     return job

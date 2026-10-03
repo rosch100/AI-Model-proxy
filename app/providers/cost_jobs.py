@@ -1,10 +1,12 @@
-"""Persist cost-refresh jobs after provider I/O has completed."""
+"""Coordinate cost-refresh reservations and persist their terminal results."""
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from uuid import uuid4
 
+import requests
+from cryptography.exceptions import InvalidTag
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
@@ -26,6 +28,8 @@ from app.providers.costs import (
     fetch_openrouter_costs,
 )
 
+REFRESH_STALE_AFTER = timedelta(seconds=180)
+
 
 def load_billing_binding(session: Session, tenant_id: str, profile_id: str) -> tuple[
     ProviderProfile,
@@ -44,12 +48,14 @@ def load_billing_binding(session: Session, tenant_id: str, profile_id: str) -> t
     if profile is None:
         raise LookupError("Provider account was not found")
     binding = session.scalar(
-        select(ProviderScopeBinding).where(
+        select(ProviderScopeBinding)
+        .where(
             ProviderScopeBinding.tenant_id == tenant_id,
             ProviderScopeBinding.profile_id == profile.id,
             ProviderScopeBinding.provider == profile.provider,
             ProviderScopeBinding.purpose == "billing",
         )
+        .with_for_update()
     )
     if binding is None:
         raise LookupError(f"No billing scope is bound to {profile.display_name}")
@@ -78,6 +84,92 @@ def load_billing_binding(session: Session, tenant_id: str, profile_id: str) -> t
     return profile, binding, node, usage_node
 
 
+def fail_stale_running_jobs(
+    session: Session, binding_id: str, now: datetime | None = None
+) -> bool:
+    """Fail expired jobs and return whether a refresh is still active."""
+    now = now or datetime.now(timezone.utc)
+    running_jobs = list(
+        session.scalars(
+            select(CostRefreshJob)
+            .where(
+                CostRefreshJob.binding_id == binding_id,
+                CostRefreshJob.status == "running",
+            )
+            .with_for_update()
+        )
+    )
+    active = False
+    for job in running_jobs:
+        created_at = job.created_at
+        if created_at.tzinfo is None:
+            created_at = created_at.replace(tzinfo=timezone.utc)
+        if now - created_at < REFRESH_STALE_AFTER:
+            active = True
+            continue
+        job.status = "failed"
+        job.completed_at = now
+        job.limitation = "Refresh process did not complete within its time limit."
+        session.add(
+            CostRefreshEvent(
+                job_id=job.id,
+                previous_status="running",
+                new_status="failed",
+                reason=job.limitation,
+            )
+        )
+    session.flush()
+    return active
+
+
+def start_cost_refresh(
+    session: Session,
+    tenant_id: str,
+    profile_id: str,
+    start: datetime,
+    end: datetime,
+) -> tuple[
+    ProviderProfile,
+    ProviderScopeBinding,
+    ProviderScopeNode,
+    ProviderScopeNode | None,
+    CostRefreshJob,
+]:
+    """Reserve a profile-specific refresh before provider I/O."""
+    profile, binding, node, usage_node = load_billing_binding(
+        session, tenant_id, profile_id
+    )
+    provider = profile.provider
+    if fail_stale_running_jobs(session, binding.id):
+        raise LookupError(f"A {provider} cost refresh is already running")
+
+    job = CostRefreshJob(
+        id=str(uuid4()),
+        tenant_id=tenant_id,
+        provider=provider,
+        binding_id=binding.id,
+        period_start=start,
+        period_end=end,
+        source_api=provider,
+        operation_key=f"{profile.id}:{binding.id}:{uuid4()}",
+        status="running",
+        retry_at=None,
+        limitation=None,
+        completed_at=None,
+    )
+    session.add(job)
+    session.flush()
+    session.add(
+        CostRefreshEvent(
+            job_id=job.id,
+            previous_status=None,
+            new_status="running",
+            reason="refresh started",
+        )
+    )
+    return profile, binding, node, usage_node, job
+
+
 def collect_provider_costs(
     cipher: SecretCipher,
     profile: ProviderProfile,
@@ -88,17 +180,27 @@ def collect_provider_costs(
     usage_scope_id: str | None = None,
 ) -> list[CostBucket]:
     """Call the provider billing API using decrypted credentials."""
-    if not profile.billing_secret_ciphertext:
+    if profile.billing_secret_ciphertext is None:
         raise CostRefreshError("Billing credentials are missing.")
-    secret = cipher.decrypt(profile.billing_secret_ciphertext)
-    if profile.provider == "openai":
-        return fetch_openai_costs(secret, canonical_scope_id, start, end)
-    if profile.provider == "openrouter":
-        return fetch_openrouter_costs(secret, start, end)
-    if profile.provider == "azure":
-        if usage_scope_id is None:
-            raise CostRefreshError("Azure usage resource is missing.")
-        return fetch_azure_costs(secret, canonical_scope_id, usage_scope_id, start, end)
+    try:
+        secret = cipher.decrypt(profile.billing_secret_ciphertext)
+    except (InvalidTag, ValueError, UnicodeDecodeError) as exc:
+        raise CostRefreshError("Billing credentials could not be decrypted.") from exc
+    try:
+        if profile.provider == "openai":
+            return fetch_openai_costs(secret, canonical_scope_id, start, end)
+        if profile.provider == "openrouter":
+            return fetch_openrouter_costs(secret, canonical_scope_id, start, end)
+        if profile.provider == "azure":
+            if usage_scope_id is None:
+                raise CostRefreshError("Azure usage resource is missing.")
+            return fetch_azure_costs(
+                secret, canonical_scope_id, usage_scope_id, start, end
+            )
+    except requests.RequestException as exc:
+        raise CostRefreshError(
+            f"{profile.provider.capitalize()} billing request failed."
+        ) from exc
     raise CostRefreshError(f"Unsupported provider {profile.provider!r}")
 
 
@@ -108,34 +210,36 @@ def persist_cost_refresh(
     actor_id: str,
     profile: ProviderProfile,
     binding: ProviderScopeBinding,
-    start: datetime,
-    end: datetime,
+    job: CostRefreshJob,
     buckets: list[CostBucket] | None,
     error: CostRefreshError | None,
-) -> CostRefreshJob:
-    """Write job, events, records, and audit in one unit of work."""
+) -> CostRefreshJob | None:
+    """Complete a still-running job; discard results after stale-job recovery."""
+    binding = session.scalar(
+        select(ProviderScopeBinding)
+        .where(ProviderScopeBinding.id == binding.id)
+        .with_for_update()
+    )
+    if binding is None:
+        return None
+    job = session.scalar(
+        select(CostRefreshJob)
+        .where(CostRefreshJob.id == job.id, CostRefreshJob.status == "running")
+        .with_for_update()
+    )
+    if job is None:
+        return None
+
     now = datetime.now(timezone.utc)
     status = "success" if error is None else error.status
-    job = CostRefreshJob(
-        id=str(uuid4()),
-        tenant_id=tenant_id,
-        provider=profile.provider,
-        binding_id=binding.id,
-        period_start=start,
-        period_end=end,
-        source_api=profile.provider,
-        operation_key=f"{profile.id}:{binding.id}:{now.isoformat()}",
-        status=status,
-        retry_at=None,
-        limitation=str(error) if error is not None else None,
-        completed_at=now,
-    )
-    session.add(job)
+    job.status = status
+    job.limitation = str(error) if error is not None else None
+    job.completed_at = now
     session.flush()
     session.add(
         CostRefreshEvent(
             job_id=job.id,
-            previous_status=None,
+            previous_status="running",
             new_status=status,
             reason=str(error) if error is not None else "refresh completed",
         )

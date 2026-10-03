@@ -28,3 +28,13 @@ def app() -> Flask:
 def testapp(app) -> TestApp:
     """Create Webtest app."""
     return TestApp(app)
+
+
+@pytest.fixture(autouse=True)
+def reset_azure_rate_limit_cooldown():
+    """Isolate the process-wide Azure cooldown between tests."""
+    from app.azure import adapter as azure_adapter
+
+    azure_adapter._rate_limit_not_before.clear()
+    yield
+    azure_adapter._rate_limit_not_before.clear()

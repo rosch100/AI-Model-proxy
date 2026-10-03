@@ -30,6 +30,15 @@
             <a href="{{ url_for('admin.edit_connection_form', profile_id=profile.id) }}">Bearbeiten</a>
             · <a href="{{ url_for('admin.settings_costs') }}">Kosten</a>
           </p>
+          {% if profile.id in view.profiles_with_bindings %}
+            <p class="hint">Dieser Account kann nicht entfernt werden, solange Provider-Scopes gebunden sind.</p>
+          {% else %}
+            <form method="post" action="{{ url_for('admin.delete_connection', profile_id=profile.id) }}">
+              <input type="hidden" name="csrf_token" value="{{ csrf_token() }}" />
+              <input type="hidden" name="profile_id" value="{{ profile.id }}" />
+              <button type="submit">Account entfernen</button>
+            </form>
+          {% endif %}
           <form method="post" action="{{ url_for('admin.refresh_catalog', profile_id=profile.id) }}">
             <input type="hidden" name="csrf_token" value="{{ csrf_token() }}" />
             <button type="submit">Katalog aktualisieren</button>

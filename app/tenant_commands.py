@@ -10,7 +10,7 @@ from uuid import UUID, uuid4
 import click
 from flask import Flask, current_app
 from flask.cli import with_appcontext
-from sqlalchemy import select
+from sqlalchemy import select, text
 from sqlalchemy.exc import IntegrityError
 from werkzeug.security import generate_password_hash
 
@@ -20,12 +20,14 @@ from .persistence.database import Database
 from .persistence.models import (
     AdminAccount,
     AuditEvent,
+    CostRefreshJob,
     ProviderProfile,
     ProviderScopeBinding,
     ProviderScopeNode,
     Tenant,
 )
 from .persistence.repositories import import_tenants
+from .providers.cost_jobs import fail_stale_running_jobs
 
 
 @click.group("tenants")
@@ -142,55 +144,60 @@ def bind_billing_scope() -> None:
             if profile is None:
                 raise ValueError("Provider profile was not found for this tenant")
             provider = profile.provider
-            nodes, binding_values = _scope_records(
-                tenant_id, provider, profile.id, scope_values
+            rebound = provider == "openrouter" and _rebind_openrouter_workspace(
+                session, tenant_id, profile.id, scope_values["billing"]
             )
-            for node in nodes:
-                existing_scope = session.scalar(
-                    select(ProviderScopeNode).where(
-                        ProviderScopeNode.provider == node.provider,
-                        ProviderScopeNode.scope_type == node.scope_type,
-                        ProviderScopeNode.canonical_scope_id == node.canonical_scope_id,
+            if not rebound:
+                nodes, binding_values = _scope_records(
+                    tenant_id, provider, profile.id, scope_values
+                )
+                for node in nodes:
+                    existing_scope = session.scalar(
+                        select(ProviderScopeNode).where(
+                            ProviderScopeNode.provider == node.provider,
+                            ProviderScopeNode.scope_type == node.scope_type,
+                            ProviderScopeNode.canonical_scope_id
+                            == node.canonical_scope_id,
+                        )
+                    )
+                    if existing_scope is not None:
+                        raise ValueError("Provider scope is already bound.")
+                session.add_all(nodes)
+                session.flush()
+                bindings = []
+                for purpose, node, parent_purpose in binding_values:
+                    parent_binding_id = next(
+                        (
+                            binding.id
+                            for binding in bindings
+                            if binding.purpose == parent_purpose
+                        ),
+                        None,
+                    )
+                    binding = ProviderScopeBinding(
+                        id=str(uuid4()),
+                        tenant_id=tenant_id,
+                        provider=provider,
+                        profile_id=profile.id,
+                        purpose=purpose,
+                        node_id=node.id,
+                        parent_binding_id=parent_binding_id,
+                    )
+                    bindings.append(binding)
+                session.add_all(bindings)
+                session.add(
+                    AuditEvent(
+                        tenant_id=tenant_id,
+                        actor_id=actor_id,
+                        target=f"{provider}:billing-scope",
+                        action="billing_scope.bind",
+                        outcome="success",
+                        details={
+                            "provider": provider,
+                            "purposes": [b.purpose for b in bindings],
+                        },
                     )
                 )
-                if existing_scope is not None:
-                    raise ValueError("Provider scope is already bound.")
-            session.add_all(nodes)
-            session.flush()
-            bindings = []
-            for purpose, node, parent_purpose in binding_values:
-                parent_binding_id = next(
-                    (
-                        binding.id
-                        for binding in bindings
-                        if binding.purpose == parent_purpose
-                    ),
-                    None,
-                )
-                binding = ProviderScopeBinding(
-                    id=str(uuid4()),
-                    tenant_id=tenant_id,
-                    provider=provider,
-                    profile_id=profile.id,
-                    purpose=purpose,
-                    node_id=node.id,
-                    parent_binding_id=parent_binding_id,
-                )
-                bindings.append(binding)
-            session.add_all(bindings)
-            session.add(
-                AuditEvent(
-                    tenant_id=tenant_id,
-                    actor_id=actor_id,
-                    target=f"{provider}:billing-scope",
-                    action="billing_scope.bind",
-                    outcome="success",
-                    details={
-                        "provider": provider,
-                        "purposes": [b.purpose for b in bindings],
-                    },
-                )
-            )
     except IntegrityError as exc:
         raise click.ClickException(
             "Unable to bind provider scope: a database integrity constraint was "
@@ -198,7 +205,82 @@ def bind_billing_scope() -> None:
         ) from exc
     except ValueError as exc:
         raise click.ClickException(f"Unable to bind provider scope: {exc}") from exc
-    click.echo(f"{provider.capitalize()} billing scope bound for tenant {tenant_id}.")
+    action = "updated" if rebound else "bound"
+    click.echo(
+        f"{provider.capitalize()} billing scope {action} for tenant {tenant_id}."
+    )
+
+
+def _rebind_openrouter_workspace(
+    session, tenant_id: str, profile_id: str, workspace_id: str
+) -> bool:
+    """Replace a legacy account binding with its explicitly confirmed workspace."""
+    binding = session.scalar(
+        select(ProviderScopeBinding)
+        .where(
+            ProviderScopeBinding.tenant_id == tenant_id,
+            ProviderScopeBinding.provider == "openrouter",
+            ProviderScopeBinding.profile_id == profile_id,
+            ProviderScopeBinding.purpose == "billing",
+        )
+        .with_for_update()
+    )
+    if binding is None:
+        return False
+
+    node = session.get(ProviderScopeNode, binding.node_id)
+    if node is None or node.scope_type != "account":
+        raise ValueError("OpenRouter billing scope is already bound.")
+    existing_workspace = session.scalar(
+        select(ProviderScopeNode).where(
+            ProviderScopeNode.provider == "openrouter",
+            ProviderScopeNode.scope_type == "workspace",
+            ProviderScopeNode.canonical_scope_id == workspace_id,
+        )
+    )
+    if existing_workspace is not None and existing_workspace.id != node.id:
+        raise ValueError("Provider scope is already bound.")
+    if fail_stale_running_jobs(session, binding.id):
+        raise ValueError(
+            "OpenRouter billing scope cannot be rebound while a refresh is running."
+        )
+    has_successful_job = session.scalar(
+        select(CostRefreshJob.id)
+        .where(
+            CostRefreshJob.binding_id == binding.id,
+            CostRefreshJob.status == "success",
+        )
+        .limit(1)
+    )
+    if has_successful_job is not None:
+        raise ValueError(
+            "OpenRouter billing scope cannot be rebound after a successful refresh."
+        )
+
+    previous_scope_type = node.scope_type
+    previous_scope_id = node.canonical_scope_id
+    if session.get_bind().dialect.name == "postgresql":
+        session.execute(text("SET LOCAL app.openrouter_workspace_rebind = 'on'"))
+    node.scope_type = "workspace"
+    node.canonical_scope_id = workspace_id
+    session.add(
+        AuditEvent(
+            tenant_id=tenant_id,
+            actor_id="operator",
+            target="openrouter:billing-scope",
+            action="billing_scope.rebind",
+            outcome="success",
+            details={
+                "provider": "openrouter",
+                "purpose": "billing",
+                "previous_scope_type": previous_scope_type,
+                "previous_scope_id": previous_scope_id,
+                "new_scope_type": "workspace",
+                "new_scope_id": workspace_id,
+            },
+        )
+    )
+    return True
 
 
 def _prompt_scope_values(provider: str) -> dict[str, str]:
@@ -222,7 +304,18 @@ def _prompt_scope_values(provider: str) -> dict[str, str]:
             "organization": _opaque_scope_id(click.prompt("OpenAI organization ID")),
             "billing": _opaque_scope_id(click.prompt("OpenAI project ID")),
         }
-    return {"billing": _opaque_scope_id(click.prompt("OpenRouter account ID"))}
+    return {
+        "billing": _canonical_openrouter_workspace_id(
+            click.prompt("OpenRouter workspace ID")
+        )
+    }
+
+
+def _canonical_openrouter_workspace_id(workspace_id: str) -> str:
+    try:
+        return str(UUID(workspace_id.strip()))
+    except ValueError as exc:
+        raise click.ClickException("OpenRouter workspace ID must be a UUID.") from exc
 
 
 def _canonical_azure_resource_group(scope_id: str) -> str:
@@ -361,14 +454,14 @@ def _scope_records(tenant_id, provider, profile_id, scope_values):
             parent_node_id=organization_node.id,
         )
         return [organization_node, project_node], [("billing", project_node, None)]
-    account_node = ProviderScopeNode(
+    workspace_node = ProviderScopeNode(
         id=str(uuid4()),
         tenant_id=tenant_id,
         provider=provider,
-        scope_type="account",
+        scope_type="workspace",
         canonical_scope_id=scope_values["billing"],
     )
-    return [account_node], [("billing", account_node, None)]
+    return [workspace_node], [("billing", workspace_node, None)]
 
 
 def register_tenant_commands(app: Flask) -> None:

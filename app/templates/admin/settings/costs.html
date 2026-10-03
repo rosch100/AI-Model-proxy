@@ -4,7 +4,13 @@
 {% block content %}
 <section>
   <h1>Kosten</h1>
-  <p class="lede">Abrechnung pro Account und ausschließlich für dessen gebundenen Scope.</p>
+  <p class="lede">Abrechnungs- und Nutzungsdaten hängen von den Rechten und Filtermöglichkeiten des jeweiligen Anbieter-Endpunkts ab. Jeder Refresh bleibt dem ausgewählten Account und dessen operatorseitig gebundenem Scope zugeordnet.</p>
+  <p>Es gibt keinen providerübergreifenden „Billing-Key“. Der Zugang muss zum Anbieter und zum operatorseitig gebundenen Scope passen:</p>
+  <ul>
+    <li><strong>OpenAI:</strong> Admin API Key mit Organisationsrechten; Kosten und Input-/Output-Tokens werden strikt für das gebundene Projekt abgerufen.</li>
+    <li><strong>OpenRouter:</strong> Management Key, nicht der normale Inference-Key. Die Activity-API nutzt die gebundene Workspace-ID als Filter und liefert echte periodische Einträge für die letzten 30 abgeschlossenen UTC-Tage, einschließlich Guthabenverbrauch, BYOK-Kosten sowie Prompt-, Completion- und Reasoning-Tokens.</li>
+    <li><strong>Azure:</strong> JSON-Service-Principal mit Cost-Management-Leserechten; Kostenabfragen werden auf die gebundene Azure-Ressource eingeschränkt.</li>
+  </ul>
   {% if view.bindings %}
     <ul>
       {% for profile, binding, node in view.bindings %}
@@ -26,8 +32,12 @@
           nicht gespeichert
         {% endif %}
       </p>
-      {% if profile.provider == "azure" %}
-        <p class="hint">Azure benötigt einen JSON-Service-Principal mit tenant_id, client_id und client_secret sowie Cost-Management-Leserechten am gebundenen Scope.</p>
+      {% if profile.provider == "openai" %}
+        <p class="hint">OpenAI benötigt einen Admin API Key mit Organisationsrechten (nicht den Inference-Key). Kosten und Input-/Output-Tokens werden strikt für das gebundene Projekt abgerufen.</p>
+      {% elif profile.provider == "openrouter" %}
+        <p class="hint">OpenRouter benötigt einen Management Key (nicht den Inference-Key). Die Activity-API nutzt die gebundene Workspace-ID als Filter und liefert echte periodische Einträge für die letzten 30 abgeschlossenen UTC-Tage, einschließlich Guthabenverbrauch, BYOK-Kosten sowie Prompt-, Completion- und Reasoning-Tokens.</p>
+      {% elif profile.provider == "azure" %}
+        <p class="hint">Azure benötigt einen JSON-Service-Principal mit tenant_id, client_id und client_secret sowie Cost-Management-Leserechten. Die Abfrage wird auf die gebundene Azure-Ressource eingeschränkt.</p>
       {% endif %}
       <form method="post" action="{{ url_for('admin.save_billing') }}" class="stack">
         {{ billing_form.csrf_token }}

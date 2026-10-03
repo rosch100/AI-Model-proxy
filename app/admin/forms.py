@@ -52,6 +52,7 @@ class AzureConnectionForm(FlaskForm):
         validators=[DataRequired(message="Standardmodell ist erforderlich.")],
         choices=[],
         validate_choice=True,
+        render_kw={"aria-describedby": "azure-model-hint"},
     )
 
 
@@ -64,6 +65,7 @@ class OpenAIConnectionForm(FlaskForm):
         validators=[DataRequired(message="Standardmodell ist erforderlich.")],
         choices=[],
         validate_choice=True,
+        render_kw={"aria-describedby": "openai-model-hint"},
     )
     organization = StringField("Organisation (optional)", validators=[Optional()])
     project = StringField("Projekt (optional)", validators=[Optional()])
@@ -80,6 +82,7 @@ class OpenRouterConnectionForm(FlaskForm):
         validators=[DataRequired(message="Standardmodell ist erforderlich.")],
         choices=[],
         validate_choice=True,
+        render_kw={"aria-describedby": "openrouter-model-hint"},
     )
 
 
@@ -124,6 +127,12 @@ class ActivateProviderForm(FlaskForm):
 
 class DeactivateProviderForm(FlaskForm):
     """CSRF-protected request to explicitly clear the active profile."""
+
+
+class DeleteProviderForm(FlaskForm):
+    """CSRF-protected request to remove one provider profile."""
+
+    profile_id = StringField(validators=[DataRequired(), Length(max=36)])
 
 
 class BillingCredentialsForm(FlaskForm):

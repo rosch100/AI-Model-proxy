@@ -21,16 +21,23 @@ from ..tenants import DatabaseTenantSnapshot
 from .request_adapter import RequestAdapter
 from .response_adapter import ResponseAdapter
 
-MAX_AZURE_RATE_LIMIT_RETRIES = 5
 MAX_AZURE_RETRY_DELAY_SECONDS = 60.0
+MIN_AZURE_RATE_LIMIT_DELAY_SECONDS = 15.0
+
+# Shared per-deployment cooldown so concurrent Cursor streams do not retry
+# into an already exhausted Azure token window.
+_rate_limit_not_before: dict[str, float] = {}
 
 
 @dataclass
 class AzureRequestContext:
-    """Share request parameters and retry budget across HTTP and SSE handling."""
+    """Share request parameters and retry state across HTTP and SSE handling."""
 
     request_kwargs: dict[str, Any]
     retries_used: int = 0
+    # Monotonic deadline this request has already waited through, so a retry
+    # sleep does not pay the same shared cooldown twice.
+    satisfied_cooldown_until: float = 0.0
 
 
 class AzureAdapter:
@@ -83,9 +90,8 @@ class AzureAdapter:
     ) -> requests.Response:
         """Retry transient Azure rate limits before returning a response stream."""
         while True:
+            self._wait_for_shared_cooldown(request_context)
             response = requests.request(**request_context.request_kwargs)
-            if request_context.retries_used >= MAX_AZURE_RATE_LIMIT_RETRIES:
-                return response
 
             retry_delay = self._azure_rate_limit_retry_delay(
                 response, request_context.retries_used
@@ -100,13 +106,12 @@ class AzureAdapter:
         self,
         response: requests.Response,
         request_context: AzureRequestContext,
+        event_data: Any = None,
     ) -> requests.Response | None:
-        """Retry a streamed rate limit while sharing the HTTP retry budget."""
-        if request_context.retries_used >= MAX_AZURE_RATE_LIMIT_RETRIES:
-            return None
-
+        """Retry a streamed rate limit using the shared backoff state."""
         retry_delay = self._retry_delay_from_headers(
-            response.headers, request_context.retries_used
+            self._merged_retry_headers(response.headers, event_data),
+            request_context.retries_used,
         )
         if retry_delay is None:
             return None
@@ -121,10 +126,15 @@ class AzureAdapter:
     ) -> None:
         retry_number = request_context.retries_used + 1
         console.print(
-            f"[yellow]Azure rate limit; retry {retry_number}/"
-            f"{MAX_AZURE_RATE_LIMIT_RETRIES} in {retry_delay:.2f}s[/yellow]"
+            f"[yellow]Azure rate limit; retry {retry_number} "
+            f"in {retry_delay:.2f}s[/yellow]"
         )
+        cooldown_until = time.monotonic() + retry_delay
+        AzureAdapter._record_shared_cooldown_until(request_context, cooldown_until)
         time.sleep(retry_delay)
+        request_context.satisfied_cooldown_until = max(
+            request_context.satisfied_cooldown_until, cooldown_until
+        )
         request_context.retries_used += 1
 
     @staticmethod
@@ -145,27 +155,151 @@ class AzureAdapter:
         return AzureAdapter._retry_delay_from_headers(response.headers, retry_number)
 
     @staticmethod
-    def _retry_delay_from_headers(headers, retry_number: int) -> float | None:
-        """Respect Azure's retry delay without retrying early when it exceeds the limit."""
+    def _merged_retry_headers(headers, event_data: Any) -> dict[str, str]:
+        """Prefer HTTP retry hints, then retry-after fields on the SSE error."""
+        merged = {str(key).lower(): str(value) for key, value in headers.items()}
+        for key, value in AzureAdapter._retry_hints_from_event(event_data).items():
+            merged.setdefault(key, value)
+        return merged
+
+    @staticmethod
+    def _retry_hints_from_event(event_data: Any) -> dict[str, str]:
+        if not isinstance(event_data, dict):
+            return {}
+        response = event_data.get("response")
+        response_error = response.get("error") if isinstance(response, dict) else None
+        nested_error = event_data.get("error")
+        sources = [event_data]
+        if isinstance(response_error, dict):
+            sources.append(response_error)
+        if isinstance(nested_error, dict):
+            sources.append(nested_error)
+        hints: dict[str, str] = {}
+        for source in sources:
+            for key in (
+                "retry-after-ms",
+                "retry_after_ms",
+                "retry-after",
+                "retry_after",
+            ):
+                value = source.get(key)
+                if value is None:
+                    continue
+                header = (
+                    "retry-after-ms"
+                    if key.replace("_", "-").endswith("-ms")
+                    else "retry-after"
+                )
+                hints.setdefault(header, str(value))
+        return hints
+
+    @staticmethod
+    def _rate_limit_key(request_context: AzureRequestContext) -> str:
+        body = request_context.request_kwargs.get("json") or {}
+        url = request_context.request_kwargs.get("url") or ""
+        model = body.get("model") or ""
+        return f"{url}|{model}"
+
+    @staticmethod
+    def _wait_for_shared_cooldown(request_context: AzureRequestContext) -> None:
+        key = AzureAdapter._rate_limit_key(request_context)
+        not_before = _rate_limit_not_before.get(key, 0.0)
+        if not_before <= request_context.satisfied_cooldown_until:
+            return
+        remaining = not_before - time.monotonic()
+        if remaining <= 0:
+            request_context.satisfied_cooldown_until = max(
+                request_context.satisfied_cooldown_until, time.monotonic()
+            )
+            return
+        console.print(
+            f"[yellow]Azure rate limit cooldown {remaining:.2f}s "
+            "before next upstream attempt[/yellow]"
+        )
+        time.sleep(remaining)
+        request_context.satisfied_cooldown_until = max(
+            request_context.satisfied_cooldown_until, not_before
+        )
+
+    @staticmethod
+    def _record_shared_cooldown_until(
+        request_context: AzureRequestContext, not_before: float
+    ) -> None:
+        key = AzureAdapter._rate_limit_key(request_context)
+        previous = _rate_limit_not_before.get(key, 0.0)
+        if not_before > previous:
+            _rate_limit_not_before[key] = not_before
+
+    @staticmethod
+    def note_empty_stream_error_precursor(
+        request_context: AzureRequestContext,
+    ) -> None:
+        """Protect peers when Azure emits an empty error before response.failed."""
+        AzureAdapter._record_shared_cooldown_until(
+            request_context, time.monotonic() + MIN_AZURE_RATE_LIMIT_DELAY_SECONDS
+        )
+
+    @staticmethod
+    def note_stream_rate_limit(
+        request_context: AzureRequestContext,
+        headers,
+        event_data: Any,
+    ) -> None:
+        """Share a streamed Azure rate-limit cooldown without retrying this response."""
+        retry_delay = AzureAdapter._retry_delay_from_headers(
+            AzureAdapter._merged_retry_headers(headers, event_data),
+            request_context.retries_used,
+        )
+        if retry_delay is not None:
+            AzureAdapter._record_shared_cooldown_until(
+                request_context, time.monotonic() + retry_delay
+            )
+
+    @staticmethod
+    def _backoff_ceiling(retry_number: int) -> float:
+        max_exponent = math.ceil(
+            math.log2(
+                MAX_AZURE_RETRY_DELAY_SECONDS / MIN_AZURE_RATE_LIMIT_DELAY_SECONDS
+            )
+        )
+        return min(
+            MIN_AZURE_RATE_LIMIT_DELAY_SECONDS * (2 ** min(retry_number, max_exponent)),
+            MAX_AZURE_RETRY_DELAY_SECONDS,
+        )
+
+    @staticmethod
+    def _azure_hint_delay_seconds(headers) -> float | None:
+        """Parse Azure retry-after hints; ignore unusable values."""
         for header, milliseconds_per_unit in (
             ("retry-after-ms", 0.001),
             ("retry-after", 1.0),
         ):
             header_value = headers.get(header)
+            if header_value is None and hasattr(headers, "get"):
+                header_value = headers.get(header.title()) or headers.get(
+                    header.upper()
+                )
             if header_value is None:
                 continue
             try:
                 delay = float(header_value) * milliseconds_per_unit
-            except ValueError:
+            except (TypeError, ValueError):
                 continue
             if not math.isfinite(delay) or delay < 0:
                 return None
-            if delay > MAX_AZURE_RETRY_DELAY_SECONDS:
-                return None
             return delay
+        return None
 
-        backoff_ceiling = min(2**retry_number, MAX_AZURE_RETRY_DELAY_SECONDS)
-        return random.uniform(0.0, backoff_ceiling)
+    @staticmethod
+    def _retry_delay_from_headers(headers, retry_number: int) -> float | None:
+        """Floor short Azure hints at 15s so TPM windows can refill under load."""
+        azure_delay = AzureAdapter._azure_hint_delay_seconds(headers)
+        floor = MIN_AZURE_RATE_LIMIT_DELAY_SECONDS
+        if azure_delay is not None:
+            return min(max(azure_delay, floor), MAX_AZURE_RETRY_DELAY_SECONDS)
+
+        backoff_ceiling = AzureAdapter._backoff_ceiling(retry_number)
+        return random.uniform(max(floor, backoff_ceiling / 2.0), backoff_ceiling)
 
     def _handle_azure_error(self, resp: Response, request_kwargs) -> Response:
 

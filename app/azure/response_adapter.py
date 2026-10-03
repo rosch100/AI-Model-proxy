@@ -367,8 +367,9 @@ class ResponseAdapter:
     # ---- Error event (no "response." prefix!) ----
     def _error(self, obj: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
         """Handle 'error' SSE event by logging until response.failed arrives."""
-        code = obj.get("code", "") if isinstance(obj, dict) else ""
-        message = obj.get("message", "") if isinstance(obj, dict) else ""
+        error = self._sse_error_details(obj)
+        code = error.get("code", "")
+        message = error.get("message", "")
         from ..common.logging import console as _err_console
 
         _err_console.print(
@@ -611,15 +612,38 @@ class ResponseAdapter:
         )
 
     @staticmethod
+    def _error_dict_is_rate_limit(error: Any) -> bool:
+        """Match Azure TPM/RPM throttles by code or message text."""
+        if not isinstance(error, dict):
+            return False
+        if error.get("code") == "rate_limit_exceeded":
+            return True
+        message = str(error.get("message") or "").lower()
+        return "rate limit" in message or "token rate" in message
+
+    @staticmethod
+    def _sse_error_details(event_data: Any) -> dict[str, Any]:
+        """Return Azure error details from either supported SSE payload shape."""
+        if not isinstance(event_data, dict):
+            return {}
+        nested_error = event_data.get("error")
+        return nested_error if isinstance(nested_error, dict) else event_data
+
+    @staticmethod
     def _is_rate_limit_failure(raw_event: str, event_data: Any) -> bool:
         """Identify Azure's retryable streaming rate-limit failure event."""
-        if raw_event != "response.failed" or not isinstance(event_data, dict):
+        if not isinstance(event_data, dict):
+            return False
+        if raw_event == "error":
+            return ResponseAdapter._error_dict_is_rate_limit(
+                ResponseAdapter._sse_error_details(event_data)
+            )
+        if raw_event != "response.failed":
             return False
         response = event_data.get("response")
         if not isinstance(response, dict):
             return False
-        error = response.get("error")
-        return isinstance(error, dict) and error.get("code") == "rate_limit_exceeded"
+        return ResponseAdapter._error_dict_is_rate_limit(response.get("error"))
 
     @staticmethod
     def _error_from_response(upstream_resp: Any) -> Dict[str, str]:
@@ -639,21 +663,37 @@ class ResponseAdapter:
             "message": str(upstream_resp.text),
         }
 
+    def _absorb_empty_error_precursor(
+        self, event: Any, state: _ResponseStreamState, request_context: Any
+    ) -> bool:
+        """Skip empty SSE error noise and start shared cooldown before peers stampede."""
+        if request_context is None or state.has_emitted_output:
+            return False
+        if (event.event or "") != "error":
+            return False
+        data = event.json if isinstance(event.json, dict) else {}
+        code = str(data.get("code") or "").strip()
+        message = str(data.get("message") or "").strip()
+        if code or message or data.get("error"):
+            return False
+        self.adapter.note_empty_stream_error_precursor(request_context)
+        console.print(
+            "[yellow]Azure empty stream error before output; "
+            "holding shared cooldown for likely rate limit[/yellow]"
+        )
+        return True
+
     def _retry_stream_if_possible(
         self, event: Any, state: _ResponseStreamState, request_context: Any
     ) -> Any:
-        """Retry a rate-limit event only while downstream output is still empty."""
-        raw_event = event.event or ""
-        if (
-            raw_event != "response.failed"
-            or state.has_emitted_output
-            or request_context is None
-        ):
+        """Retry a rate-limit event only before downstream-visible output."""
+        if request_context is None or state.has_emitted_output:
             return None
+        raw_event = event.event or ""
         if not self._is_rate_limit_failure(raw_event, event.json):
             return None
         return self.adapter._retry_stream_rate_limit(
-            state.upstream_resp, request_context
+            state.upstream_resp, request_context, event.json
         )
 
     def _stream_upstream_events(
@@ -673,15 +713,34 @@ class ResponseAdapter:
                     }
                 )
                 if error_chunk is not None:
-                    state.has_emitted_output = True
                     yield error_chunk
                     self._record_completion_chunk(error_chunk, state)
                 return
 
             retry_stream = False
+            empty_error_precursor = False
+            stream_error_after_output: Optional[Dict[str, str]] = None
+            stream_rate_limit_noted = False
+            terminal_event_seen = False
             for event in sse_to_events(
-                state.upstream_resp.iter_content(chunk_size=8192)
+                state.upstream_resp.iter_content(chunk_size=128)
             ):
+                if event.event in {
+                    "response.completed",
+                    "response.failed",
+                    "response.incomplete",
+                }:
+                    terminal_event_seen = True
+                absorbed_precursor = self._absorb_empty_error_precursor(
+                    event, state, request_context
+                )
+                if absorbed_precursor:
+                    empty_error_precursor = True
+                    continue
+                raw_event = event.event or ""
+                is_rate_limit_failure = self._is_rate_limit_failure(
+                    raw_event, event.json
+                )
                 retry_response = self._retry_stream_if_possible(
                     event, state, request_context
                 )
@@ -689,10 +748,104 @@ class ResponseAdapter:
                     state.upstream_resp = retry_response
                     retry_stream = True
                     break
-                yield from self._adapt_event(event, state, live)
+                if raw_event == "error":
+                    error = self._sse_error_details(event.json)
+                    if state.has_emitted_output:
+                        stream_error_after_output = {
+                            "code": str(error.get("code") or "stream_error"),
+                            "message": str(
+                                error.get("message")
+                                or "Azure ended the stream after partial output."
+                            ),
+                        }
+                    elif error.get("code") or error.get("message"):
+                        error_chunk = self._failed({"response": {"error": error}})
+                        if error_chunk is not None:
+                            state.has_emitted_output = True
+                            yield error_chunk
+                            self._record_completion_chunk(error_chunk, state)
+                        return
+                if (
+                    is_rate_limit_failure
+                    and state.has_emitted_output
+                    and request_context is not None
+                ):
+                    self.adapter.note_stream_rate_limit(
+                        request_context, state.upstream_resp.headers, event.json
+                    )
+                    stream_rate_limit_noted = True
+                for chunk in self._adapt_event(event, state, live):
+                    state.has_emitted_output = True
+                    yield chunk
 
-            if not retry_stream:
-                return
+            if retry_stream:
+                self._reset_stream_attempt(state)
+                continue
+            if (
+                empty_error_precursor
+                and not state.has_emitted_output
+                and not terminal_event_seen
+                and request_context is not None
+            ):
+                retry_response = self.adapter._retry_stream_rate_limit(
+                    state.upstream_resp,
+                    request_context,
+                    {
+                        "code": "rate_limit_exceeded",
+                        "message": "token rate limit",
+                    },
+                )
+                if retry_response is not None:
+                    state.upstream_resp = retry_response
+                    self._reset_stream_attempt(state)
+                    continue
+            incomplete_after_output = state.has_emitted_output and (
+                stream_error_after_output or empty_error_precursor
+            )
+            if incomplete_after_output and not terminal_event_seen:
+                is_rate_limit_or_unknown_error = stream_error_after_output and (
+                    stream_error_after_output["code"] == "rate_limit_exceeded"
+                    or stream_error_after_output["code"] == "stream_error"
+                )
+                if (
+                    request_context is not None
+                    and not empty_error_precursor
+                    and not stream_rate_limit_noted
+                    and is_rate_limit_or_unknown_error
+                ):
+                    self.adapter.note_empty_stream_error_precursor(request_context)
+                if stream_error_after_output is None:
+                    error = {
+                        "code": "rate_limit_exceeded",
+                        "message": (
+                            "Azure emitted an empty stream error before the response "
+                            "ended; the response may be incomplete. It was not "
+                            "restarted to avoid duplicating output or tool calls."
+                        ),
+                    }
+                else:
+                    error = {
+                        **stream_error_after_output,
+                        "message": (
+                            f"{stream_error_after_output['message']} The response may "
+                            "be incomplete; it was not restarted to avoid duplicating "
+                            "output or tool calls."
+                        ),
+                    }
+                error_chunk = self._failed({"response": {"error": error}})
+                if error_chunk is not None:
+                    yield error_chunk
+                    self._record_completion_chunk(error_chunk, state)
+            return
+
+    def _reset_stream_attempt(self, state: _ResponseStreamState) -> None:
+        """Discard adaptation state belonging to a failed upstream attempt."""
+        state.events = 0
+        state.completion_msg = {"role": "assistant", "content": "", "tool_calls": []}
+        self._reasoning_open = False
+        self._reasoning_pending_whitespace = ""
+        self._tool_calls = 0
+        self._usage = None
 
     def _adapt_event(
         self, event: Any, state: _ResponseStreamState, live: Live
@@ -713,13 +866,11 @@ class ResponseAdapter:
 
         closing = self._reasoning_chunk_before_event(raw_event, event_data)
         if closing is not None:
-            state.has_emitted_output = True
             yield closing
             self._record_completion_chunk(closing, state)
 
         chunk = handler(event_data)
         if chunk is not None:
-            state.has_emitted_output = True
             yield chunk
             self._record_completion_chunk(chunk, state)
 
@@ -803,7 +954,6 @@ class ResponseAdapter:
 
         closing = self._close_reasoning_chunk()
         if closing is not None:
-            state.has_emitted_output = True
             yield closing
         finish_reason = "tool_calls" if self._tool_calls > 0 else "stop"
         yield self._build_completion_chunk(finish_reason=finish_reason)

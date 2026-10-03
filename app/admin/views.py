@@ -33,6 +33,7 @@ from app.admin.forms import (
     ActivateProviderForm,
     BillingCredentialsForm,
     DeactivateProviderForm,
+    DeleteProviderForm,
     LoginForm,
     PasswordChangeForm,
     ProviderProfileForm,
@@ -69,6 +70,7 @@ from app.persistence.admin_ops import (
     activate_provider_profile,
     change_admin_password,
     create_provider_profile,
+    delete_provider_profile,
     replace_catalog_entries,
     rotate_api_key,
     save_billing_secret,
@@ -105,8 +107,8 @@ from app.providers.catalog import (
 )
 from app.providers.cost_jobs import (
     collect_provider_costs,
-    load_billing_binding,
     persist_cost_refresh,
+    start_cost_refresh,
 )
 from app.providers.costs import CostRefreshError
 
@@ -649,6 +651,30 @@ def update_connection(profile_id: str):
     return redirect(url_for("admin.settings_connection"))
 
 
+@admin_bp.post("/settings/connection/<profile_id>/delete")
+@login_required
+def delete_connection(profile_id: str):
+    """Soft-delete one provider account owned by the current tenant."""
+    form = DeleteProviderForm()
+    if not form.validate_on_submit() or form.profile_id.data != profile_id:
+        return "Bad Request", 400
+    try:
+        with _database().sessions.begin() as session:
+            delete_provider_profile(
+                session, g.admin.tenant_id, profile_id, g.admin.username
+            )
+    except LookupError:
+        return "Not Found", 404
+    except ValueError:
+        flash(
+            "Account kann nicht entfernt werden, solange Provider-Scopes gebunden sind.",
+            "error",
+        )
+        return redirect(url_for("admin.settings_connection"))
+    flash("Account entfernt.", "info")
+    return redirect(url_for("admin.settings_connection"))
+
+
 @admin_bp.post("/settings/connection/<profile_id>/activate")
 @login_required
 def activate_connection(profile_id: str):
@@ -819,50 +845,61 @@ def refresh_costs():
     """Refresh one profile's costs; provider I/O stays outside the write transaction."""
     profile_id = request.form.get("profile_id", "")
     database = _database()
-    end = datetime.now(timezone.utc)
+    end = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
     start = end - timedelta(days=30)
-    with database.sessions() as session:
-        try:
-            profile, binding, node, usage_node = load_billing_binding(
-                session, g.admin.tenant_id, profile_id
-            )
-        except LookupError as exc:
-            flash(str(exc), "error")
-            return redirect(url_for("admin.settings_costs"))
-        binding_id = binding.id
-        canonical_scope_id = node.canonical_scope_id
-        usage_scope_id = usage_node.canonical_scope_id if usage_node else None
     try:
-        buckets = collect_provider_costs(
-            database.secret_cipher,
-            profile,
-            canonical_scope_id,
-            start,
-            end,
-            usage_scope_id=usage_scope_id,
-        )
-        error = None
-    except CostRefreshError as exc:
-        buckets = None
-        error = exc
+        with database.sessions.begin() as session:
+            profile, binding, node, usage_node, job = start_cost_refresh(
+                session, g.admin.tenant_id, profile_id, start, end
+            )
+            profile_id = profile.id
+            binding_id = binding.id
+            job_id = job.id
+            canonical_scope_id = node.canonical_scope_id
+            usage_scope_id = usage_node.canonical_scope_id if usage_node else None
+    except LookupError as exc:
+        flash(str(exc), "error")
+        return redirect(url_for("admin.settings_costs"))
+
+    with database.sessions() as session:
+        profile = session.get(ProviderProfile, profile_id)
+        try:
+            buckets = collect_provider_costs(
+                database.secret_cipher,
+                profile,
+                canonical_scope_id,
+                start,
+                end,
+                usage_scope_id=usage_scope_id,
+            )
+            error = None
+        except CostRefreshError as exc:
+            buckets = None
+            error = exc
     with database.sessions.begin() as session:
         profile = session.get(ProviderProfile, profile_id)
         binding = session.get(ProviderScopeBinding, binding_id)
-        persist_cost_refresh(
+        job = session.get(CostRefreshJob, job_id)
+        persisted_job = persist_cost_refresh(
             session,
             g.admin.tenant_id,
             g.admin.username,
             profile,
             binding,
-            start,
-            end,
+            job,
             buckets,
             error,
         )
-    flash(
-        "Kosten aktualisiert." if error is None else str(error),
-        "info" if error is None else "error",
-    )
+    if persisted_job is None:
+        flash(
+            "Der Refresh ist abgelaufen; das verspätete Ergebnis wurde verworfen.",
+            "error",
+        )
+    else:
+        flash(
+            "Kosten aktualisiert." if error is None else str(error),
+            "info" if error is None else "error",
+        )
     return redirect(url_for("admin.settings_costs"))
 
 
@@ -952,8 +989,8 @@ def delete_account_passkey(passkey_id: str):
     return redirect(url_for("admin.account"))
 
 
-def _load_tenant_profiles() -> tuple[Tenant, dict[str, ProviderProfile]]:
-    """Load one representative profile per provider, preferring the active one."""
+def _load_tenant_profiles() -> tuple[Tenant, tuple[ProviderProfile, ...]]:
+    """Load every active tenant profile without collapsing same-provider accounts."""
     database = _database()
     with database.sessions() as session:
         tenant = session.get(Tenant, g.admin.tenant_id)
@@ -967,14 +1004,8 @@ def _load_tenant_profiles() -> tuple[Tenant, dict[str, ProviderProfile]]:
                 .order_by(ProviderProfile.provider, ProviderProfile.display_name)
             )
         )
-        selected: dict[str, ProviderProfile] = {}
-        for profile in profiles:
-            if profile.provider not in selected:
-                selected[profile.provider] = profile
-            if profile.id == tenant.active_profile_id:
-                selected[profile.provider] = profile
         session.expunge_all()
-        return tenant, selected
+        return tenant, profiles
 
 
 def _set_profile_form_choices(
@@ -1040,6 +1071,13 @@ def _connection_context() -> dict[str, object]:
             )
             for provider in provider_names
         }
+        profiles_with_bindings = frozenset(
+            session.scalars(
+                select(ProviderScopeBinding.profile_id).where(
+                    ProviderScopeBinding.tenant_id == tenant.id
+                )
+            )
+        )
         catalogs: dict[str, tuple[ProviderCatalogEntry, ...]] = {}
         selectable_models: dict[str, tuple[tuple[str, str | None], ...]] = {}
         selectable_model_ids: dict[str, tuple[str, ...]] = {}
@@ -1066,6 +1104,7 @@ def _connection_context() -> dict[str, object]:
             "view": ConnectionView(
                 tenant_id=tenant.id,
                 profiles_by_provider=profiles_by_provider,
+                profiles_with_bindings=profiles_with_bindings,
                 catalogs=catalogs,
                 selectable_models=selectable_models,
                 selectable_model_ids=selectable_model_ids,

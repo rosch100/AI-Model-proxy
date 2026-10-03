@@ -325,10 +325,11 @@ def upgrade() -> None:
     op.execute(
         """CREATE FUNCTION validate_provider_scope_binding() RETURNS trigger
         LANGUAGE plpgsql AS $$
-        DECLARE scope_kind text;
-        DECLARE parent_scope_kind text;
-        DECLARE parent_purpose text;
-        DECLARE parent_node text;
+        DECLARE
+            scope_kind text;
+            parent_scope_kind text;
+            parent_purpose text;
+            parent_node text;
         BEGIN
             SELECT scope_type, parent_node_id INTO scope_kind, parent_node
             FROM provider_scope_nodes

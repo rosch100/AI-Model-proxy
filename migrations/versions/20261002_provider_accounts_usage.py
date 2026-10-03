@@ -87,9 +87,9 @@ def upgrade() -> None:
         display_name = label if suffix == 1 else f"{label} {suffix}"
         op.get_bind().execute(
             sa.text(
-            "UPDATE provider_profiles SET display_name = :display_name, "
-            "display_name_key = :display_name_key, history_generation = 0, "
-            "deleted_at = NULL WHERE id = :profile_id"
+                "UPDATE provider_profiles SET display_name = :display_name, "
+                "display_name_key = :display_name_key, history_generation = 0, "
+                "deleted_at = NULL WHERE id = :profile_id"
             ),
             {
                 "display_name": display_name,

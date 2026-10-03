@@ -4,8 +4,9 @@ from __future__ import annotations
 
 import re
 import secrets
-from datetime import datetime
+from datetime import datetime, timezone
 from decimal import Decimal
+from urllib.parse import parse_qs, urlparse
 from uuid import uuid4
 
 import pytest
@@ -209,13 +210,17 @@ def test_billing_secret_is_saved_to_requested_profile_only():
     database.engine.dispose()
 
 
-def test_azure_cost_response_uses_provider_currency(requests_mock, monkeypatch):
-    """Azure cost buckets retain currency and only accept the bound resource."""
+def test_azure_cost_response_preserves_daily_currency_buckets(
+    requests_mock, monkeypatch
+):
+    """Azure daily costs retain date/currency and only accept the bound resource."""
     monkeypatch.setattr("app.providers.costs._azure_arm_token", lambda secret: "token")
     resource_id = (
         "/subscriptions/sub/resourcegroups/rg/providers/"
         "microsoft.cognitiveservices/accounts/llm"
     )
+    start = datetime(2026, 9, 1, tzinfo=timezone.utc)
+    end = datetime(2026, 10, 1, tzinfo=timezone.utc)
     request = requests_mock.post(
         "https://management.azure.com/subscriptions/sub/resourceGroups/rg"
         "/providers/Microsoft.CostManagement/query?api-version=2023-11-01",
@@ -225,11 +230,13 @@ def test_azure_cost_response_uses_provider_currency(requests_mock, monkeypatch):
                     {"name": "ResourceId", "type": "String"},
                     {"name": "Currency", "type": "String"},
                     {"name": "PreTaxCost", "type": "Number"},
+                    {"name": "UsageDate", "type": "Number"},
                 ],
                 "rows": [
-                    [resource_id, "EUR", 12.5],
-                    [resource_id, "EUR", 2.5],
-                    [resource_id, "GBP", 3],
+                    [resource_id, "EUR", 12.5, 20260901],
+                    [resource_id, "EUR", 2.5, 20260901],
+                    [resource_id, "EUR", 7, 20260902],
+                    [resource_id, "GBP", 3, 20260902],
                 ],
             }
         },
@@ -238,23 +245,94 @@ def test_azure_cost_response_uses_provider_currency(requests_mock, monkeypatch):
         "service-principal",
         "/subscriptions/sub/resourceGroups/rg",
         resource_id,
-        datetime(2026, 9, 1),
-        datetime(2026, 10, 1),
+        start,
+        end,
     )
     request_body = request.last_request.json()
     dataset = request_body["dataset"]
     assert dataset["aggregation"] == {
         "totalCost": {"name": "PreTaxCost", "function": "Sum"}
     }
+    assert request_body["timePeriod"] == {
+        "from": "2026-09-01",
+        "to": "2026-09-30",
+    }
     assert dataset["filter"]["dimensions"]["values"] == [resource_id]
     assert {group["name"] for group in dataset["grouping"]} == {
         "ResourceId",
         "Currency",
     }
-    assert [(bucket.currency, bucket.value) for bucket in buckets] == [
-        ("EUR", Decimal("15.0")),
-        ("GBP", Decimal("3")),
+    assert [
+        (
+            bucket.currency,
+            bucket.value,
+            bucket.bucket_start,
+            bucket.bucket_end,
+            bucket.granularity,
+        )
+        for bucket in buckets
+    ] == [
+        (
+            "EUR",
+            Decimal("15.0"),
+            datetime(2026, 9, 1, tzinfo=timezone.utc),
+            datetime(2026, 9, 2, tzinfo=timezone.utc),
+            "day",
+        ),
+        (
+            "EUR",
+            Decimal("7"),
+            datetime(2026, 9, 2, tzinfo=timezone.utc),
+            datetime(2026, 9, 3, tzinfo=timezone.utc),
+            "day",
+        ),
+        (
+            "GBP",
+            Decimal("3"),
+            datetime(2026, 9, 2, tzinfo=timezone.utc),
+            datetime(2026, 9, 3, tzinfo=timezone.utc),
+            "day",
+        ),
     ]
+
+
+@pytest.mark.parametrize(
+    ("cost_value", "currency"),
+    [("1000000000000000000", "USD"), ("1.00000000001", "USD"), ("12", "EURO")],
+)
+def test_azure_cost_response_rejects_values_outside_storage_schema(
+    requests_mock, monkeypatch, cost_value, currency
+):
+    """Azure values that cannot fit the cost record schema fail before persistence."""
+    monkeypatch.setattr("app.providers.costs._azure_arm_token", lambda secret: "token")
+    resource_id = (
+        "/subscriptions/sub/resourceGroups/rg/providers/"
+        "Microsoft.CognitiveServices/accounts/llm"
+    )
+    requests_mock.post(
+        "https://management.azure.com/subscriptions/sub/resourceGroups/rg"
+        "/providers/Microsoft.CostManagement/query?api-version=2023-11-01",
+        json={
+            "properties": {
+                "columns": [
+                    {"name": "ResourceId", "type": "String"},
+                    {"name": "Currency", "type": "String"},
+                    {"name": "PreTaxCost", "type": "Number"},
+                    {"name": "UsageDate", "type": "Number"},
+                ],
+                "rows": [[resource_id, currency, cost_value, 20260901]],
+            }
+        },
+    )
+
+    with pytest.raises(CostRefreshError, match="invalid|precision"):
+        fetch_azure_costs(
+            "service-principal",
+            "/subscriptions/sub/resourceGroups/rg",
+            resource_id,
+            datetime(2026, 9, 1, tzinfo=timezone.utc),
+            datetime(2026, 10, 1, tzinfo=timezone.utc),
+        )
 
 
 def test_azure_cost_response_rejects_unexpected_resource(requests_mock, monkeypatch):
@@ -269,12 +347,14 @@ def test_azure_cost_response_rejects_unexpected_resource(requests_mock, monkeypa
                     {"name": "ResourceId", "type": "String"},
                     {"name": "Currency", "type": "String"},
                     {"name": "PreTaxCost", "type": "Number"},
+                    {"name": "UsageDate", "type": "Number"},
                 ],
                 "rows": [
                     [
                         "/subscriptions/sub/resourceGroups/rg/providers/Microsoft.CognitiveServices/accounts/other",
                         "USD",
                         8,
+                        20260901,
                     ]
                 ],
             }
@@ -285,8 +365,8 @@ def test_azure_cost_response_rejects_unexpected_resource(requests_mock, monkeypa
             "service-principal",
             "/subscriptions/sub/resourceGroups/rg",
             "/subscriptions/sub/resourceGroups/rg/providers/Microsoft.CognitiveServices/accounts/llm",
-            datetime(2026, 9, 1),
-            datetime(2026, 10, 1),
+            datetime(2026, 9, 1, tzinfo=timezone.utc),
+            datetime(2026, 10, 1, tzinfo=timezone.utc),
         )
 
 
@@ -336,12 +416,14 @@ def test_azure_cost_response_rejects_non_finite_cost(
                     {"name": "ResourceId", "type": "String"},
                     {"name": "PreTaxCost", "type": "Number"},
                     {"name": "Currency", "type": "String"},
+                    {"name": "UsageDate", "type": "Number"},
                 ],
                 "rows": [
                     [
                         "/subscriptions/sub/resourceGroups/rg/providers/Microsoft.CognitiveServices/accounts/llm",
                         invalid_amount,
                         "USD",
+                        20260901,
                     ]
                 ],
             }
@@ -352,8 +434,8 @@ def test_azure_cost_response_rejects_non_finite_cost(
             "service-principal",
             "/subscriptions/sub/resourceGroups/rg",
             "/subscriptions/sub/resourceGroups/rg/providers/Microsoft.CognitiveServices/accounts/llm",
-            datetime(2026, 9, 1),
-            datetime(2026, 10, 1),
+            datetime(2026, 9, 1, tzinfo=timezone.utc),
+            datetime(2026, 10, 1, tzinfo=timezone.utc),
         )
 
 
@@ -373,8 +455,8 @@ def test_azure_cost_response_treats_no_content_as_unavailable(
             "service-principal",
             "/subscriptions/sub/resourceGroups/rg",
             "/subscriptions/sub/resourceGroups/rg/providers/Microsoft.CognitiveServices/accounts/llm",
-            datetime(2026, 9, 1),
-            datetime(2026, 10, 1),
+            datetime(2026, 9, 1, tzinfo=timezone.utc),
+            datetime(2026, 10, 1, tzinfo=timezone.utc),
         )
 
     assert failure.value.status == "unavailable"
@@ -393,8 +475,8 @@ def test_azure_cost_response_rejects_invalid_json(requests_mock, monkeypatch):
             "service-principal",
             "/subscriptions/sub/resourceGroups/rg",
             "/subscriptions/sub/resourceGroups/rg/providers/Microsoft.CognitiveServices/accounts/llm",
-            datetime(2026, 9, 1),
-            datetime(2026, 10, 1),
+            datetime(2026, 9, 1, tzinfo=timezone.utc),
+            datetime(2026, 10, 1, tzinfo=timezone.utc),
         )
 
 
@@ -405,8 +487,8 @@ def test_azure_billing_credentials_reject_valid_non_object_json(requests_mock):
             "[]",
             "/subscriptions/sub/resourceGroups/rg",
             "/subscriptions/sub/resourceGroups/rg/providers/Microsoft.CognitiveServices/accounts/llm",
-            datetime(2026, 9, 1),
-            datetime(2026, 10, 1),
+            datetime(2026, 9, 1, tzinfo=timezone.utc),
+            datetime(2026, 10, 1, tzinfo=timezone.utc),
         )
     assert not requests_mock.request_history
 
@@ -422,8 +504,8 @@ def test_azure_billing_token_network_error_is_a_cost_refresh_error(requests_mock
             '{"tenant_id":"tenant","client_id":"client",' '"client_secret":"secret"}',
             "/subscriptions/sub/resourceGroups/rg",
             "/subscriptions/sub/resourceGroups/rg/providers/Microsoft.CognitiveServices/accounts/llm",
-            datetime(2026, 9, 1),
-            datetime(2026, 10, 1),
+            datetime(2026, 9, 1, tzinfo=timezone.utc),
+            datetime(2026, 10, 1, tzinfo=timezone.utc),
         )
 
 
@@ -444,8 +526,8 @@ def test_cost_collection_requires_profile_billing_secret():
             database.secret_cipher,
             profile,
             "org-production",
-            datetime(2026, 9, 1),
-            datetime(2026, 10, 1),
+            datetime(2026, 9, 1, tzinfo=timezone.utc),
+            datetime(2026, 10, 1, tzinfo=timezone.utc),
         )
     database.engine.dispose()
 
@@ -581,4 +663,102 @@ def test_cost_routes_keep_same_provider_accounts_isolated(admin_app, monkeypatch
         )
         assert refresh_audit.target == f"costs:{staging_profile_id}"
         assert refresh_audit.details["profile_id"] == staging_profile_id
+    database.engine.dispose()
+
+
+def test_openrouter_refresh_uses_selected_profiles_workspace_and_binding(
+    admin_app, requests_mock
+):
+    """The selected OpenRouter profile supplies both key and workspace scope."""
+    database = admin_app.extensions["database"]
+    workspaces = {
+        "production": "550e8400-e29b-41d4-a716-446655440000",
+        "staging": "550e8400-e29b-41d4-a716-446655440001",
+    }
+    with database.sessions.begin() as session:
+        account = authenticate_admin(session, "ada", "correct-horse-battery")
+        insert_passkey(
+            session,
+            account_id=account.id,
+            credential_id=secrets.token_bytes(32),
+            public_key=secrets.token_bytes(64),
+            sign_count=0,
+            user_handle=secrets.token_bytes(32),
+            label="Primary",
+            aaguid=None,
+            backed_up=False,
+        )
+        principal = create_admin_session(session, account, enrollment_only=False)
+        profiles = {}
+        for suffix, workspace_id in workspaces.items():
+            profile = create_provider_profile(
+                session,
+                database.secret_cipher,
+                "acme",
+                "openrouter",
+                suffix.title(),
+                {},
+                "openai/gpt-5",
+                f"inference-{suffix}",
+                "ada",
+            )
+            node = ProviderScopeNode(
+                id=f"workspace-node-{suffix}",
+                tenant_id="acme",
+                provider="openrouter",
+                scope_type="workspace",
+                canonical_scope_id=workspace_id,
+            )
+            session.add(node)
+            session.flush()
+            binding = ProviderScopeBinding(
+                id=f"workspace-binding-{suffix}",
+                tenant_id="acme",
+                provider="openrouter",
+                profile_id=profile.id,
+                purpose="billing",
+                node_id=node.id,
+            )
+            session.add(binding)
+            save_billing_secret(
+                session,
+                database.secret_cipher,
+                "acme",
+                profile.id,
+                f"management-{suffix}",
+                "ada",
+            )
+            profiles[suffix] = (profile.id, binding.id)
+
+    client = admin_app.test_client()
+    client.set_cookie(ADMIN_COOKIE_NAME, principal.token, path="/admin")
+    page = client.get("/admin/settings/costs")
+    csrf = re.search(
+        r'name="csrf_token" type="hidden" value="([^\"]+)"',
+        page.get_data(as_text=True),
+    ).group(1)
+    requests_mock.get(
+        "https://openrouter.ai/api/v1/activity",
+        json={"data": []},
+    )
+    selected_profile_id, selected_binding_id = profiles["staging"]
+    response = client.post(
+        "/admin/settings/costs/refresh",
+        data={"csrf_token": csrf, "profile_id": selected_profile_id},
+    )
+
+    assert response.status_code == 302
+    request = requests_mock.last_request
+    assert parse_qs(urlparse(request.url).query) == {
+        "workspace_id": [workspaces["staging"]]
+    }
+    assert request.headers["Authorization"] == "Bearer management-staging"
+    with database.sessions() as session:
+        job = session.scalar(select(CostRefreshJob))
+        assert job.binding_id == selected_binding_id
+        audit = session.scalar(
+            select(AuditEvent).where(AuditEvent.action == "costs.refresh")
+        )
+        assert audit.target == f"costs:{selected_profile_id}"
+        assert audit.details["profile_id"] == selected_profile_id
     database.engine.dispose()

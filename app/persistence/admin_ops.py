@@ -17,6 +17,7 @@ from app.persistence.models import (
     AuditEvent,
     ProviderCatalogEntry,
     ProviderProfile,
+    ProviderScopeBinding,
     Tenant,
     provider_profile_name_key,
 )
@@ -316,6 +317,50 @@ def update_provider_profile(
         )
     )
     return profile
+
+
+def delete_provider_profile(
+    session: Session, tenant_id: str, profile_id: str, actor_id: str
+) -> None:
+    """Soft-delete one tenant-owned profile while preserving audit history."""
+    tenant = session.scalar(
+        select(Tenant).where(Tenant.id == tenant_id).with_for_update()
+    )
+    if tenant is None:
+        raise LookupError("Tenant was not found")
+    profile = session.scalar(
+        select(ProviderProfile)
+        .where(
+            ProviderProfile.id == profile_id,
+            ProviderProfile.tenant_id == tenant_id,
+            ProviderProfile.deleted_at.is_(None),
+        )
+        .with_for_update()
+    )
+    if profile is None:
+        raise LookupError("Provider account was not found")
+    has_scope_bindings = session.scalar(
+        select(ProviderScopeBinding.id)
+        .where(ProviderScopeBinding.profile_id == profile.id)
+        .limit(1)
+    )
+    if has_scope_bindings is not None:
+        raise ValueError("Account cannot be deleted while scopes are bound")
+    profile.inference_secret_ciphertext = None
+    profile.billing_secret_ciphertext = None
+    profile.deleted_at = datetime.now(timezone.utc)
+    if tenant.active_profile_id == profile.id:
+        tenant.active_profile_id = None
+    session.add(
+        AuditEvent(
+            tenant_id=tenant_id,
+            actor_id=actor_id,
+            target=f"profile:{profile.id}",
+            action="profile.delete",
+            outcome="success",
+            details={"provider": profile.provider, "profile_id": profile.id},
+        )
+    )
 
 
 def activate_provider_profile(

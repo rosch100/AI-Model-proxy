@@ -90,7 +90,8 @@ def test_dashboard_explains_missing_cost_configuration(admin_app):
     assert 'href="/admin/settings/costs"' in body
     assert "Kein Billing-Scope gebunden" in body
     assert "Live-Verbindungen" in body
-    assert body.index("Live-Verbindungen") < body.index("Aktuelle Aktivität")
+    assert body.index("Live-Verbindungen") < body.index("Kostenübersicht nach Konto")
+    assert body.index("Kostenübersicht nach Konto") < body.index("Aktuelle Aktivität")
     assert "keine Anfrage in 24 h" in body
 
 

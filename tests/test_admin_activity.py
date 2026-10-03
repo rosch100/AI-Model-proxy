@@ -6,7 +6,7 @@ from datetime import datetime, timedelta, timezone
 
 from sqlalchemy import select
 
-from app.admin.view_models import activity_board
+from app.admin.view_models import activity_board, format_relative_time
 from app.persistence.inference_activity import (
     parse_provider_usage,
     record_inference_activity,
@@ -90,15 +90,15 @@ def test_activity_board_shows_average_tokens_per_request_and_last_query():
     assert board.total_requests_with_usage_in_window == 2
     assert board.total_tokens_per_request_label == "8.250"
     assert [row.requested_model for row in board.requests] == [
-        "cursor-acme-model",
-        "openrouter/free",
         "gpt-5",
+        "openrouter/free",
+        "cursor-acme-model",
     ]
-    assert board.requests[0].total_tokens_label == "15.000"
-    assert board.requests[0].input_tokens_label == "14.000"
-    assert board.requests[0].output_tokens_label == "1.000"
-    assert board.requests[0].provider_label == "Azure"
-    assert board.requests[0].time_label == "03.10.2026 16:19:00 UTC"
+    assert board.requests[-1].total_tokens_label == "15.000"
+    assert board.requests[-1].input_tokens_label == "14.000"
+    assert board.requests[-1].output_tokens_label == "1.000"
+    assert board.requests[-1].provider_label == "Azure"
+    assert board.requests[-1].time_label == "2026-10-03T16:19:00+00:00"
     assert board.requests[1].total_tokens_label is None
     azure = board.providers[0]
     assert azure.label == "Azure"
@@ -118,6 +118,38 @@ def test_activity_board_shows_average_tokens_per_request_and_last_query():
     assert openrouter.rows[0].tokens_per_request_label is None
     assert openrouter.rows[0].bar_percent == 0
     assert openrouter.rows[0].recency == "recent"
+
+
+def test_relative_time_is_timezone_neutral_for_older_activity():
+    """Older live timestamps use relative labels, not a UTC clock rendering."""
+    now = datetime(2026, 10, 3, 16, 20, tzinfo=timezone.utc)
+
+    assert format_relative_time(now - timedelta(hours=2), now) == "vor 2 Std."
+
+
+def test_activity_board_filters_request_list_by_selected_period():
+    """Show only list entries inside the selected lookback window."""
+    now = datetime(2026, 10, 3, 16, 20, tzinfo=timezone.utc)
+    events = tuple(
+        InferenceActivityEvent(
+            tenant_id="acme",
+            provider="azure",
+            inbound_model="gpt-6-luna",
+            routed_model="gpt-6-luna",
+            total_tokens=100,
+            occurred_at=now - timedelta(minutes=minutes_old),
+        )
+        for minutes_old in (120, 30, 5)
+    )
+
+    board = activity_board(
+        events, custom_model_id="cursor-acme-model", now=now, request_period_hours=1
+    )
+
+    assert [row.occurred_at for row in board.requests] == [
+        now - timedelta(minutes=30),
+        now - timedelta(minutes=5),
+    ]
 
 
 def test_activity_board_limits_request_list_to_most_recent_entries():
@@ -142,8 +174,8 @@ def test_activity_board_limits_request_list_to_most_recent_entries():
     board = activity_board(events, custom_model_id="cursor-acme-model", now=now)
 
     assert len(board.requests) == 50
-    assert board.requests[0].occurred_at == now
-    assert board.requests[-1].occurred_at == now - timedelta(minutes=49)
+    assert board.requests[0].occurred_at == now - timedelta(minutes=49)
+    assert board.requests[-1].occurred_at == now
 
 
 def test_dashboard_renders_activity_empty_state(admin_app):
@@ -151,7 +183,55 @@ def test_dashboard_renders_activity_empty_state(admin_app):
     body = _authenticated_client(admin_app).get("/admin/").get_data(as_text=True)
 
     assert "Aktuelle Aktivität" in body
-    assert "Keine aktuelle Proxy-Aktivität" in body
+    assert "Keine Proxy-Aktivität im ausgewählten Zeitraum" in body
+
+
+def test_dashboard_rejects_unsupported_activity_period(admin_app):
+    """Reject query values outside the available activity periods."""
+    response = _authenticated_client(admin_app).get("/admin/?activity_hours=2")
+
+    assert response.status_code == 400
+
+
+def test_dashboard_activity_range_includes_older_events(admin_app):
+    """The selected list range controls both initial render and HTMX refresh."""
+    database = admin_app.extensions["database"]
+    now = datetime.now(timezone.utc)
+    with database.sessions.begin() as session:
+        session.add_all(
+            (
+                InferenceActivityEvent(
+                    tenant_id="acme",
+                    provider="azure",
+                    inbound_model="within-range-model",
+                    routed_model="within-range-model",
+                    input_tokens=8,
+                    output_tokens=4,
+                    total_tokens=12,
+                    occurred_at=now - timedelta(days=2),
+                ),
+                InferenceActivityEvent(
+                    tenant_id="acme",
+                    provider="azure",
+                    inbound_model="outside-range-model",
+                    routed_model="outside-range-model",
+                    input_tokens=6,
+                    output_tokens=4,
+                    total_tokens=10,
+                    occurred_at=now - timedelta(days=8),
+                ),
+            )
+        )
+
+    client = _authenticated_client(admin_app)
+    body = client.get("/admin/?activity_hours=168").get_data(as_text=True)
+    fragment = client.get("/admin/activity?activity_hours=168").get_data(as_text=True)
+
+    assert "within-range-model" in body
+    assert "outside-range-model" not in body
+    assert "/admin/activity?activity_hours=168" in body
+    assert "within-range-model" in fragment
+    assert "outside-range-model" not in fragment
 
 
 def test_dashboard_renders_provider_model_activity(admin_app):
@@ -180,7 +260,12 @@ def test_dashboard_renders_provider_model_activity(admin_app):
 
     assert "gpt-6-luna" in body
     assert "Tokens / Anfrage" in body
-    assert "Zeit (UTC)" in body
+    assert "Zeit (lokal)" in body
+    assert "Zeitraum der Liste" in body
+    assert "Letzte 7 Tage" in body
+    assert "data-local-time" in body
+    assert body.index("Live-Verbindungen") < body.index("Kostenübersicht nach Konto")
+    assert body.index("Kostenübersicht nach Konto") < body.index("Aktuelle Aktivität")
     assert "15.000" in body
     assert "Eingabe 14.000 · Ausgabe 1.000" in body
     assert "Azure" in body

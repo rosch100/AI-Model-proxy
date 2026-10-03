@@ -675,6 +675,24 @@ code {
   font-size: 0.86rem;
 }
 
+.activity-period-form {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-end;
+  gap: 0.65rem;
+}
+
+.activity-period-form label {
+  display: grid;
+  gap: 0.3rem;
+  color: var(--muted);
+  font-size: 0.82rem;
+}
+
+.activity-period-form select {
+  min-width: 11rem;
+}
+
 .activity-summary {
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));

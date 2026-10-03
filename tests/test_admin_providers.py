@@ -207,8 +207,9 @@ def test_openrouter_account_key_survives_save_and_catalog_refresh(
 
     edit_page = client.get(f"/admin/settings/connection/{profile_id}/edit")
     edit_body = edit_page.get_data(as_text=True)
-    assert "gespeicherten Schlüssel beizubehalten" in edit_body
-    assert "API-Schlüssel ist gespeichert" in edit_body
+    assert "leer lassen oder unverändert lassen" in edit_body
+    assert 'name="api_key"' in edit_body
+    assert 'value="••••••••"' in edit_body
     assert key not in edit_body
 
     activated = client.post(

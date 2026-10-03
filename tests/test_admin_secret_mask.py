@@ -195,7 +195,7 @@ def test_costs_page_explains_provider_specific_credentials_and_limits(admin_app)
     assert "Management Key" in body
     assert "platform.openai.com/settings/organization/admin-keys" in body
     assert "openrouter.ai/settings/management-keys" in body
-    assert "flask tenants bind-billing-scope" in body
+    assert "flask tenants bind-billing-scope" not in body
     assert "sk-admin-" in body
     assert "Usage API" in body
     assert "Only management keys" in body

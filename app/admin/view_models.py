@@ -33,6 +33,7 @@ class ProviderStatus:
     is_active: bool
     recency: str | None = None
     last_request_label: str | None = None
+    last_request_at: datetime | None = None
 
 
 @dataclass(frozen=True)
@@ -120,6 +121,7 @@ class ActivityBoard:
     last_request_at: datetime | None
     last_request_label: str | None
     providers: tuple[ProviderActivityGroup, ...]
+    request_period_hours: int
 
 
 @dataclass(frozen=True)
@@ -270,6 +272,8 @@ def dashboard_view(
     activity_events: Sequence[InferenceActivityEvent] = (),
     *,
     now: datetime | None = None,
+    request_events: Sequence[InferenceActivityEvent] | None = None,
+    request_period_hours: int = ACTIVITY_LOOKBACK_HOURS,
 ) -> DashboardView:
     """Build provider status and latest-snapshot cost summaries for a tenant."""
     profiles_by_provider: dict[str, ProviderProfile] = {}
@@ -347,7 +351,9 @@ def dashboard_view(
                 period_start=latest_success.period_start if latest_success else None,
                 period_end=latest_success.period_end if latest_success else None,
                 last_successful_at=(
-                    latest_success.completed_at if latest_success else None
+                    _aware_utc(latest_success.completed_at)
+                    if latest_success and latest_success.completed_at
+                    else None
                 ),
                 last_job_status=(
                     _REFRESH_STATUS_LABELS.get(
@@ -372,6 +378,8 @@ def dashboard_view(
         activity_events,
         custom_model_id=tenant.custom_model_id,
         now=now,
+        request_events=request_events,
+        request_period_hours=request_period_hours,
     )
     latest_activity = {
         group.provider: max(group.rows, key=lambda row: row.last_request_at)
@@ -391,6 +399,11 @@ def dashboard_view(
             ),
             last_request_label=(
                 latest_activity[status.provider].last_request_label
+                if status.provider in latest_activity
+                else None
+            ),
+            last_request_at=(
+                latest_activity[status.provider].last_request_at
                 if status.provider in latest_activity
                 else None
             ),
@@ -435,9 +448,10 @@ def format_relative_time(moment: datetime, now: datetime) -> str:
         return f"vor {int(elapsed)} s"
     if elapsed < 3600:
         return f"vor {int(elapsed // 60)} min"
-    if moment.astimezone(timezone.utc).date() == now.astimezone(timezone.utc).date():
-        return moment.astimezone(timezone.utc).strftime("%H:%M UTC")
-    return moment.astimezone(timezone.utc).strftime("%d.%m. %H:%M UTC")
+    if elapsed < 86400:
+        return f"vor {int(elapsed // 3600)} Std."
+    days = int(elapsed // 86400)
+    return f"vor {days} Tag" if days == 1 else f"vor {days} Tagen"
 
 
 @dataclass
@@ -468,12 +482,42 @@ def _recency_class(
     return "idle"
 
 
+def _activity_request_row(event: InferenceActivityEvent) -> ActivityRequestRow:
+    """Prepare one inference event for the chronological request list."""
+    occurred_at = _aware_utc(event.occurred_at)
+    return ActivityRequestRow(
+        provider=event.provider,
+        provider_label=_PROVIDER_LABELS[event.provider],
+        requested_model=event.inbound_model,
+        routed_model=event.routed_model,
+        occurred_at=occurred_at,
+        time_label=occurred_at.isoformat(),
+        total_tokens_label=(
+            None
+            if event.total_tokens is None
+            else format_token_count(event.total_tokens)
+        ),
+        input_tokens_label=(
+            None
+            if event.input_tokens is None
+            else format_token_count(event.input_tokens)
+        ),
+        output_tokens_label=(
+            None
+            if event.output_tokens is None
+            else format_token_count(event.output_tokens)
+        ),
+    )
+
+
 def activity_board(
     events: Sequence[InferenceActivityEvent],
     *,
     custom_model_id: str,
     now: datetime | None = None,
     window_minutes: int = ACTIVITY_WINDOW_MINUTES,
+    request_events: Sequence[InferenceActivityEvent] | None = None,
+    request_period_hours: int = ACTIVITY_LOOKBACK_HOURS,
     lookback_hours: int = ACTIVITY_LOOKBACK_HOURS,
 ) -> ActivityBoard:
     """Prepare recent request rows and provider recency for the overview."""
@@ -482,8 +526,17 @@ def activity_board(
         raise ValueError("Activity board clock must be timezone-aware")
     window_start = clock - timedelta(minutes=window_minutes)
     lookback_start = clock - timedelta(hours=lookback_hours)
+    request_start = clock - timedelta(hours=request_period_hours)
+    list_events = request_events if request_events is not None else events
+    request_rows = sorted(
+        (
+            _activity_request_row(event)
+            for event in list_events
+            if _aware_utc(event.occurred_at) >= request_start
+        ),
+        key=lambda row: row.occurred_at,
+    )[-_ACTIVITY_REQUEST_LIST_LIMIT:]
     buckets: dict[tuple[str, str], _ActivityAccumulator] = {}
-    request_rows: list[ActivityRequestRow] = []
     total_tokens = 0
     total_requests = 0
     total_requests_with_usage = 0
@@ -491,31 +544,6 @@ def activity_board(
         occurred_at = _aware_utc(event.occurred_at)
         if occurred_at < lookback_start:
             continue
-        request_rows.append(
-            ActivityRequestRow(
-                provider=event.provider,
-                provider_label=_PROVIDER_LABELS[event.provider],
-                requested_model=event.inbound_model,
-                routed_model=event.routed_model,
-                occurred_at=occurred_at,
-                time_label=occurred_at.strftime("%d.%m.%Y %H:%M:%S UTC"),
-                total_tokens_label=(
-                    None
-                    if event.total_tokens is None
-                    else format_token_count(event.total_tokens)
-                ),
-                input_tokens_label=(
-                    None
-                    if event.input_tokens is None
-                    else format_token_count(event.input_tokens)
-                ),
-                output_tokens_label=(
-                    None
-                    if event.output_tokens is None
-                    else format_token_count(event.output_tokens)
-                ),
-            )
-        )
         display = _display_model(
             event.inbound_model, event.routed_model, custom_model_id
         )
@@ -555,7 +583,7 @@ def activity_board(
         scale = max(scale, weight)
         prepared.append((provider, model, bucket, tokens_per_request))
 
-    request_rows.sort(key=lambda row: row.occurred_at, reverse=True)
+    request_rows.sort(key=lambda row: row.occurred_at)
 
     grouped: dict[str, list[ModelActivityRow]] = {
         name: [] for name in ("azure", "openai", "openrouter")
@@ -615,7 +643,7 @@ def activity_board(
     return ActivityBoard(
         window_minutes=window_minutes,
         generated_at=clock,
-        requests=tuple(request_rows[:_ACTIVITY_REQUEST_LIST_LIMIT]),
+        requests=tuple(request_rows),
         total_tokens_per_request=total_tokens_per_request,
         total_tokens_per_request_label=(
             None
@@ -631,4 +659,5 @@ def activity_board(
             else None
         ),
         providers=tuple(providers),
+        request_period_hours=request_period_hours,
     )

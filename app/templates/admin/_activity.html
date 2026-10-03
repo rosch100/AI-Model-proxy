@@ -2,17 +2,28 @@
   id="dashboard-activity"
   class="dashboard-section activity-section"
   aria-labelledby="activity-title"
-  hx-get="{{ url_for('admin.dashboard_activity') }}"
+  hx-get="{{ url_for('admin.dashboard_activity', activity_hours=activity.request_period_hours) }}"
   hx-trigger="every 15s"
   hx-swap="outerHTML"
+  data-activity-section
 >
   <div class="section-heading">
     <div>
       <h2 id="activity-title">Aktuelle Aktivität</h2>
-      <p class="section-caption">
-        Einzelne Proxy-Anfragen der letzten 24 Stunden – mit Tokenzahl, Zeitpunkt und abgefragtem Modell. Aktualisiert alle 15 Sekunden.
+      <p class="section-caption" id="activity-time-hint">
+        Live-Kennzahlen beziehen sich auf die letzten 15 Minuten; die Liste zeigt den gewählten Zeitraum. Zeiten werden in deiner lokalen Zeitzone angezeigt. Aktualisiert alle 15 Sekunden.
       </p>
     </div>
+    <form class="activity-period-form" method="get" action="{{ url_for('admin.dashboard') }}">
+      <label for="activity-period">Zeitraum der Liste
+        <select id="activity-period" name="activity_hours" data-activity-period>
+          {% for hours, label in activity_period_options %}
+            <option value="{{ hours }}"{% if hours == activity.request_period_hours %} selected{% endif %}>{{ label }}</option>
+          {% endfor %}
+        </select>
+      </label>
+      <button type="submit">Anwenden</button>
+    </form>
     {% if activity.last_request_label %}
       <p class="activity-updated">Zuletzt {{ activity.last_request_label }}</p>
     {% endif %}
@@ -33,13 +44,13 @@
     <div class="activity-request-list">
       <div class="activity-request-list-heading">
         <h3>Letzte Anfragen</h3>
-        <span>{{ activity.requests|length }} Einträge · neueste zuerst</span>
+        <span>Bis zu {{ activity.requests|length }} der neuesten Einträge · älteste oben, neueste unten</span>
       </div>
       <div class="activity-table-scroll">
         <table class="activity-table">
           <thead>
             <tr>
-              <th scope="col">Zeit (UTC)</th>
+              <th scope="col">Zeit (lokal)</th>
               <th scope="col">Abgefragtes Modell</th>
               <th scope="col">Tokens / Anfrage</th>
             </tr>
@@ -48,7 +59,7 @@
             {% for row in activity.requests %}
               <tr>
                 <td class="activity-time-cell">
-                  <time datetime="{{ row.occurred_at.isoformat() }}">{{ row.time_label }}</time>
+                  <time datetime="{{ row.occurred_at.isoformat() }}" data-local-time aria-describedby="activity-time-hint">{{ row.time_label }}</time>
                 </td>
                 <td class="activity-model-cell">
                   <strong>{{ row.requested_model }}</strong>
@@ -74,8 +85,8 @@
   {% else %}
     <div class="empty-state">
       <span class="empty-state-mark" aria-hidden="true">·</span>
-      <h3>Keine aktuelle Proxy-Aktivität</h3>
-      <p>In den letzten 24 Stunden hat dieser Mandant noch keine Chat-Anfragen über den Proxy gesendet.</p>
+      <h3>Keine Proxy-Aktivität im ausgewählten Zeitraum</h3>
+      <p>In diesem Zeitraum hat der Mandant noch keine Chat-Anfragen über den Proxy gesendet.</p>
     </div>
   {% endif %}
 </section>

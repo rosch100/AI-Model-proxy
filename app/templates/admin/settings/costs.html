@@ -4,21 +4,18 @@
 {% block content %}
 <section>
   <h1>Kosten</h1>
-  <p class="lede">Abrechnungsdaten kommen nicht vom Inference-API-Key. Es sind zwei unabhängige Schritte: zuerst ein operatorseitig gebundener Billing-Scope, danach ein eigener Billing-Schlüssel des Anbieters.</p>
-  <p>Azure verwendet die Hostidentität des Proxys; es werden keine Azure-Client-Secrets erfasst.</p>
-
-  <h2>Warum „Kein Billing-Scope gebunden“ erscheint</h2>
-  <p>Das Speichern eines Schlüssels auf dieser Seite bindet keinen Scope. Organisation/Projekt auf der Verbindungsseite gelten nur für Inference-Header, nicht für Kosten. OpenAI- und OpenRouter-Scopes legt ausschließlich der Proxy-Operator mit <code>flask tenants bind-billing-scope</code> fest (Tenant-ID und Profil-ID des Accounts). Ohne diesen Eintrag schlägt jede Aktualisierung fehl, unabhängig vom Key.</p>
+  <p class="lede">Billing-Schlüssel und Abrechnungs-Scope sind getrennte Einstellungen. Beide lassen sich hier pro Provider-Account speichern; der Proxy verwendet die Angaben nur für diesen Tenant.</p>
+  <p>Azure verwendet weiterhin die Hostidentität des Proxys; es werden keine Azure-Client-Secrets erfasst.</p>
 
   <h2>OpenAI: Admin API Key erzeugen</h2>
   <p>Ein Projekt- oder User-Key aus <a href="https://platform.openai.com/api-keys" rel="noreferrer">API keys</a> (Präfix typisch <code>sk-proj-</code> oder <code>sk-</code>) darf <code>/v1/organization/costs</code> und <code>/v1/organization/usage/completions</code> nicht aufrufen. Dafür braucht es einen <strong>Admin API Key</strong> der API-Platform-Organisation (Präfix <code>sk-admin-</code>). Nur Organization Owner können ihn anlegen. Er ist nicht für Chat Completions nutzbar.</p>
   <ol>
     <li>Als Owner anmelden: <a href="https://platform.openai.com/settings/organization/admin-keys" rel="noreferrer">platform.openai.com/settings/organization/admin-keys</a></li>
     <li>„Create new admin key“, Namen vergeben.</li>
-    <li>Rechte <em>Restricted</em>: mindestens <strong>Usage API → Read</strong> (<code>api.usage.read</code>). Nicht den Inference-Key wiederverwenden.</li>
+    <li>Rechte <em>Restricted</em>: mindestens <strong>Usage API → Read</strong> (<code>api.usage.read</code>). Zum automatischen Laden der Projektliste zusätzlich <strong>Organization Administration → Read</strong>. Nicht den Inference-Key wiederverwenden.</li>
     <li>Den Wert einmalig kopieren und unten als OpenAI-Billing-Schlüssel speichern.</li>
   </ol>
-  <p class="hint">IDs für die Operator-Bindung: Organization ID unter <a href="https://platform.openai.com/settings/organization/general" rel="noreferrer">Organization → General</a> (<code>org-…</code>); Project ID unter <a href="https://platform.openai.com/settings/organization/projects" rel="noreferrer">Organization → Projects</a> (<code>proj_…</code>). Der Refresh filtert Kosten und Tokens auf genau dieses Projekt.</p>
+  <p class="hint">Die Organization-ID findest du unter <a href="https://platform.openai.com/settings/organization/general" rel="noreferrer">Organization → General</a> (<code>org-…</code>), die Project-ID unter <a href="https://platform.openai.com/settings/organization/projects" rel="noreferrer">Organization → Projects</a> (<code>proj_…</code>). Beide werden unten direkt beim Profil gespeichert; der Refresh filtert Kosten und Tokens auf dieses Projekt.</p>
 
   <h2>OpenRouter: Management Key erzeugen</h2>
   <p>Ein normaler Inference-Key von <a href="https://openrouter.ai/settings/keys" rel="noreferrer">Settings → API Keys</a> (<code>sk-or-v1-…</code>) liefert 403 auf der Activity-API („Only management keys can perform this operation“). Kosten kommen von <code>GET /api/v1/activity</code>, und die verlangt einen <strong>Management API Key</strong>. In Organisationen dürfen nur Organization Admins einen anlegen. Er kann keine Completions ausführen.</p>
@@ -27,7 +24,7 @@
     <li>„Create New Key“, Name und Ablaufdatum wählen.</li>
     <li>Den Wert einmalig kopieren und unten als OpenRouter-Billing-Schlüssel speichern.</li>
   </ol>
-  <p class="hint">Die Workspace-ID ist die UUID des Workspaces unter <a href="https://openrouter.ai/settings" rel="noreferrer">OpenRouter Settings</a> (Workspaces). Der Operator bindet genau diese UUID. Die Activity-API liefert OpenRouter- und BYOK-Kosten sowie Tokenverbrauch der letzten 30 abgeschlossenen UTC-Tage, gefiltert auf diesen Workspace.</p>
+  <p class="hint">Die Workspace-ID ist die UUID des Workspaces unter <a href="https://openrouter.ai/settings" rel="noreferrer">OpenRouter Settings</a> (Workspaces). Sie lässt sich unten direkt beim Account eintragen. Die Activity-API liefert OpenRouter- und BYOK-Kosten sowie Tokenverbrauch der letzten 30 abgeschlossenen UTC-Tage, gefiltert auf diesen Workspace.</p>
 
   <h2>Azure-Hostidentität</h2>
   <p>Es wird keine Tenant-Credential eingegeben. Der Proxy verwendet seine operatorseitig konfigurierte Managed Identity (einschließlich User-assigned Managed Identity) auf Azure oder Workload Identity bzw. Zertifikatsidentität außerhalb Azure. Die gebundene Resource Group benötigt Cost Management Reader; die gebundene Cognitive-Services-Ressource benötigt Monitoring Reader für separat abgefragte Usage-Metriken.</p>
@@ -39,7 +36,7 @@
     <div><dt>Schätzungen</dt><dd>Nur mit belegter Preisquelle, Version, Modell und passender Usage-Grundlage</dd><dd>{% if view.records|selectattr("kind", "equalto", "estimate")|list %}{{ view.records|selectattr("kind", "equalto", "estimate")|list|length }} Datensätze insgesamt{% else %}Noch keine Datensätze{% endif %}</dd></div>
   </dl>
   <ul>
-    <li><strong>OpenAI:</strong> Admin API Key (nicht der Projekt-Inference-Key). Kosten und Input-/Output-Tokens werden auf das operatorseitig gebundene Projekt gefiltert.</li>
+    <li><strong>OpenAI:</strong> Admin API Key (nicht der Projekt-Inference-Key). Kosten und Input-/Output-Tokens werden auf das hier konfigurierte Projekt gefiltert.</li>
     <li><strong>OpenRouter:</strong> Management Key (nicht der Completions-API-Key). Activity-API der letzten 30 abgeschlossenen UTC-Tage, gefiltert auf die gebundene Workspace-UUID.</li>
     <li><strong>Azure-Hostidentität:</strong> keine Tenant-Credential. Cost Management Reader auf der Resource Group, Monitoring Reader auf der Cognitive-Services-Ressource.</li>
   </ul>
@@ -83,11 +80,11 @@
   {% if view.bindings %}
     <ul>
       {% for profile, binding, node in view.bindings %}
-        <li>{{ profile.display_name }} ({{ profile.provider }}) / {{ binding.purpose }}: <code>{{ node.canonical_scope_id }}</code></li>
+        <li>{{ profile.display_name }} ({{ profile.provider }}) / {{ binding.purpose }}: <code>{{ node.canonical_scope_id }}</code>{% if profile.provider == "openai" and profile.id in openai_organization_ids %} · Organization <code>{{ openai_organization_ids[profile.id] }}</code>{% endif %}</li>
       {% endfor %}
     </ul>
   {% else %}
-    <p>Kein Billing- oder Usage-Scope gebunden. Azure-Scopes können oben im Formular erfasst werden. OpenAI (Organization-ID <code>org-…</code> plus Project-ID <code>proj_…</code>) und OpenRouter (Workspace-UUID) bindet der Operator mit <code>flask tenants bind-billing-scope</code> — das ist unabhängig vom Billing-Schlüssel.</p>
+    <p>Noch keine Billing- oder Usage-Scopes für diesen Tenant konfiguriert.</p>
   {% endif %}
 
   <h2>Accounts</h2>
@@ -95,32 +92,64 @@
     <article>
       <h3>{{ profile.display_name }} ({{ profile.provider }})</h3>
       {% if profile.provider in ["openai", "openrouter"] %}
-        <p>Billing-Schlüssel:
-          {% if view.billing_key_masks[profile.id] %}
-            <code class="secret-mask">{{ view.billing_key_masks[profile.id] }}</code>
-          {% else %}
-            nicht gespeichert
-          {% endif %}
-        </p>
+        {% set account_billing_form = billing_forms[profile.id] %}
         <form method="post" action="{{ url_for('admin.save_billing') }}" class="stack">
-          {{ billing_form.csrf_token }}
+          {{ account_billing_form.csrf_token }}
           <input type="hidden" name="profile_id" value="{{ profile.id }}" />
           {% if profile.provider == "openai" %}
-            <label for="openai-billing-secret-{{ profile.id }}">OpenAI Admin API Key *
-              {{ billing_form.billing_secret(id="openai-billing-secret-" ~ profile.id, autocomplete="off", aria_describedby="openai-billing-hint-" ~ profile.id) }}
+            <label for="openai-billing-secret-{{ profile.id }}">OpenAI Admin API Key
+              {{ account_billing_form.billing_secret(id="openai-billing-secret-" ~ profile.id, autocomplete="new-password", aria_describedby="openai-billing-hint-" ~ profile.id) }}
             </label>
-            <p id="openai-billing-hint-{{ profile.id }}" class="hint">Nur ein Admin API Key von <a href="https://platform.openai.com/settings/organization/admin-keys" rel="noreferrer">Organization → Admin keys</a> (Usage API Read). Projekt-Keys von der API-keys-Seite funktionieren hier nicht. Der Scope muss zusätzlich operatorseitig gebunden sein.</p>
+            <p id="openai-billing-hint-{{ profile.id }}" class="hint">{% if view.billing_key_masks[profile.id] %}Gespeichert (maskiert). Leer lassen, um den Key beizubehalten; einen neuen Key hier eingeben, um ihn zu ersetzen.{% else %}Noch nicht gespeichert.{% endif %} Erforderlich ist ein Admin API Key von <a href="https://platform.openai.com/settings/organization/admin-keys" rel="noreferrer">Organization → Admin keys</a> mit Usage API Read. Für das automatische Laden der Projektliste zusätzlich Organization Administration Read.</p>
           {% else %}
-            <label for="openrouter-billing-secret-{{ profile.id }}">OpenRouter Management Key *
-              {{ billing_form.billing_secret(id="openrouter-billing-secret-" ~ profile.id, autocomplete="off", aria_describedby="openrouter-billing-hint-" ~ profile.id) }}
+            <label for="openrouter-billing-secret-{{ profile.id }}">OpenRouter Management Key
+              {{ account_billing_form.billing_secret(id="openrouter-billing-secret-" ~ profile.id, autocomplete="new-password", aria_describedby="openrouter-billing-hint-" ~ profile.id) }}
             </label>
-            <p id="openrouter-billing-hint-{{ profile.id }}" class="hint">Nur ein Management Key von <a href="https://openrouter.ai/settings/management-keys" rel="noreferrer">Settings → Management API Keys</a>. Completions-Keys von der normalen API-Keys-Seite werden von der Activity-API abgelehnt. Die Workspace-UUID muss operatorseitig gebunden sein.</p>
+            <p id="openrouter-billing-hint-{{ profile.id }}" class="hint">{% if view.billing_key_masks[profile.id] %}Gespeichert (maskiert). Leer lassen, um den Key beizubehalten; einen neuen Key hier eingeben, um ihn zu ersetzen.{% else %}Noch nicht gespeichert.{% endif %} Erforderlich ist ein Management Key von <a href="https://openrouter.ai/settings/management-keys" rel="noreferrer">Settings → Management API Keys</a>.</p>
           {% endif %}
-          <button type="submit">{{ profile.provider }} Billing-Zugang speichern</button>
+          <button type="submit">Billing-Key speichern</button>
         </form>
-        {% if view.billing_key_masks[profile.id] %}
+        {% if profile.provider == "openai" and profile.id in openai_scope_forms %}
+          {% set scope_form = openai_scope_forms[profile.id] %}
+          <h4>OpenAI Billing-Scope</h4>
+          <form method="post" action="{{ url_for('admin.load_openai_projects') }}" class="stack">
+            {{ scope_form.csrf_token }}
+            <input type="hidden" name="profile_id" value="{{ profile.id }}" />
+            <label for="openai-organization-lookup-{{ profile.id }}">OpenAI Organization-ID *
+              <input id="openai-organization-lookup-{{ profile.id }}" name="organization_id" type="text" required maxlength="128" pattern="org-[A-Za-z0-9_-]+" value="{{ scope_form.organization_id.data or '' }}" autocomplete="off" />
+            </label>
+            <button type="submit" {% if not view.billing_key_masks[profile.id] %}disabled{% endif %}>Projekte automatisch laden</button>
+            <p class="hint">Organization-ID findest du in Organization → General. Die Liste wird mit dem gespeicherten Admin-Key direkt bei OpenAI abgerufen.</p>
+          </form>
+          <form method="post" action="{{ url_for('admin.save_openai_cost_scope') }}" class="stack">
+            {{ scope_form.csrf_token }}
+            <input type="hidden" name="profile_id" value="{{ profile.id }}" />
+            <label>{{ scope_form.organization_id.label }}{{ scope_form.organization_id(autocomplete="off", pattern="org-[A-Za-z0-9_-]+") }}</label>
+            <label>{{ scope_form.project_id.label }}
+              {{ scope_form.project_id(list="openai-project-options-" ~ profile.id, autocomplete="off", pattern="proj_[A-Za-z0-9_-]+") }}
+            </label>
+            <datalist id="openai-project-options-{{ profile.id }}">
+              {% for project_id, project_name in openai_projects.get(profile.id, []) %}
+                <option value="{{ project_id }}">{{ project_name }}</option>
+              {% endfor %}
+            </datalist>
+            <label class="reveal-toggle">{{ scope_form.exclusive_scope_confirmation() }}{{ scope_form.exclusive_scope_confirmation.label.text }}</label>
+            <button type="submit">OpenAI-Scope speichern</button>
+          </form>
+        {% elif profile.provider == "openrouter" and profile.id in openrouter_scope_forms %}
+          {% set scope_form = openrouter_scope_forms[profile.id] %}
+          <h4>OpenRouter Billing-Scope</h4>
+          <form method="post" action="{{ url_for('admin.save_openrouter_cost_scope') }}" class="stack">
+            {{ scope_form.csrf_token }}
+            <input type="hidden" name="profile_id" value="{{ profile.id }}" />
+            <label>{{ scope_form.workspace_id.label }}{{ scope_form.workspace_id(autocomplete="off", placeholder="Workspace UUID") }}</label>
+            <label class="reveal-toggle">{{ scope_form.exclusive_scope_confirmation() }}{{ scope_form.exclusive_scope_confirmation.label.text }}</label>
+            <button type="submit">OpenRouter-Scope speichern</button>
+          </form>
+        {% endif %}
+        {% if view.billing_key_masks[profile.id] and profile.id in scope_bound_profile_ids %}
           <form method="post" action="{{ url_for('admin.refresh_costs') }}">
-            {{ billing_form.csrf_token }}
+            {{ account_billing_form.csrf_token }}
             <input type="hidden" name="profile_id" value="{{ profile.id }}" />
             <button type="submit">{{ profile.provider }} aktualisieren</button>
           </form>
@@ -129,7 +158,7 @@
         <p class="hint">Azure-Kosten verwenden die operatorseitige Hostidentität; ein Azure-Inference-Key oder Tenant-Service-Principal wird nicht für Billing verwendet.</p>
         {% if profile.id in view.azure_costs_ready_profile_ids %}
           <form method="post" action="{{ url_for('admin.refresh_costs') }}">
-            {{ billing_form.csrf_token }}
+            <input type="hidden" name="csrf_token" value="{{ csrf_token() }}" />
             <input type="hidden" name="profile_id" value="{{ profile.id }}" />
             <button type="submit">Azure-Kosten aktualisieren</button>
           </form>

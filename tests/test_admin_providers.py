@@ -508,7 +508,7 @@ def test_activate_profile_writes_audit_and_active_id():
             activate_provider_profile(session, tenant, profile.id, "ada")
         replace_catalog_entries(session, profile, [("gpt-5.4", None)], None)
         activate_provider_profile(session, tenant, profile.id, "ada")
-        assert tenant.active_profile_id == profile.id
+        assert profile.route_priority == 1
     database.engine.dispose()
 
 
@@ -517,7 +517,6 @@ def test_create_provider_profile_is_inactive_and_tenant_scoped():
     database = build_admin_database()
     seed_admin(database)
     with database.sessions.begin() as session:
-        tenant = session.get(Tenant, "acme")
         original = create_provider_profile(
             session,
             database.secret_cipher,
@@ -529,7 +528,7 @@ def test_create_provider_profile_is_inactive_and_tenant_scoped():
             "sk-first",
             "ada",
         )
-        tenant.active_profile_id = original.id
+        original.route_priority = 1
         second = create_provider_profile(
             session,
             database.secret_cipher,
@@ -544,7 +543,8 @@ def test_create_provider_profile_is_inactive_and_tenant_scoped():
         assert original.id != second.id
         assert original.display_name == "Personal"
         assert second.display_name == "Work"
-        assert tenant.active_profile_id == original.id
+        assert original.route_priority == 1
+        assert second.route_priority is None
         assert (
             session.scalar(
                 select(ProviderProfile).where(
@@ -652,8 +652,7 @@ def test_azure_profile_updates_validate_url_and_keep_model_deployments():
             "azure-key",
             "ada",
         )
-        tenant = session.get(Tenant, "acme")
-        tenant.active_profile_id = profile.id
+        profile.route_priority = 1
         replace_catalog_entries(
             session, profile, [("gpt-6-astra", "deployment-a")], None
         )
@@ -683,7 +682,7 @@ def test_azure_profile_updates_validate_url_and_keep_model_deployments():
         assert updated.settings == {"base_url": "https://new-resource.openai.azure.com"}
         assert updated.default_model is None
         assert updated.catalog_refreshed_at is None
-        assert tenant.active_profile_id is None
+        assert profile.route_priority is None
         assert not list(
             session.scalars(
                 select(ProviderCatalogEntry).where(

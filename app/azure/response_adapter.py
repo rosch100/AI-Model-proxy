@@ -6,12 +6,14 @@ OpenAI Chat Completions-compatible streaming responses.
 
 from __future__ import annotations
 
+import json
 import random
 import time
 from dataclasses import dataclass
 from string import ascii_letters, digits
 from typing import Any, Dict, Iterable, Optional
 
+import requests
 from flask import Response, current_app, stream_with_context
 from rich.live import Live
 from rich.markup import escape as rich_escape
@@ -19,6 +21,7 @@ from rich.markup import escape as rich_escape
 from ..common.logging import console, create_message_panel
 from ..common.sse import chunks_to_sse, sse_to_events
 from ..exceptions import ClientClosedConnection
+from ..providers.failover_upstream import PreparedUpstream, sanitize_error_event
 from ..reasoning_display import (
     parse_reasoning_display_mode,
     reasoning_content_delta,
@@ -175,8 +178,6 @@ class ResponseAdapter:
         Handles native tool types (apply_patch_call, shell_call, mcp_call, etc.)
         by wrapping them as function calls so Cursor can process them.
         """
-        import json as _json
-
         item_type = item.get("type", "")
         call_id = item.get("call_id") or item.get("id") or ""
 
@@ -192,8 +193,6 @@ class ResponseAdapter:
         name = native_type_to_name.get(item_type)
         if not name:
             return None
-
-        from ..common.logging import console
 
         console.print(
             f"[bold magenta]NATIVE TOOL:[/bold magenta] Converting {item_type} → {name} "
@@ -223,7 +222,7 @@ class ResponseAdapter:
         else:
             args = {}
 
-        arguments_json = _json.dumps(args, ensure_ascii=False)
+        arguments_json = json.dumps(args, ensure_ascii=False)
 
         self._tool_calls += 1
         return self._build_completion_chunk(
@@ -320,8 +319,6 @@ class ResponseAdapter:
 
         # Log unexpected item types for debugging
         if item_type:
-            from ..common.logging import console
-
             console.print(f"[bold yellow]UNKNOWN ITEM TYPE:[/bold yellow] {item_type}")
 
         return None
@@ -370,9 +367,7 @@ class ResponseAdapter:
         error = self._sse_error_details(obj)
         code = error.get("code", "")
         message = error.get("message", "")
-        from ..common.logging import console as _err_console
-
-        _err_console.print(
+        console.print(
             f"[bold red]STREAM ERROR:[/bold red] {rich_escape(f'code={code} message={message}')}"
         )
         return None
@@ -466,9 +461,7 @@ class ResponseAdapter:
         self, obj: Optional[Dict[str, Any]]
     ) -> Optional[Dict[str, Any]]:
         """Handle response.mcp_call.failed — log MCP call failure."""
-        from ..common.logging import console as _mcp_console
-
-        _mcp_console.print(
+        console.print(
             f"[bold red]MCP CALL FAILED:[/bold red] {rich_escape(str(obj)[:300])}"
         )
         return None
@@ -478,9 +471,7 @@ class ResponseAdapter:
         self, obj: Optional[Dict[str, Any]]
     ) -> Optional[Dict[str, Any]]:
         """Handle response.mcp_list_tools.failed — log MCP list failure."""
-        from ..common.logging import console as _mcp_lt_console
-
-        _mcp_lt_console.print(
+        console.print(
             f"[bold red]MCP LIST TOOLS FAILED:[/bold red] {rich_escape(str(obj)[:300])}"
         )
         return None
@@ -562,9 +553,7 @@ class ResponseAdapter:
                 else 0
             )
             cache_pct = (cached_tokens / input_tokens * 100) if input_tokens > 0 else 0
-            from ..common.logging import console as _usage_console
-
-            _usage_console.print(
+            console.print(
                 f"[bold green]USAGE:[/bold green] "
                 f"input={input_tokens} (cached={cached_tokens}, {cache_pct:.0f}%) "
                 f"output={output_tokens} (reasoning={reasoning_tokens}) "
@@ -578,8 +567,6 @@ class ResponseAdapter:
         This occurs when the model hits max_output_tokens. We log and pass
         the reason through so the downstream client knows the response was cut short.
         """
-        from ..common.logging import console as _inc_console
-
         reason = (
             obj.get("response", {})
             .get("incomplete_details", {})
@@ -587,7 +574,7 @@ class ResponseAdapter:
             if isinstance(obj, dict)
             else "unknown"
         )
-        _inc_console.print(f"[bold red]RESPONSE INCOMPLETE:[/bold red] reason={reason}")
+        console.print(f"[bold red]RESPONSE INCOMPLETE:[/bold red] reason={reason}")
         return self._build_completion_chunk(
             delta={
                 "role": "assistant",
@@ -725,6 +712,8 @@ class ResponseAdapter:
             for event in sse_to_events(
                 state.upstream_resp.iter_content(chunk_size=128)
             ):
+                if isinstance(state.upstream_resp, PreparedUpstream):
+                    event = sanitize_error_event(event)
                 if event.event in {
                     "response.completed",
                     "response.failed",
@@ -1000,6 +989,23 @@ class ResponseAdapter:
                 yield from chunks_to_sse(
                     self._adapt_stream(upstream_resp, request_context)
                 )
+            except requests.RequestException:
+                if not isinstance(upstream_resp, PreparedUpstream):
+                    raise
+                error = self._failed(
+                    {
+                        "response": {
+                            "error": {
+                                "code": "stream_interrupted",
+                                "message": (
+                                    "Provider stream interrupted; not replayed "
+                                    "to avoid duplicate output or tool calls."
+                                ),
+                            }
+                        }
+                    }
+                )
+                yield from chunks_to_sse([error])
             except GeneratorExit:
                 # Downstream client closed the connection mid-stream
                 # Translate to a clearer exception for the caller.

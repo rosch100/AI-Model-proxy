@@ -5,7 +5,33 @@
 <section>
   {% set labels = {"azure": "Azure", "openai": "OpenAI", "openrouter": "OpenRouter"} %}
   <h1>Provider-Accounts</h1>
-  <p class="lede">Pro Anbieter können mehrere Accounts gespeichert werden. Neue Accounts bleiben inaktiv, bis sie ausdrücklich aktiviert werden.</p>
+  <p class="lede">Mehrere Accounts können gemeinsam eine priorisierte Failover-Reihenfolge bilden. Neue Accounts bleiben inaktiv, bis sie ausdrücklich hinzugefügt werden.</p>
+  <h2>Failover-Reihenfolge</h2>
+  <p>Cursor-Modell-ID: <code>{{ cursor_model_id }}</code> → Standardmodell des jeweiligen Profils.</p>
+  <p>Das erste Profil wird bevorzugt. Bei HTTP 408/429/5xx oder sicherem Verbindungsfehler vor der Antwort wird das nächste versucht. Andere 4xx und Fehler nach Stream-Beginn werden nicht erneut abgesendet.</p>
+  <p class="hint">Das Standardmodell jedes Profils ist dessen Zielmodell für die stabile Cursor-Modell-ID. Unterschiedliche Modelle sind nicht automatisch gleichwertig. Ein Wechsel kann zusätzliche Kosten verursachen; es gibt keine Exactly-once-Garantie.</p>
+  {% if view.routed_profiles %}
+    <ol class="provider-route">
+    {% for profile in view.routed_profiles %}
+      <li data-route-profile="{{ profile.id }}">
+        <strong>{{ labels[profile.provider] }} · {{ profile.display_name }}</strong>
+        · {{ profile.default_model }}
+        {% if loop.first %}<span>Primärprofil</span>{% else %}<span>Fallback {{ loop.index - 1 }}</span>{% endif %}
+        <form method="post" action="{{ url_for('admin.move_connection', profile_id=profile.id) }}">
+          <input type="hidden" name="csrf_token" value="{{ csrf_token() }}" />
+          <input type="hidden" name="profile_id" value="{{ profile.id }}" />
+          <button type="submit" name="direction" value="up" aria-label="{{ profile.display_name }} nach oben" {% if loop.first %}disabled{% endif %}>Nach oben</button>
+          <button type="submit" name="direction" value="down" aria-label="{{ profile.display_name }} nach unten" {% if loop.last %}disabled{% endif %}>Nach unten</button>
+        </form>
+        <form method="post" action="{{ url_for('admin.deactivate_connection_profile', profile_id=profile.id) }}">
+          <input type="hidden" name="csrf_token" value="{{ csrf_token() }}" />
+          <input type="hidden" name="profile_id" value="{{ profile.id }}" />
+          <button type="submit">Aus Reihenfolge entfernen</button>
+        </form>
+      </li>
+    {% endfor %}
+    </ol>
+  {% endif %}
   {% if view.active_profile_id %}
     <p>Aktiver Account: <strong>{{ labels.get(view.active_provider, "Unbekannter Anbieter") }} · {{ view.active_profile_name or "Unbekannter Account" }}</strong></p>
   {% else %}
@@ -21,7 +47,7 @@
         <li>
           <h3>{{ profile.display_name }}</h3>
           <p>
-            {% if profile.id == view.active_profile_id %}<strong>Aktiv</strong>{% else %}Inaktiv{% endif %}
+            {% if profile.route_priority is not none %}<strong>Aktiv · Priorität {{ profile.route_priority }}</strong>{% else %}Inaktiv{% endif %}
             · Modell: {{ profile.default_model or "nicht gesetzt" }}
             · {% if profile.catalog_error %}Katalogfehler{% elif profile.catalog_refreshed_at %}Katalog aktualisiert{% else %}Katalog noch nicht geladen{% endif %}
             · {% if profile.inference_secret_ciphertext %}Schlüssel gespeichert{% else %}Schlüssel fehlt{% endif %}
@@ -43,7 +69,7 @@
             <input type="hidden" name="csrf_token" value="{{ csrf_token() }}" />
             <button type="submit">Katalog aktualisieren</button>
           </form>
-          {% if profile.id != view.active_profile_id %}
+          {% if profile.route_priority is none %}
             <form method="post" action="{{ url_for('admin.activate_connection', profile_id=profile.id) }}">
               <input type="hidden" name="csrf_token" value="{{ csrf_token() }}" />
               <input type="hidden" name="profile_id" value="{{ profile.id }}" />
@@ -72,7 +98,7 @@
   {% if view.active_profile_id %}
     <form method="post" action="{{ url_for('admin.deactivate_connection') }}">
       <input type="hidden" name="csrf_token" value="{{ csrf_token() }}" />
-      <button type="submit">Aktiven Account deaktivieren</button>
+      <button type="submit">Gesamte Failover-Reihenfolge deaktivieren</button>
     </form>
   {% endif %}
 </section>

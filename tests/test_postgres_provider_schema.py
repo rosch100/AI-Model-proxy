@@ -45,9 +45,9 @@ def test_multiple_provider_profiles_and_casefolded_active_names_are_enforced(
         connection.execute(
             text(
                 "INSERT INTO provider_profiles "
-                "(id, tenant_id, provider, settings, display_name, history_generation) "
-                "VALUES ('profile-a', 'tenant-a', 'azure', '{}', 'Production', 0), "
-                "('profile-b', 'tenant-a', 'azure', '{}', 'Staging', 0)"
+                "(id, tenant_id, provider, settings, display_name, display_name_key, history_generation) "
+                "VALUES ('profile-a', 'tenant-a', 'azure', '{}', 'Production', 'production', 0), "
+                "('profile-b', 'tenant-a', 'azure', '{}', 'Staging', 'staging', 0)"
             )
         )
 
@@ -57,8 +57,8 @@ def test_multiple_provider_profiles_and_casefolded_active_names_are_enforced(
             connection.execute(
                 text(
                     "INSERT INTO provider_profiles "
-                    "(id, tenant_id, provider, settings, display_name, history_generation) "
-                    "VALUES ('profile-c', 'tenant-a', 'azure', :settings, 'pRODUCTION', 0)"
+                    "(id, tenant_id, provider, settings, display_name, display_name_key, history_generation) "
+                    "VALUES ('profile-c', 'tenant-a', 'azure', :settings, 'pRODUCTION', 'production', 0)"
                 ),
                 {"settings": json.dumps({})},
             )
@@ -181,9 +181,11 @@ def test_environment_import_is_idempotent_for_active_profile_with_azure_peers(
             billing_secret_ciphertext=cipher.encrypt("peer-billing-secret"),
             catalog_error="peer catalog state",
         )
-        session.add_all((tenant, active_profile, peer_profile))
+        session.add(tenant)
         session.flush()
-        tenant.active_profile_id = active_profile.id
+        session.add_all((active_profile, peer_profile))
+        session.flush()
+        active_profile.route_priority = 1
         session.flush()
         peer_before = session.execute(
             text(
@@ -208,13 +210,14 @@ def test_environment_import_is_idempotent_for_active_profile_with_azure_peers(
             )
         ).one()
         assert peer_after == peer_before
-        assert tenant.active_profile_id == active_profile.id
+        assert active_profile.route_priority == 1
+        assert peer_profile.route_priority is None
         assert active_profile.display_name == "Production"
         assert cipher.decrypt(peer_profile.inference_secret_ciphertext) == "peer-secret"
 
 
 @pytest.mark.parametrize(
-    ("azure_profile_ids", "active_profile_id"),
+    ("azure_profile_ids", "primary_profile_id"),
     [
         (("azure-one", "azure-two"), None),
         ((), "openai-active"),
@@ -222,7 +225,7 @@ def test_environment_import_is_idempotent_for_active_profile_with_azure_peers(
     ids=("ambiguous-azure-candidates", "no-active-azure-profile"),
 )
 def test_environment_import_fails_closed_without_unique_active_azure_profile(
-    postgres_test_databases, azure_profile_ids, active_profile_id
+    postgres_test_databases, azure_profile_ids, primary_profile_id
 ):
     """Missing and ambiguous Azure selection never creates or mutates a profile."""
     databases = postgres_test_databases
@@ -258,10 +261,10 @@ def test_environment_import_fails_closed_without_unique_active_azure_profile(
             )
             for profile_id in azure_profile_ids
         ]
-        if active_profile_id == "openai-active":
+        if primary_profile_id == "openai-active":
             profiles.append(
                 ProviderProfile(
-                    id=active_profile_id,
+                    id=primary_profile_id,
                     tenant_id=source.id,
                     provider="openai",
                     display_name="OpenAI",
@@ -272,7 +275,8 @@ def test_environment_import_fails_closed_without_unique_active_azure_profile(
             )
         session.add_all(profiles)
         session.flush()
-        tenant.active_profile_id = active_profile_id
+        for profile in profiles:
+            profile.route_priority = 1 if profile.id == primary_profile_id else None
         session.flush()
         profile_columns = tuple(ProviderProfile.__table__.columns)
         profile_rows_before = session.execute(
@@ -290,10 +294,13 @@ def test_environment_import_fails_closed_without_unique_active_azure_profile(
             .order_by(ProviderProfile.id)
         ).all()
         assert profile_rows_after == profile_rows_before
-        assert tenant.active_profile_id == active_profile_id
+        assert [
+            profile.id for profile in profiles if profile.route_priority is not None
+        ] == ([primary_profile_id] if primary_profile_id is not None else [])
 
 
 def _seed_legacy_profile_and_cost_data(connection) -> None:
+    """Seed a valid Azure billing root and its resource-scoped usage child."""
     connection.execute(
         text(
             "INSERT INTO tenants (id, api_key_hash, custom_model_id) "
@@ -306,13 +313,16 @@ def _seed_legacy_profile_and_cost_data(connection) -> None:
             "(id, tenant_id, provider, settings, inference_secret_ciphertext, "
             "billing_secret_ciphertext, default_model, catalog_refreshed_at, "
             "catalog_error, created_at) "
-            "VALUES ('profile-a', 'tenant-a', 'openai', CAST(:settings AS json), "
-            "'ciphertext-inference', 'ciphertext-billing', 'gpt-5.4', "
+            "VALUES ('profile-a', 'tenant-a', 'azure', CAST(:settings AS json), "
+            "'ciphertext-inference', NULL, 'gpt-5.4', "
             "'2026-09-29T12:00:00Z', 'catalog warning', '2026-09-01T12:00:00Z')"
         ),
         {
             "settings": json.dumps(
-                {"organization": "org-safe", "project": "project-safe"}
+                {
+                    "base_url": "https://resource.openai.azure.com",
+                    "model_deployments": {"gpt-5.4": "deployment-a"},
+                }
             )
         },
     )
@@ -323,16 +333,18 @@ def _seed_legacy_profile_and_cost_data(connection) -> None:
         text(
             "INSERT INTO provider_catalog_entries "
             "(id, profile_id, model_id, deployment_id, source) "
-            "VALUES (71, 'profile-a', 'gpt-5.4', NULL, 'provider')"
+            "VALUES (71, 'profile-a', 'gpt-5.4', 'deployment-a', 'provider')"
         )
     )
     connection.execute(
         text(
             "INSERT INTO provider_scope_nodes "
             "(id, tenant_id, provider, scope_type, canonical_scope_id, parent_node_id) "
-            "VALUES ('org-node', 'tenant-a', 'openai', 'organization', 'org-safe', NULL), "
-            "('project-node', 'tenant-a', 'openai', 'project', 'project-safe', 'org-node'), "
-            "('usage-node', 'tenant-a', 'openai', 'project', 'usage-safe', 'org-node')"
+            "VALUES ('billing-node', 'tenant-a', 'azure', 'resource_group', "
+            "'/subscriptions/sub-safe/resourceGroups/rg-safe', NULL), "
+            "('usage-node', 'tenant-a', 'azure', 'cognitive_resource', "
+            "'/subscriptions/sub-safe/resourceGroups/rg-safe/providers/Microsoft.CognitiveServices/accounts/resource', "
+            "'billing-node')"
         )
     )
     connection.execute(
@@ -340,8 +352,8 @@ def _seed_legacy_profile_and_cost_data(connection) -> None:
             "INSERT INTO provider_scope_bindings "
             "(id, tenant_id, provider, profile_id, purpose, node_id, "
             "parent_binding_id, created_at) "
-            "VALUES ('binding-a', 'tenant-a', 'openai', 'profile-a', 'billing', "
-            "'project-node', NULL, '2026-09-02T12:00:00Z')"
+            "VALUES ('binding-a', 'tenant-a', 'azure', 'profile-a', 'billing', "
+            "'billing-node', NULL, '2026-09-02T12:00:00Z')"
         )
     )
     connection.execute(
@@ -349,7 +361,7 @@ def _seed_legacy_profile_and_cost_data(connection) -> None:
             "INSERT INTO provider_scope_bindings "
             "(id, tenant_id, provider, profile_id, purpose, node_id, "
             "parent_binding_id, created_at) "
-            "VALUES ('binding-b', 'tenant-a', 'openai', 'profile-a', 'usage', "
+            "VALUES ('binding-b', 'tenant-a', 'azure', 'profile-a', 'usage', "
             "'usage-node', 'binding-a', '2026-09-03T12:00:00Z')"
         )
     )
@@ -358,8 +370,8 @@ def _seed_legacy_profile_and_cost_data(connection) -> None:
             "INSERT INTO cost_refresh_jobs "
             "(id, tenant_id, provider, binding_id, period_start, period_end, source_api, "
             "operation_key, status, retry_at, limitation, created_at, completed_at) "
-            "VALUES ('job-a', 'tenant-a', 'openai', 'binding-a', "
-            "'2026-09-01T00:00:00Z', '2026-10-01T00:00:00Z', 'openai.costs', "
+            "VALUES ('job-a', 'tenant-a', 'azure', 'binding-a', "
+            "'2026-09-01T00:00:00Z', '2026-10-01T00:00:00Z', 'azure.costs', "
             "'operation-a', 'success', NULL, 'complete window', "
             "'2026-10-01T12:00:00Z', '2026-10-01T12:05:00Z')"
         )
@@ -378,10 +390,10 @@ def _seed_legacy_profile_and_cost_data(connection) -> None:
             "currency, bucket_start, bucket_end, source, granularity, dimensions, "
             "price_source, price_version, usage_source, usage_bucket_start, "
             "formula_parameters, model_key, region_key, deployment_key) "
-            "VALUES (93, 'job-a', 'tenant-a', 'openai', 'binding-a', 'estimate', 'cost', "
+            "VALUES (93, 'job-a', 'tenant-a', 'azure', 'binding-a', 'estimate', 'cost', "
             "1.25, 'currency', 'USD', '2026-09-01T00:00:00Z', '2026-10-01T00:00:00Z', "
-            "'openai.organization.costs', 'window', '{\"project\": \"project-safe\"}', "
-            "'price-list', 'v42', 'openai.usage', '2026-09-30T00:00:00Z', "
+            "'azure.costs', 'window', '{\"resource_group\": \"rg-safe\"}', "
+            "'price-list', 'v42', 'azure.usage', '2026-09-30T00:00:00Z', "
             "'{\"multiplier\": 1}', 'gpt-5.4', 'eastus', 'deployment-a')"
         )
     )
@@ -389,9 +401,18 @@ def _seed_legacy_profile_and_cost_data(connection) -> None:
 
 def _legacy_snapshot(connection) -> dict[str, tuple]:
     """Read every persisted column that existed before the profile migration."""
+    tenant_columns = {
+        column["name"] for column in inspect(connection).get_columns("tenants")
+    }
+    primary_profile = (
+        "active_profile_id"
+        if "active_profile_id" in tenant_columns
+        else "(SELECT p.id FROM provider_profiles p WHERE p.tenant_id = tenants.id "
+        "AND p.route_priority IS NOT NULL ORDER BY p.route_priority LIMIT 1)"
+    )
     queries = {
-        "tenant": "SELECT id, api_key_hash, custom_model_id, active_profile_id, created_at "
-        "FROM tenants ORDER BY id",
+        "tenant": f"SELECT id, api_key_hash, custom_model_id, {primary_profile}, created_at "
+        "FROM tenants ORDER BY tenants.id",
         "profile": "SELECT id, tenant_id, provider, settings, "
         "inference_secret_ciphertext, billing_secret_ciphertext, default_model, "
         "catalog_refreshed_at, catalog_error, created_at FROM provider_profiles ORDER BY id",
@@ -437,7 +458,7 @@ def test_migration_preserves_profile_catalog_bindings_jobs_and_costs_round_trip(
             )
         ).one()
     assert after_upgrade == before
-    assert tuple(profile) == ("OpenAI", None, 0)
+    assert tuple(profile) == ("Azure", None, 0)
 
     databases.downgrade("20261002_passkeys")
     with databases.admin_engine.connect() as connection:

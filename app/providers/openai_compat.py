@@ -9,6 +9,12 @@ import requests
 from flask import Request, Response, stream_with_context
 
 from app.exceptions import ServiceConfigurationError
+from app.providers.failover_upstream import (
+    ROUTED_READ_TIMEOUT_SECONDS,
+    chat_stream,
+    prepare_upstream,
+    transport_failure,
+)
 from app.tenants import DatabaseTenantSnapshot
 
 
@@ -24,7 +30,7 @@ def openai_compatible_base_url(provider: str) -> str:
 
 
 def forward_openai_compatible(
-    req: Request, snapshot: DatabaseTenantSnapshot
+    req: Request, snapshot: DatabaseTenantSnapshot, *, routed: bool = False
 ) -> Response:
     """Forward a Cursor request to OpenAI or OpenRouter Chat Completions."""
     if snapshot.profile_id is None:
@@ -55,13 +61,27 @@ def forward_openai_compatible(
     project = snapshot.provider_settings.get("project")
     if isinstance(project, str) and project:
         headers["OpenAI-Project"] = project
-    upstream = requests.post(
-        f"{origin}/chat/completions",
-        headers=headers,
-        data=json.dumps(payload),
-        stream=True,
-        timeout=600,
-    )
+    try:
+        upstream = requests.post(
+            f"{origin}/chat/completions",
+            headers=headers,
+            data=json.dumps(payload),
+            stream=True,
+            timeout=(10.0, ROUTED_READ_TIMEOUT_SECONDS) if routed else 600,
+        )
+    except requests.RequestException as exc:
+        if routed:
+            raise transport_failure(exc) from exc
+        raise
+    if routed:
+        prepared = prepare_upstream(upstream)
+        response = Response(
+            stream_with_context(chat_stream(prepared, snapshot.custom_model_id)),
+            content_type="text/event-stream",
+            headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+        )
+        response.call_on_close(prepared.close)
+        return response
 
     def generate() -> Any:
         try:

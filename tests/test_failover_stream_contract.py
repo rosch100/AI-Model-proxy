@@ -1,0 +1,140 @@
+"""Logical identity, bounded prefixes and interrupted streams across providers."""
+
+import json
+from unittest.mock import Mock
+
+import pytest
+import requests
+from flask import request
+
+from app.azure.adapter import AzureAdapter
+from app.providers.failover_upstream import (
+    UpstreamError,
+    chat_stream,
+    prepare_upstream,
+)
+from app.tenants import DatabaseTenantSnapshot
+
+
+def upstream(chunks):
+    """Build a successful upstream response from byte chunks."""
+    response = Mock(status_code=200)
+    response.headers = {"Content-Type": "text/event-stream"}
+    response.iter_content.return_value = iter(chunks)
+    return response
+
+
+def test_chat_stream_keeps_tool_ids_and_model_identity():
+    """Preserve tool call IDs while restoring the logical model name."""
+    payload = {
+        "model": "other-model",
+        "choices": [
+            {
+                "delta": {
+                    "tool_calls": [
+                        {
+                            "id": "call-123",
+                            "function": {"name": "test", "arguments": "{}"},
+                        }
+                    ]
+                }
+            }
+        ],
+    }
+    content = ("data: " + json.dumps(payload) + "\n\n").encode()
+    raw = upstream([content, b"data: [DONE]\n\n"])
+    body = b"".join(chat_stream(prepare_upstream(raw), "cursor-model"))
+    assert b'"model":"cursor-model"' in body
+    assert b'"id":"call-123"' in body
+    assert body.endswith(b"data: [DONE]\n\n")
+    raw.close.assert_called_once()
+
+
+def test_late_transport_failure_emits_error_without_replay():
+    """Expose an interrupted chat stream without leaking transport details."""
+
+    def chunks():
+        yield b'data: {"model":"provider","choices":[{"delta":{"content":"partial"}}]}\n\n'
+        raise requests.ReadTimeout("secret-upstream-url")
+
+    raw = upstream(chunks())
+    body = b"".join(chat_stream(prepare_upstream(raw), "cursor-model"))
+    assert b"partial" in body
+    assert b"stream_interrupted" in body
+    assert b"secret-upstream-url" not in body
+    raw.close.assert_called_once()
+
+
+def test_late_azure_transport_failure_is_visible_without_replay(app, monkeypatch):
+    """Expose an interrupted Azure stream without leaking transport details."""
+
+    def chunks():
+        yield b'event: response.output_text.delta\ndata: {"delta":"partial"}\n\n'
+        raise requests.ReadTimeout("secret-upstream-url")
+
+    raw = upstream(chunks())
+    monkeypatch.setattr("app.azure.adapter.requests.request", lambda **kwargs: raw)
+    snapshot = DatabaseTenantSnapshot(
+        id="tenant",
+        api_key_hash="digest",
+        custom_model_id="cursor-model",
+        provider="azure",
+        provider_settings={
+            "base_url": "https://resource.openai.azure.com",
+            "model_deployments": {"gpt-5.4": "deployment"},
+        },
+        inference_secret="secret",
+        default_model="gpt-5.4",
+        profile_id="profile",
+    )
+    with app.test_request_context(
+        "/v1/chat/completions",
+        method="POST",
+        json={"model": "cursor-model", "messages": []},
+    ):
+        response = AzureAdapter().forward_attempt(request, snapshot)
+        body = response.get_data()
+    assert b"partial" in body
+    assert b"stream_interrupted" in body
+    assert b"secret-upstream-url" not in body
+    raw.close.assert_called_once()
+
+
+def test_error_code_does_not_reflect_arbitrary_secret():
+    """Sanitize arbitrary secrets from upstream error codes and messages."""
+    raw = upstream([])
+    raw.status_code = 503
+    raw.json.return_value = {
+        "error": {"code": "sk-secret-credential", "message": "secret"}
+    }
+    with pytest.raises(UpstreamError) as caught:
+        prepare_upstream(raw)
+    assert "secret" not in caught.value.code
+    assert "secret" not in caught.value.message
+
+
+def test_heartbeat_and_sse_fields_are_not_json_errors():
+    """Accept heartbeat comments and SSE metadata alongside JSON payloads."""
+    raw = upstream(
+        [
+            b": keepalive\r\n\r\n",
+            (
+                b"event: message\r\nid: event-1\r\nretry: 1000\r\n"
+                b'data: {"model":"provider","choices":[{"delta":{"content":"hello"}}]}\r\n\r\n'
+            ),
+        ]
+    )
+    prepared = prepare_upstream(raw)
+    body = b"".join(chat_stream(prepared, "cursor-model"))
+    assert b"hello" in body
+    assert b"invalid_upstream_event" not in body
+
+
+def test_malformed_initial_event_is_explicit_terminal_failure():
+    """Reject malformed initial JSON as a terminal upstream error."""
+    raw = upstream([b"data: not-json\n\n"])
+    with pytest.raises(UpstreamError) as caught:
+        prepare_upstream(raw)
+    assert caught.value.status == 502
+    assert not caught.value.retryable
+    raw.close.assert_called_once()

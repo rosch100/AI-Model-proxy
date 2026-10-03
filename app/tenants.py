@@ -6,7 +6,7 @@ import hashlib
 import hmac
 import json
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Mapping
 
 from .exceptions import ServiceConfigurationError
@@ -48,7 +48,7 @@ class DatabaseTenantSnapshot:
     custom_model_id: str
     provider: str | None
     provider_settings: Mapping[str, Any]
-    inference_secret: str | None
+    inference_secret: str | None = field(repr=False)
     default_model: str | None
     profile_id: str | None = None
     profile_name: str | None = None
@@ -88,6 +88,16 @@ class DatabaseTenantSnapshot:
                 "The active tenant profile has no Azure base URL."
             )
         return f"{base_url.rstrip('/')}/openai/v1/responses"
+
+
+@dataclass(frozen=True)
+class DatabaseTenantRoutingSnapshot:
+    """Authenticated tenant identity and its validated, ordered provider route."""
+
+    id: str
+    api_key_hash: str
+    custom_model_id: str
+    profiles: tuple[DatabaseTenantSnapshot, ...]
 
 
 def hash_api_key(api_key: str) -> str:

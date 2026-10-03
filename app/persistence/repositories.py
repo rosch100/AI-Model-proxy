@@ -4,15 +4,69 @@ from __future__ import annotations
 
 import hmac
 from collections.abc import Sequence
+from copy import deepcopy
 from uuid import uuid4
 
+from cryptography.exceptions import InvalidTag
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from app.tenants import DatabaseTenantSnapshot, TenantConfig, hash_api_key
+from app.providers.azure_url import validate_azure_base_url
+from app.providers.catalog import selectable_catalog_models
+from app.tenants import (
+    DatabaseTenantRoutingSnapshot,
+    DatabaseTenantSnapshot,
+    TenantConfig,
+    hash_api_key,
+)
 
-from .models import ProviderProfile, Tenant
+from .models import ProviderCatalogEntry, ProviderProfile, Tenant
 from .secrets import SecretCipher
+
+
+def validate_routed_profile(
+    profile: ProviderProfile, entries: Sequence[tuple[str, str | None]]
+) -> None:
+    """Reject incomplete settings or a target absent from the selectable catalog."""
+    if profile.deleted_at is not None:
+        raise ValueError("Provider account has been removed")
+    if (
+        not profile.inference_secret_ciphertext
+        or not isinstance(profile.default_model, str)
+        or not profile.default_model.strip()
+    ):
+        raise ValueError(f"The {profile.display_name} account is incomplete")
+    if profile.provider not in {"azure", "openai", "openrouter"}:
+        raise ValueError("Unsupported provider")
+    selectable = dict(selectable_catalog_models(profile.provider, entries))
+    if profile.default_model not in selectable:
+        raise ValueError(
+            f"The default model for {profile.display_name} is not in its available catalog"
+        )
+    if not isinstance(profile.settings, dict):
+        raise ValueError("Provider settings must be an object")
+    if profile.provider == "azure":
+        validate_azure_base_url(profile.settings.get("base_url"))
+        deployments = profile.settings.get("model_deployments")
+        if (
+            not isinstance(deployments, dict)
+            or any(
+                not isinstance(model, str)
+                or not isinstance(deployment, str)
+                or not deployment.strip()
+                for model, deployment in deployments.items()
+            )
+            or deployments.get(profile.default_model)
+            != selectable[profile.default_model]
+        ):
+            raise ValueError(
+                "Azure model deployments do not match the available catalog"
+            )
+    else:
+        for key in ("organization", "project"):
+            value = profile.settings.get(key)
+            if value is not None and not isinstance(value, str):
+                raise ValueError(f"Provider setting {key} must be a string")
 
 
 class TenantRepository:
@@ -34,70 +88,88 @@ class TenantRepository:
 
     def get_proxy_snapshot_by_api_key(
         self, api_key: str, cipher: SecretCipher
-    ) -> DatabaseTenantSnapshot | None:
-        """Resolve a key and its active provider profile from one database read."""
+    ) -> DatabaseTenantRoutingSnapshot | None:
+        """Read identity, ordered route, and validation catalogs in one statement."""
         digest = hash_api_key(api_key)
-        row = self._session.execute(
-            select(Tenant, ProviderProfile)
+        rows = self._session.execute(
+            select(Tenant, ProviderProfile, ProviderCatalogEntry)
             .outerjoin(
                 ProviderProfile,
                 (ProviderProfile.tenant_id == Tenant.id)
-                & (ProviderProfile.id == Tenant.active_profile_id),
+                & ProviderProfile.route_priority.is_not(None)
+                & ProviderProfile.deleted_at.is_(None),
+            )
+            .outerjoin(
+                ProviderCatalogEntry,
+                ProviderCatalogEntry.profile_id == ProviderProfile.id,
             )
             .where(Tenant.api_key_hash == digest)
-        ).one_or_none()
-        if row is None:
+            .order_by(ProviderProfile.route_priority, ProviderCatalogEntry.id)
+            .execution_options(populate_existing=True)
+        ).all()
+        if not rows:
             return None
-
-        tenant, profile = row
+        tenant = rows[0][0]
         if not hmac.compare_digest(tenant.api_key_hash, digest):
             return None
-        if profile is None:
-            return DatabaseTenantSnapshot(
-                id=tenant.id,
-                api_key_hash=tenant.api_key_hash,
-                custom_model_id=tenant.custom_model_id,
-                provider=None,
-                provider_settings={},
-                inference_secret=None,
-                default_model=None,
-                profile_id=None,
-                profile_name=None,
-                history_generation=None,
-                profile_deleted=False,
-            )
 
-        secret = (
-            cipher.decrypt(profile.inference_secret_ciphertext)
-            if profile.inference_secret_ciphertext is not None
-            else None
-        )
-        return DatabaseTenantSnapshot(
+        catalogs: dict[str, list[tuple[str, str | None]]] = {}
+        profiles: dict[str, ProviderProfile] = {}
+        for _tenant, profile, entry in rows:
+            if profile is None:
+                continue
+            profiles[profile.id] = profile
+            catalog = catalogs.setdefault(profile.id, [])
+            if entry is not None:
+                catalog.append((entry.model_id, entry.deployment_id))
+        snapshots = []
+        for profile in profiles.values():
+            try:
+                validate_routed_profile(profile, catalogs[profile.id])
+                secret = cipher.decrypt(profile.inference_secret_ciphertext)
+                if not secret.strip():
+                    continue
+            except (ValueError, InvalidTag):
+                # Invalid route members cannot be used; never invent another model.
+                continue
+            snapshots.append(
+                DatabaseTenantSnapshot(
+                    id=tenant.id,
+                    api_key_hash=tenant.api_key_hash,
+                    custom_model_id=tenant.custom_model_id,
+                    provider=profile.provider,
+                    provider_settings=deepcopy(profile.settings),
+                    inference_secret=secret,
+                    default_model=profile.default_model,
+                    profile_id=profile.id,
+                    profile_name=profile.display_name,
+                    history_generation=profile.history_generation,
+                    profile_deleted=False,
+                )
+            )
+        return DatabaseTenantRoutingSnapshot(
             id=tenant.id,
             api_key_hash=tenant.api_key_hash,
             custom_model_id=tenant.custom_model_id,
-            provider=profile.provider,
-            provider_settings=dict(profile.settings),
-            inference_secret=secret,
-            default_model=profile.default_model,
-            profile_id=profile.id,
-            profile_name=profile.display_name,
-            history_generation=profile.history_generation,
-            profile_deleted=profile.deleted_at is not None,
+            profiles=tuple(snapshots),
         )
 
     def get_admin_snapshot(
         self, tenant_id: str
     ) -> tuple[Tenant, ProviderProfile | None]:
-        """Return a tenant and its active provider profile in one query."""
+        """Return a tenant and its first routed, nondeleted profile in one query."""
         row = self._session.execute(
             select(Tenant, ProviderProfile)
             .outerjoin(
                 ProviderProfile,
                 (ProviderProfile.tenant_id == Tenant.id)
-                & (ProviderProfile.id == Tenant.active_profile_id),
+                & ProviderProfile.deleted_at.is_(None)
+                & ProviderProfile.route_priority.is_not(None),
             )
             .where(Tenant.id == tenant_id)
+            .order_by(ProviderProfile.route_priority)
+            .limit(1)
+            .execution_options(populate_existing=True)
         ).one_or_none()
         if row is None:
             raise LookupError(f"Tenant {tenant_id!r} does not exist")
@@ -126,20 +198,17 @@ def import_tenants(
                 )
             profiles = list(
                 session.scalars(
-                    select(ProviderProfile).where(
+                    select(ProviderProfile)
+                    .where(
                         ProviderProfile.tenant_id == tenant_config.id,
-                        ProviderProfile.provider == "azure",
+                        ProviderProfile.deleted_at.is_(None),
+                        ProviderProfile.route_priority.is_not(None),
                     )
+                    .order_by(ProviderProfile.route_priority)
                 )
             )
-            profile = next(
-                (
-                    candidate
-                    for candidate in profiles
-                    if candidate.id == existing.active_profile_id
-                    and candidate.deleted_at is None
-                ),
-                None,
+            profile = (
+                profiles[0] if profiles and profiles[0].provider == "azure" else None
             )
             if profile is None:
                 raise ValueError(
@@ -151,8 +220,7 @@ def import_tenants(
                 "model_deployments": dict(tenant_config.azure_model_deployments),
             }
             if (
-                profile is None
-                or profile.settings != expected_settings
+                profile.settings != expected_settings
                 or profile.default_model != tenant_config.azure_default_model
             ):
                 raise ValueError(
@@ -189,11 +257,20 @@ def import_tenants(
                 "model_deployments": dict(tenant_config.azure_model_deployments),
             },
             default_model=tenant_config.azure_default_model,
+            route_priority=1,
             inference_secret_ciphertext=cipher.encrypt(tenant_config.azure_api_key),
         )
         session.add(profile)
         session.flush()
-        tenant.active_profile_id = profile_id
+        session.add_all(
+            ProviderCatalogEntry(
+                profile_id=profile_id,
+                model_id=model_id,
+                deployment_id=deployment_id,
+                source="environment",
+            )
+            for model_id, deployment_id in tenant_config.azure_model_deployments.items()
+        )
         imported += 1
     session.flush()
     return imported

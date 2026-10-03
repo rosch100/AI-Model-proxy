@@ -153,8 +153,7 @@ def test_delete_connection_soft_deletes_only_the_tenant_profile(admin_app):
         )
         own_profile_id = own_profile.id
         foreign_profile_id = foreign_profile.id
-        tenant = session.get(Tenant, "acme")
-        tenant.active_profile_id = own_profile_id
+        own_profile.route_priority = 1
 
     client = _authenticated_admin_client(admin_app)
     page = client.get("/admin/settings/connection")
@@ -177,7 +176,7 @@ def test_delete_connection_soft_deletes_only_the_tenant_profile(admin_app):
         own_profile = session.get(ProviderProfile, own_profile_id)
         assert own_profile.deleted_at is not None
         assert session.get(ProviderProfile, foreign_profile_id).deleted_at is None
-        assert session.get(Tenant, "acme").active_profile_id is None
+        assert own_profile.route_priority is None
         event = session.scalar(
             select(AuditEvent).where(AuditEvent.action == "profile.delete")
         )

@@ -9,7 +9,7 @@ from typing import Any
 from sqlalchemy import Engine, create_engine
 from sqlalchemy.orm import Session, sessionmaker
 
-from app.tenants import DatabaseTenantSnapshot
+from app.tenants import DatabaseTenantRoutingSnapshot
 
 from .repositories import TenantRepository
 from .secrets import SecretCipher
@@ -25,7 +25,7 @@ class Database:
 
     def get_proxy_snapshot_by_api_key(
         self, api_key: str
-    ) -> DatabaseTenantSnapshot | None:
+    ) -> DatabaseTenantRoutingSnapshot | None:
         """Resolve persisted proxy identity and provider settings for one request."""
         with self.sessions() as session:
             return TenantRepository(session).get_proxy_snapshot_by_api_key(

@@ -14,6 +14,7 @@ from sqlalchemy import (
     ForeignKey,
     ForeignKeyConstraint,
     Index,
+    Integer,
     LargeBinary,
     Numeric,
     String,
@@ -45,18 +46,11 @@ class Tenant(Base):
     __table_args__ = (
         UniqueConstraint("api_key_hash", name="uq_tenants_api_key_hash"),
         UniqueConstraint("custom_model_id", name="uq_tenants_custom_model_id"),
-        ForeignKeyConstraint(
-            ["id", "active_profile_id"],
-            ["provider_profiles.tenant_id", "provider_profiles.id"],
-            name="fk_tenant_active_profile_same_tenant",
-            use_alter=True,
-        ),
     )
 
     id: Mapped[str] = mapped_column(String(128), primary_key=True)
     api_key_hash: Mapped[str] = mapped_column(String(64), nullable=False)
     custom_model_id: Mapped[str] = mapped_column(String(128), nullable=False)
-    active_profile_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False
     )
@@ -91,6 +85,13 @@ class ProviderProfile(Base):
             "tenant_id", "provider", "id", name="uq_profile_tenant_provider_id"
         ),
         UniqueConstraint("tenant_id", "id", name="uq_profile_tenant_id"),
+        UniqueConstraint(
+            "tenant_id", "route_priority", name="uq_profile_tenant_route_priority"
+        ),
+        CheckConstraint(
+            "route_priority IS NULL OR route_priority > 0",
+            name="ck_profile_route_priority_positive",
+        ),
         CheckConstraint(
             "provider IN ('azure', 'openai', 'openrouter')",
             name="ck_profile_provider",
@@ -129,6 +130,7 @@ class ProviderProfile(Base):
     )
     billing_secret_ciphertext: Mapped[str | None] = mapped_column(String, nullable=True)
     default_model: Mapped[str | None] = mapped_column(String(256), nullable=True)
+    route_priority: Mapped[int | None] = mapped_column(Integer, nullable=True)
     catalog_refreshed_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True
     )

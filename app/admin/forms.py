@@ -102,8 +102,10 @@ class ProviderProfileForm(FlaskForm):
         "Account-Name *", validators=[DataRequired(), Length(max=128)]
     )
     base_url = StringField("Azure Base-URL *")
-    default_model = StringField(
-        "Standardmodell", validators=[Optional(), Length(max=256)]
+    default_model = SelectField(
+        "Standardmodell",
+        validators=[Optional()],
+        choices=[("", "Katalog zuerst laden")],
     )
     api_key = PasswordField("Inference-Schlüssel", validators=[Optional()])
     organization = StringField("Organisation (optional)", validators=[Optional()])
@@ -126,7 +128,16 @@ class ActivateProviderForm(FlaskForm):
 
 
 class DeactivateProviderForm(FlaskForm):
-    """CSRF-protected request to explicitly clear the active profile."""
+    """CSRF-protected request to explicitly clear the provider route."""
+
+
+class ReorderProviderForm(ActivateProviderForm):
+    """Tenant-owned profile and accessible one-step priority change."""
+
+    direction = SelectField(
+        choices=[("up", "Nach oben"), ("down", "Nach unten")],
+        validators=[DataRequired()],
+    )
 
 
 class DeleteProviderForm(FlaskForm):

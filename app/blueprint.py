@@ -17,8 +17,11 @@ from .common.recording import (
     record_payload,
 )
 from .exceptions import ConfigurationError, ServiceConfigurationError
-from .providers.openai_compat import forward_openai_compatible
-from .tenants import AUTH_MODE_TENANT, DatabaseTenantSnapshot
+from .providers.routing import forward_tenant_route, routed_profiles
+from .tenants import (
+    AUTH_MODE_TENANT,
+    DatabaseTenantRoutingSnapshot,
+)
 
 blueprint = Blueprint("blueprint", __name__)
 
@@ -68,7 +71,7 @@ def _ensure_provider_allowed_for_auth(provider: str) -> None:
     if provider == "codex" and is_tenant_auth_mode():
         raise ServiceConfigurationError(
             "Codex is not available in AUTH_MODE=tenant. "
-            "Tenant API keys may only use the Azure provider."
+            "Tenant API keys may only use configured tenant providers."
         )
 
 
@@ -78,26 +81,14 @@ def _is_explicit_azure_path(path: str) -> bool:
     return clean_path == "azure" or clean_path.startswith("azure/")
 
 
-def _ensure_database_profile_enabled(path: str, tenant: DatabaseTenantSnapshot) -> None:
-    """Apply provider switches to the selected database-backed profile."""
-    if _is_explicit_azure_path(path):
-        if tenant.provider != "azure":
-            raise ServiceConfigurationError(
-                "The active tenant provider is not available on the Azure route."
-            )
-        _ensure_provider_enabled("azure")
-        return
-    if tenant.provider == "azure":
-        _ensure_provider_enabled("azure")
-
-
 def _azure_model_ids() -> list[str]:
     """Return Cursor-facing Azure model ids for the authenticated principal."""
     tenant = current_tenant()
-    if isinstance(tenant, DatabaseTenantSnapshot):
-        if tenant.profile_id is None or tenant.profile_deleted:
-            return []
-        return [tenant.custom_model_id]
+    if isinstance(tenant, DatabaseTenantRoutingSnapshot):
+        profiles = routed_profiles(
+            tenant, azure_only=_is_explicit_azure_path(request.path)
+        )
+        return [tenant.custom_model_id] if profiles else []
     if tenant is not None:
         return list(tenant.azure_model_deployments)
     if current_app.config.get("AUTH_MODE") == AUTH_MODE_TENANT:
@@ -135,30 +126,12 @@ def catch_all(path: str):
         _ensure_provider_enabled(provider)
         return CodexAdapter().forward(request, provider_path)
     tenant = current_tenant()
-    if isinstance(tenant, DatabaseTenantSnapshot):
-        _ensure_database_profile_enabled(path, tenant)
-        if tenant.profile_id is None:
-            raise ServiceConfigurationError(
-                "No active provider profile is configured for this tenant."
-            )
-        if tenant.profile_deleted:
-            raise ServiceConfigurationError(
-                "The active provider profile has been removed."
-            )
-        if tenant.provider in {"openai", "openrouter"}:
-            return forward_openai_compatible(request, tenant)
-        if tenant.provider is None:
-            raise ServiceConfigurationError(
-                "No active provider profile is configured for this tenant."
-            )
-        if tenant.provider != "azure":
-            raise ServiceConfigurationError(
-                f"Unsupported active provider {tenant.provider!r}."
-            )
-    azure_adapter = AzureAdapter()
-    if isinstance(tenant, DatabaseTenantSnapshot):
-        return azure_adapter.forward(request, tenant)
-    return azure_adapter.forward(request)
+    if isinstance(tenant, DatabaseTenantRoutingSnapshot):
+        return forward_tenant_route(
+            request, tenant, azure_only=_is_explicit_azure_path(path)
+        )
+    _ensure_provider_enabled("azure")
+    return AzureAdapter().forward(request)
 
 
 # ── Model list ──────────────────────────────────────────────────────────────
@@ -179,9 +152,7 @@ def models():
         _ensure_provider_enabled(provider)
         return jsonify(codex_model_payload())
     tenant = current_tenant()
-    if isinstance(tenant, DatabaseTenantSnapshot):
-        _ensure_database_profile_enabled(request.path, tenant)
-    else:
+    if not isinstance(tenant, DatabaseTenantRoutingSnapshot):
         _ensure_provider_enabled(provider)
     return jsonify(
         {

@@ -21,6 +21,7 @@ from app.persistence.models import (
     Tenant,
     provider_profile_name_key,
 )
+from app.persistence.repositories import validate_routed_profile
 from app.persistence.secrets import SecretCipher
 from app.providers.azure_url import validate_azure_base_url
 from app.providers.catalog import selectable_catalog_models
@@ -78,28 +79,50 @@ def upsert_provider_profile(
     inference_secret: str | None,
     actor_id: str,
 ) -> ProviderProfile:
-    """Create or update one provider profile without activating it."""
-    profile = session.scalar(
-        select(ProviderProfile).where(
-            ProviderProfile.tenant_id == tenant_id,
-            ProviderProfile.provider == provider,
+    """Save a legacy provider selection only when its profile is unambiguous."""
+    _lock_tenant(session, tenant_id)
+    profiles = list(
+        session.scalars(
+            select(ProviderProfile)
+            .where(
+                ProviderProfile.tenant_id == tenant_id,
+                ProviderProfile.provider == provider,
+                ProviderProfile.deleted_at.is_(None),
+            )
+            .execution_options(populate_existing=True)
         )
     )
-    if profile is None:
-        profile = ProviderProfile(
-            id=str(uuid4()),
-            tenant_id=tenant_id,
-            provider=provider,
-            settings=settings,
-            default_model=default_model,
+    if len(profiles) > 1:
+        raise ValueError(
+            "Provider account selection is ambiguous; specify a profile ID"
         )
-        session.add(profile)
-        session.flush()
+    if not profiles:
+        profile = create_provider_profile(
+            session,
+            cipher,
+            tenant_id,
+            provider,
+            provider,
+            settings,
+            default_model,
+            inference_secret,
+            actor_id,
+        )
     else:
-        profile.settings = settings
-        profile.default_model = default_model
-    if inference_secret:
-        profile.inference_secret_ciphertext = cipher.encrypt(inference_secret)
+        profile = profiles[0]
+        if profile.display_name is None:
+            raise ValueError("Provider account name is required")
+        profile = update_provider_profile(
+            session,
+            cipher,
+            tenant_id,
+            profile.id,
+            profile.display_name,
+            settings,
+            default_model,
+            inference_secret,
+            actor_id,
+        )
     session.add(
         AuditEvent(
             tenant_id=tenant_id,
@@ -211,11 +234,7 @@ def update_provider_profile(
     actor_id: str,
 ) -> ProviderProfile:
     """Update one account without changing its provider or blanking its secret."""
-    tenant = session.scalar(
-        select(Tenant).where(Tenant.id == tenant_id).with_for_update()
-    )
-    if tenant is None:
-        raise LookupError("Tenant was not found")
+    _lock_tenant(session, tenant_id)
     profile = session.scalar(
         select(ProviderProfile)
         .where(
@@ -224,6 +243,7 @@ def update_provider_profile(
             ProviderProfile.deleted_at.is_(None),
         )
         .with_for_update()
+        .execution_options(populate_existing=True)
     )
     if profile is None:
         raise LookupError("Provider account was not found")
@@ -255,9 +275,8 @@ def update_provider_profile(
     if not normalized_default_model and profile.default_model:
         raise ValueError("Default model is required")
 
-    tenant = session.get(Tenant, tenant_id)
     if (
-        tenant.active_profile_id == profile.id
+        profile.route_priority is not None
         and not azure_endpoint_changed
         and normalized_default_model is not None
     ):
@@ -266,17 +285,16 @@ def update_provider_profile(
                 ProviderCatalogEntry.profile_id == profile.id
             )
         )
-        selectable_models = {
-            model_id
-            for model_id, _deployment_id in selectable_catalog_models(
-                profile.provider,
-                [(entry.model_id, entry.deployment_id) for entry in catalog],
-            )
-        }
-        if normalized_default_model not in selectable_models:
-            raise ValueError(
-                f"The default model for {profile.display_name} is not in its available catalog"
-            )
+        candidate = ProviderProfile(
+            provider=profile.provider,
+            display_name=profile.display_name,
+            settings=normalized_settings,
+            default_model=normalized_default_model,
+            inference_secret_ciphertext=profile.inference_secret_ciphertext,
+        )
+        validate_routed_profile(
+            candidate, [(entry.model_id, entry.deployment_id) for entry in catalog]
+        )
 
     profile.display_name = name
     profile.settings = normalized_settings
@@ -284,21 +302,7 @@ def update_provider_profile(
     if azure_endpoint_changed:
         profile.catalog_refreshed_at = None
         profile.catalog_error = None
-        if tenant.active_profile_id == profile.id:
-            tenant.active_profile_id = None
-            session.add(
-                AuditEvent(
-                    tenant_id=tenant_id,
-                    actor_id=actor_id,
-                    target="tenant:active-profile",
-                    action="profile.deactivate",
-                    outcome="success",
-                    details={
-                        "profile_id": profile.id,
-                        "reason": "azure_endpoint_changed",
-                    },
-                )
-            )
+        _remove_from_route(session, profile, actor_id, "azure_endpoint_changed")
         session.execute(
             delete(ProviderCatalogEntry).where(
                 ProviderCatalogEntry.profile_id == profile.id
@@ -323,11 +327,7 @@ def delete_provider_profile(
     session: Session, tenant_id: str, profile_id: str, actor_id: str
 ) -> None:
     """Soft-delete one tenant-owned profile while preserving audit history."""
-    tenant = session.scalar(
-        select(Tenant).where(Tenant.id == tenant_id).with_for_update()
-    )
-    if tenant is None:
-        raise LookupError("Tenant was not found")
+    _lock_tenant(session, tenant_id)
     profile = session.scalar(
         select(ProviderProfile)
         .where(
@@ -336,6 +336,7 @@ def delete_provider_profile(
             ProviderProfile.deleted_at.is_(None),
         )
         .with_for_update()
+        .execution_options(populate_existing=True)
     )
     if profile is None:
         raise LookupError("Provider account was not found")
@@ -349,8 +350,7 @@ def delete_provider_profile(
     profile.inference_secret_ciphertext = None
     profile.billing_secret_ciphertext = None
     profile.deleted_at = datetime.now(timezone.utc)
-    if tenant.active_profile_id == profile.id:
-        tenant.active_profile_id = None
+    _remove_from_route(session, profile, actor_id, "profile_deleted")
     session.add(
         AuditEvent(
             tenant_id=tenant_id,
@@ -363,15 +363,147 @@ def delete_provider_profile(
     )
 
 
-def activate_provider_profile(
-    session: Session, tenant: Tenant, profile_id: str, actor_id: str
-) -> ProviderProfile:
-    """Atomically activate one complete account identified by profile ID."""
+def _lock_tenant(session: Session, tenant_id: str) -> Tenant:
+    """Serialize every route mutation on the stable tenant row."""
     tenant = session.scalar(
-        select(Tenant).where(Tenant.id == tenant.id).with_for_update()
+        select(Tenant)
+        .where(Tenant.id == tenant_id)
+        .with_for_update()
+        .execution_options(populate_existing=True)
     )
     if tenant is None:
         raise LookupError("Tenant was not found")
+    return tenant
+
+
+def _routed_profiles(session: Session, tenant_id: str) -> list[ProviderProfile]:
+    """Read the current route after acquiring the tenant lock."""
+    return list(
+        session.scalars(
+            select(ProviderProfile)
+            .where(
+                ProviderProfile.tenant_id == tenant_id,
+                ProviderProfile.route_priority.is_not(None),
+            )
+            .order_by(ProviderProfile.route_priority)
+            .execution_options(populate_existing=True)
+        )
+    )
+
+
+def _write_route(
+    session: Session,
+    previous: list[ProviderProfile],
+    ordered: list[ProviderProfile],
+) -> None:
+    """Renumber atomically using a flushed NULL phase to avoid unique collisions."""
+    for profile in previous:
+        profile.route_priority = None
+    session.flush()
+    for priority, profile in enumerate(ordered, start=1):
+        profile.route_priority = priority
+    session.flush()
+
+
+def _remove_from_route(
+    session: Session,
+    profile: ProviderProfile,
+    actor_id: str,
+    reason: str,
+) -> None:
+    """Remove one member and compact the route under an already-held tenant lock."""
+    if profile.route_priority is None:
+        return
+    previous = _routed_profiles(session, profile.tenant_id)
+    _write_route(
+        session, previous, [item for item in previous if item.id != profile.id]
+    )
+    session.add(
+        AuditEvent(
+            tenant_id=profile.tenant_id,
+            actor_id=actor_id,
+            target=f"profile:{profile.id}",
+            action="profile.deactivate",
+            outcome="success",
+            details={"profile_id": profile.id, "reason": reason},
+        )
+    )
+
+
+def deactivate_provider_profile(
+    session: Session, tenant: Tenant, profile_id: str, actor_id: str
+) -> ProviderProfile:
+    """Remove one tenant-owned account from routing without changing its bindings."""
+    _lock_tenant(session, tenant.id)
+    profile = session.scalar(
+        select(ProviderProfile)
+        .where(
+            ProviderProfile.id == profile_id,
+            ProviderProfile.tenant_id == tenant.id,
+            ProviderProfile.deleted_at.is_(None),
+        )
+        .execution_options(populate_existing=True)
+    )
+    if profile is None:
+        raise LookupError("Provider account was not found")
+    _remove_from_route(session, profile, actor_id, "manual")
+    return profile
+
+
+def reorder_provider_profile(
+    session: Session,
+    tenant: Tenant,
+    profile_id: str,
+    direction: str,
+    actor_id: str,
+) -> ProviderProfile:
+    """Move a routed account one position up/down in the tenant-local route."""
+    if direction not in {"up", "down"}:
+        raise ValueError("Route direction must be up or down")
+    _lock_tenant(session, tenant.id)
+    profile = session.scalar(
+        select(ProviderProfile)
+        .where(
+            ProviderProfile.id == profile_id,
+            ProviderProfile.tenant_id == tenant.id,
+            ProviderProfile.deleted_at.is_(None),
+        )
+        .execution_options(populate_existing=True)
+    )
+    if profile is None:
+        raise LookupError("Provider account was not found")
+    if profile.route_priority is None:
+        raise ValueError("Cannot reorder an inactive provider account")
+    previous = _routed_profiles(session, tenant.id)
+    ordered = list(previous)
+    index = next(index for index, item in enumerate(ordered) if item.id == profile.id)
+    destination = index + (-1 if direction == "up" else 1)
+    if destination < 0 or destination >= len(ordered):
+        return profile
+    ordered[index], ordered[destination] = ordered[destination], ordered[index]
+    _write_route(session, previous, ordered)
+    session.add(
+        AuditEvent(
+            tenant_id=tenant.id,
+            actor_id=actor_id,
+            target=f"profile:{profile.id}",
+            action="profile.reorder",
+            outcome="success",
+            details={
+                "profile_id": profile.id,
+                "direction": direction,
+                "route_priority": profile.route_priority,
+            },
+        )
+    )
+    return profile
+
+
+def activate_provider_profile(
+    session: Session, tenant: Tenant, profile_id: str, actor_id: str
+) -> ProviderProfile:
+    """Append a validated account, preserving any existing route position."""
+    tenant = _lock_tenant(session, tenant.id)
     profile = session.scalar(
         select(ProviderProfile)
         .where(
@@ -380,28 +512,21 @@ def activate_provider_profile(
             ProviderProfile.deleted_at.is_(None),
         )
         .with_for_update()
+        .execution_options(populate_existing=True)
     )
     if profile is None:
         raise LookupError("Provider account was not found")
-    if not profile.inference_secret_ciphertext or not profile.default_model:
-        raise ValueError(f"The {profile.display_name} account is incomplete")
     catalog = session.scalars(
         select(ProviderCatalogEntry).where(
             ProviderCatalogEntry.profile_id == profile.id
         )
     )
-    selectable_models = {
-        model_id
-        for model_id, _deployment_id in selectable_catalog_models(
-            profile.provider,
-            [(entry.model_id, entry.deployment_id) for entry in catalog],
-        )
-    }
-    if profile.default_model not in selectable_models:
-        raise ValueError(
-            f"The default model for {profile.display_name} is not in its available catalog"
-        )
-    tenant.active_profile_id = profile.id
+    validate_routed_profile(
+        profile, [(entry.model_id, entry.deployment_id) for entry in catalog]
+    )
+    if profile.route_priority is None:
+        previous = _routed_profiles(session, tenant.id)
+        _write_route(session, previous, [*previous, profile])
     session.add(
         AuditEvent(
             tenant_id=tenant.id,
@@ -409,7 +534,11 @@ def activate_provider_profile(
             target=f"profile:{profile.id}",
             action="profile.activate",
             outcome="success",
-            details={"provider": profile.provider, "profile_id": profile.id},
+            details={
+                "provider": profile.provider,
+                "profile_id": profile.id,
+                "route_priority": profile.route_priority,
+            },
         )
     )
     return profile
@@ -421,7 +550,16 @@ def replace_catalog_entries(
     entries: list[tuple[str, str | None]],
     error: str | None,
 ) -> None:
-    """Replace catalog rows after a successful provider query."""
+    """Replace catalog rows, deactivating routes whose target disappeared."""
+    _lock_tenant(session, profile.tenant_id)
+    profile = session.scalar(
+        select(ProviderProfile)
+        .where(ProviderProfile.id == profile.id)
+        .with_for_update()
+        .execution_options(populate_existing=True)
+    )
+    if profile is None or profile.deleted_at is not None:
+        raise LookupError("Provider account was not found")
     profile.catalog_error = error
     if error is not None:
         return
@@ -444,6 +582,13 @@ def replace_catalog_entries(
             )
         )
     profile.catalog_refreshed_at = datetime.now(timezone.utc)
+    selectable_models = {
+        model_id for model_id, _ in selectable_catalog_models(profile.provider, entries)
+    }
+    if profile.default_model not in selectable_models:
+        _remove_from_route(
+            session, profile, "system:catalog", "default_model_unavailable"
+        )
 
 
 def save_billing_secret(

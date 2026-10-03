@@ -37,6 +37,7 @@ from app.admin.forms import (
     LoginForm,
     PasswordChangeForm,
     ProviderProfileForm,
+    ReorderProviderForm,
 )
 from app.admin.security import (
     ADMIN_COOKIE_NAME,
@@ -70,7 +71,9 @@ from app.persistence.admin_ops import (
     activate_provider_profile,
     change_admin_password,
     create_provider_profile,
+    deactivate_provider_profile,
     delete_provider_profile,
+    reorder_provider_profile,
     replace_catalog_entries,
     rotate_api_key,
     save_billing_secret,
@@ -610,6 +613,7 @@ def update_connection(profile_id: str):
         session.expunge(profile)
     form = ProviderProfileForm()
     _set_profile_form_choices(form, provider=profile.provider)
+    _set_profile_model_choices(form, profile)
     if not form.validate_on_submit() or form.provider.data != profile.provider:
         flash("Accountdaten sind ungültig.", "error")
         return (
@@ -710,21 +714,61 @@ def deactivate_connection():
         tenant = session.scalar(
             select(Tenant).where(Tenant.id == g.admin.tenant_id).with_for_update()
         )
-        tenant.active_profile_id = None
-        session.add(
-            AuditEvent(
-                tenant_id=tenant.id,
-                actor_id=g.admin.username,
-                target="tenant:active-profile",
-                action="profile.deactivate",
-                outcome="success",
-                details={},
+        profile_ids = tuple(
+            session.scalars(
+                select(ProviderProfile.id)
+                .where(
+                    ProviderProfile.tenant_id == tenant.id,
+                    ProviderProfile.route_priority.is_not(None),
+                    ProviderProfile.deleted_at.is_(None),
+                )
+                .order_by(ProviderProfile.route_priority)
             )
         )
+        for profile_id in profile_ids:
+            deactivate_provider_profile(session, tenant, profile_id, g.admin.username)
     flash(
         "Kein Account aktiv. Proxy-Anfragen sind bis zur nächsten Aktivierung nicht verfügbar.",
         "warning",
     )
+    return redirect(url_for("admin.settings_connection"))
+
+
+@admin_bp.post("/settings/connection/<profile_id>/deactivate")
+@login_required
+def deactivate_connection_profile(profile_id: str):
+    """Remove only this account from the tenant failover order."""
+    form = ActivateProviderForm()
+    if not form.validate_on_submit() or form.profile_id.data != profile_id:
+        return "Bad Request", 400
+    with _database().sessions.begin() as session:
+        tenant = session.get(Tenant, g.admin.tenant_id)
+        try:
+            deactivate_provider_profile(session, tenant, profile_id, g.admin.username)
+        except LookupError:
+            return "Not Found", 404
+    flash("Account aus der Failover-Reihenfolge entfernt.", "info")
+    return redirect(url_for("admin.settings_connection"))
+
+
+@admin_bp.post("/settings/connection/<profile_id>/move")
+@login_required
+def move_connection(profile_id: str):
+    """Move one tenant-owned account without accepting arbitrary positions."""
+    form = ReorderProviderForm()
+    if not form.validate_on_submit() or form.profile_id.data != profile_id:
+        return "Bad Request", 400
+    try:
+        with _database().sessions.begin() as session:
+            tenant = session.get(Tenant, g.admin.tenant_id)
+            reorder_provider_profile(
+                session, tenant, profile_id, form.direction.data, g.admin.username
+            )
+    except LookupError:
+        return "Not Found", 404
+    except ValueError:
+        return "Bad Request", 400
+    flash("Failover-Reihenfolge aktualisiert.", "info")
     return redirect(url_for("admin.settings_connection"))
 
 
@@ -761,6 +805,11 @@ def refresh_catalog(profile_id: str):
         entries = []
         error = str(exc)
     with database.sessions.begin() as session:
+        tenant = session.scalar(
+            select(Tenant).where(Tenant.id == g.admin.tenant_id).with_for_update()
+        )
+        if tenant is None:
+            return "Not Found", 404
         profile = session.scalar(
             select(ProviderProfile)
             .where(
@@ -784,17 +833,22 @@ def refresh_catalog(profile_id: str):
                 "warning",
             )
             return redirect(url_for("admin.settings_connection"))
+        was_routed = profile.route_priority is not None
         replace_catalog_entries(session, profile, entries, error)
         if error is None and provider == "azure":
             deployments = azure_deployments_from_catalog(entries)
             profile.settings = {**profile.settings, "model_deployments": deployments}
-            if deployments and profile.default_model not in deployments:
-                profile.default_model = next(iter(deployments))
+            if profile.default_model not in deployments:
+                profile.default_model = (
+                    None if was_routed else next(iter(deployments), None)
+                )
         elif error is None and provider in {"openai", "openrouter"}:
             selectable = selectable_catalog_models(provider, entries)
             model_ids = [model_id for model_id, _ in selectable]
-            if model_ids and profile.default_model not in model_ids:
-                profile.default_model = model_ids[0]
+            if profile.default_model not in model_ids:
+                profile.default_model = (
+                    None if was_routed or not model_ids else model_ids[0]
+                )
     flash(
         (
             f"Katalog aktualisiert — {len(selectable_catalog_models(provider, entries))} wählbare Modelle übernommen."
@@ -1032,7 +1086,24 @@ def _profile_form(profile: ProviderProfile) -> ProviderProfileForm:
         api_key="",
     )
     _set_profile_form_choices(form, profile.provider)
+    _set_profile_model_choices(form, profile)
     return form
+
+
+def _set_profile_model_choices(
+    form: ProviderProfileForm, profile: ProviderProfile
+) -> None:
+    """Bind model targets to the saved account catalog, never free-form IDs."""
+    with _database().sessions() as session:
+        entries = session.execute(
+            select(ProviderCatalogEntry.model_id, ProviderCatalogEntry.deployment_id)
+            .where(ProviderCatalogEntry.profile_id == profile.id)
+            .order_by(ProviderCatalogEntry.model_id)
+        ).all()
+    models = selectable_catalog_models(profile.provider, entries)
+    form.default_model.choices = [("", "Standardmodell wählen")] + [
+        (model, model) for model, _deployment in models
+    ]
 
 
 def _provider_settings(form: ProviderProfileForm) -> dict[str, object]:
@@ -1101,6 +1172,7 @@ def _connection_context() -> dict[str, object]:
             )
         session.expunge_all()
         return {
+            "cursor_model_id": tenant.custom_model_id,
             "view": ConnectionView(
                 tenant_id=tenant.id,
                 profiles_by_provider=profiles_by_provider,
@@ -1108,22 +1180,15 @@ def _connection_context() -> dict[str, object]:
                 catalogs=catalogs,
                 selectable_models=selectable_models,
                 selectable_model_ids=selectable_model_ids,
-                active_profile_id=tenant.active_profile_id,
-                active_profile_name=next(
-                    (
-                        profile.display_name
-                        for profile in profiles
-                        if profile.id == tenant.active_profile_id
-                    ),
-                    None,
-                ),
-                active_provider=next(
-                    (
-                        profile.provider
-                        for profile in profiles
-                        if profile.id == tenant.active_profile_id
-                    ),
-                    None,
+                routed_profiles=tuple(
+                    sorted(
+                        (
+                            profile
+                            for profile in profiles
+                            if profile.route_priority is not None
+                        ),
+                        key=lambda profile: profile.route_priority,
+                    )
                 ),
             ),
             "logout_form": LoginForm(),

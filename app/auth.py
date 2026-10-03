@@ -11,7 +11,7 @@ from .tenants import (
     AUTH_MODE_SINGLE,
     AUTH_MODE_TENANT,
     TENANT_CONFIG_DATABASE,
-    DatabaseTenantSnapshot,
+    DatabaseTenantRoutingSnapshot,
     TenantConfig,
     resolve_tenant_for_api_key,
 )
@@ -40,7 +40,7 @@ def _bearer_token() -> str | None:
     return token
 
 
-def authenticate_request() -> TenantConfig | DatabaseTenantSnapshot | None:
+def authenticate_request() -> TenantConfig | DatabaseTenantRoutingSnapshot | None:
     """Authenticate the request and return the tenant when in tenant mode.
 
     In single mode returns None after validating SERVICE_API_KEY.
@@ -96,7 +96,7 @@ def require_auth(func):
     return wrapper
 
 
-def current_tenant() -> TenantConfig | DatabaseTenantSnapshot | None:
+def current_tenant() -> TenantConfig | DatabaseTenantRoutingSnapshot | None:
     """Return the authenticated tenant for the current request, if any."""
     return getattr(g, "tenant", None)
 

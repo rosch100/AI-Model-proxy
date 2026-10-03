@@ -96,6 +96,30 @@ passkeys after bootstrap:
    enrollment before any other admin page is reachable.
 4. Afterwards password login is rejected; use „Mit Passkey anmelden“.
 
+### Provider failover order
+
+Run `flask db upgrade` with the migration role before starting the updated app.
+The migration preserves the previous primary profile at priority 1, leaves other
+profiles inactive and removes `Tenant.active_profile_id`. A downgrade is refused
+while any tenant has more than one active profile; deactivate extra candidates
+explicitly before rolling back. Do not run old and new application versions
+concurrently across this schema change.
+
+Under **Verbindung**, load each account's catalog, choose its standard model and
+activate it. Activation appends to the route. **Nach oben / Nach unten** changes
+priority; removal compacts the remaining order. These operations are tenant-bound,
+CSRF-protected and serialized by a tenant row lock. Catalog loss of a selected
+model or an Azure endpoint change removes that account from routing. Scope
+bindings and billing data remain profile-owned and do not change with priority.
+
+The stable Cursor tenant model ID maps to each account's selected standard model;
+there is no automatic matching of similar provider model names. Check that every
+selected model supports the tools and capabilities your Cursor workload needs.
+Root inference switches on HTTP 408/429/5xx and recognized early SSE errors before
+output, not on other 4xx or after partial output. Such failover is best effort and
+can cause additional processing or costs. `/azure` remains pinned to the first
+active Azure profile without cross-provider failover; Codex is not a candidate.
+
 ### Operator recovery (lost last passkey)
 
 There is no self-service or CLI recovery. On the host, delete the account's

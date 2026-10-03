@@ -133,6 +133,20 @@ origins). After the first password bootstrap, admins must enroll a passkey;
 password login is then rejected. See [DEPLOYMENT.md](DEPLOYMENT.md#tenant-admin-ui-database-mode)
 for enrollment and operator recovery if the last passkey is lost.
 
+In **Verbindung**, add provider accounts, refresh their catalogs and select a
+catalog-backed standard model per account. Activate multiple accounts and use
+**Nach oben / Nach unten** to set the root inference failover order. Cursor keeps
+one stable tenant model ID; each profile maps it explicitly to its standard model.
+Unknown model IDs are rejected rather than forwarded unchanged.
+
+Root requests try the next account on HTTP 408/429/5xx, safe connection failures,
+or recognized early SSE errors, but never after stream output begins. Other 4xx
+and ambiguous read failures are final. Switching is best effort and may incur
+additional processing/costs. `/azure` stays pinned to the first active Azure
+account; `/codex` and single/environment-tenant mode keep their existing behavior.
+Run `flask db upgrade` before deploying the new route schema. See the
+[routing decision](docs/adr/0001-azure-rooted-multi-provider-proxy.md).
+
 Generate a tenant cleartext key and hash:
 
 ```bash

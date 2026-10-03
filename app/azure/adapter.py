@@ -15,6 +15,11 @@ from flask import Request, Response
 
 from ..common.logging import console
 from ..common.recording import record_payload
+from ..providers.failover_upstream import (
+    ROUTED_READ_TIMEOUT_SECONDS,
+    prepare_upstream,
+    transport_failure,
+)
 from ..tenants import DatabaseTenantSnapshot
 
 # Local adapters
@@ -84,6 +89,22 @@ class AzureAdapter:
             return self._handle_azure_error(resp, request_kwargs)
 
         return self.response_adapter.adapt(resp, request_context)
+
+    def forward_attempt(
+        self, req: Request, snapshot: DatabaseTenantSnapshot
+    ) -> Response:
+        """Make one routed attempt; do not wait or replay within this provider."""
+        request_kwargs = self.request_adapter.adapt(req, snapshot)
+        request_kwargs["timeout"] = (10.0, ROUTED_READ_TIMEOUT_SECONDS)
+        try:
+            upstream = requests.request(**request_kwargs)
+        except requests.RequestException as exc:
+            raise transport_failure(exc) from exc
+        prepared = prepare_upstream(upstream)
+        # No AzureRequestContext: HTTP/SSE retries belong to the outer router.
+        response = self.response_adapter.adapt(prepared)
+        response.call_on_close(prepared.close)
+        return response
 
     def _request_upstream(
         self, request_context: AzureRequestContext

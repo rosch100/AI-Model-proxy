@@ -27,8 +27,15 @@ def _engine_with_schema(database_url: str, schema: str) -> Engine:
     engine = create_engine(database_url, pool_pre_ping=True)
 
     def set_search_path(dbapi_connection, _connection_record) -> None:
-        with dbapi_connection.cursor() as cursor:
-            cursor.execute(f'SET search_path TO "{schema}"')
+        # SQLAlchemy rolls back on connect/pool return. Persist the session setting
+        # outside a transaction, or the runtime role silently loses its test schema.
+        previous_autocommit = dbapi_connection.autocommit
+        dbapi_connection.autocommit = True
+        try:
+            with dbapi_connection.cursor() as cursor:
+                cursor.execute(f'SET search_path TO "{schema}"')
+        finally:
+            dbapi_connection.autocommit = previous_autocommit
 
     event.listen(engine, "connect", set_search_path)
     return engine

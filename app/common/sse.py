@@ -67,14 +67,19 @@ class SSEDecoder:
         retry: Optional[int] = None
 
         for line in lines:
-            if line.startswith(b"event:"):
-                ev_type = (
-                    line.split(b":", 1)[1]
-                    .strip()
-                    .decode(self.encoding, errors="replace")
-                )
-            else:
-                data_parts.append(line[5:].strip())
+            if line.startswith(b":"):
+                continue
+            name, separator, value = line.partition(b":")
+            if separator and value.startswith(b" "):
+                value = value[1:]
+            if name == b"event":
+                ev_type = value.decode(self.encoding, errors="replace")
+            elif name == b"data":
+                data_parts.append(value)
+            elif name == b"id" and b"\x00" not in value:
+                ev_id = value.decode(self.encoding, errors="replace")
+            elif name == b"retry" and value.isdigit():
+                retry = int(value)
 
         data_text = (
             b"\n".join(data_parts).decode(self.encoding, errors="replace")

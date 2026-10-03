@@ -44,9 +44,22 @@ class ConnectionView:
     catalogs: dict[str, tuple[ProviderCatalogEntry, ...]]
     selectable_models: dict[str, tuple[tuple[str, str | None], ...]]
     selectable_model_ids: dict[str, tuple[str, ...]]
-    active_profile_id: str | None
-    active_profile_name: str | None
-    active_provider: str | None
+    routed_profiles: tuple[ProviderProfile, ...]
+
+    @property
+    def active_profile_id(self) -> str | None:
+        """Expose the primary ID derived from the ordered route."""
+        return self.routed_profiles[0].id if self.routed_profiles else None
+
+    @property
+    def active_profile_name(self) -> str | None:
+        """Expose the primary account name, without a second routing source."""
+        return self.routed_profiles[0].display_name if self.routed_profiles else None
+
+    @property
+    def active_provider(self) -> str | None:
+        """Expose the primary provider derived from the ordered route."""
+        return self.routed_profiles[0].provider if self.routed_profiles else None
 
 
 @dataclass(frozen=True)
@@ -81,19 +94,26 @@ def dashboard_view(
 ) -> DashboardView:
     """Build dashboard status rows without collapsing account identities."""
     profiles_by_provider: dict[str, ProviderProfile] = {}
-    active_provider = None
-    for profile in profiles:
+    active_providers: set[str] = set()
+    visible_profiles = sorted(
+        (profile for profile in profiles if profile.deleted_at is None),
+        key=lambda profile: (
+            profile.route_priority is None,
+            profile.route_priority or 0,
+            profile.id,
+        ),
+    )
+    for profile in visible_profiles:
         profiles_by_provider.setdefault(profile.provider, profile)
-        if profile.id == tenant.active_profile_id:
-            profiles_by_provider[profile.provider] = profile
-            active_provider = profile.provider
+        if profile.route_priority is not None:
+            active_providers.add(profile.provider)
     labels = {"azure": "Azure", "openai": "OpenAI", "openrouter": "OpenRouter"}
     statuses = tuple(
         ProviderStatus(
             provider=name,
             label=labels[name],
             state=provider_state(profiles_by_provider.get(name)),
-            is_active=active_provider == name,
+            is_active=name in active_providers,
         )
         for name in ("azure", "openai", "openrouter")
     )

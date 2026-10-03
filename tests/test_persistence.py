@@ -17,7 +17,7 @@ from sqlalchemy import create_engine, event, select
 from sqlalchemy.orm import Session
 
 from app.persistence.database import Database
-from app.persistence.models import Base, ProviderProfile, Tenant
+from app.persistence.models import Base, ProviderCatalogEntry, ProviderProfile, Tenant
 from app.persistence.repositories import TenantRepository, import_tenants
 from app.persistence.secrets import SecretCipher
 from app.tenants import TenantConfig
@@ -230,7 +230,7 @@ def test_tenant_import_is_idempotent_and_encrypts_provider_credentials():
             select(ProviderProfile).where(ProviderProfile.tenant_id == "acme")
         )
         assert tenant.custom_model_id.startswith("cursor-")
-        assert tenant.active_profile_id == profile.id
+        assert profile.route_priority == 1
         assert profile.default_model == "gpt-5.4"
         assert cipher.decrypt(profile.inference_secret_ciphertext) == "azure-secret"
         assert profile.inference_secret_ciphertext != "azure-secret"
@@ -380,11 +380,12 @@ def test_environment_import_uses_the_active_azure_profile_without_mutating_peers
         )
         session.add_all((active_profile, peer_profile))
         session.flush()
-        tenant.active_profile_id = active_profile.id
+        active_profile.route_priority = 1
         session.flush()
 
         assert import_tenants((source,), session, cipher) == 0
-        assert tenant.active_profile_id == active_profile.id
+        assert active_profile.route_priority == 1
+        assert peer_profile.route_priority is None
         assert active_profile.display_name == "Production"
         assert peer_profile.settings == {"base_url": "https://staging.openai.azure.com"}
         assert peer_profile.default_model == "gpt-5.5"
@@ -447,14 +448,17 @@ def test_proxy_snapshot_freezes_active_profile_identity_and_generation():
                     id="acme",
                     api_key_hash=hashlib.sha256(b"cursor-key").hexdigest(),
                     custom_model_id="cursor-acme",
-                    active_profile_id="profile-a",
                 ),
                 ProviderProfile(
                     id="profile-a",
+                    route_priority=1,
                     tenant_id="acme",
                     provider="azure",
                     display_name="Production",
-                    settings={"base_url": "https://production.example"},
+                    settings={
+                        "base_url": "https://production.openai.azure.com",
+                        "model_deployments": {"gpt-5.4": "production-deployment"},
+                    },
                     default_model="gpt-5.4",
                     history_generation=3,
                     inference_secret_ciphertext=cipher.encrypt("production-key"),
@@ -472,19 +476,32 @@ def test_proxy_snapshot_freezes_active_profile_identity_and_generation():
             )
         )
 
+        session.flush()
+        session.add(
+            ProviderCatalogEntry(
+                profile_id="profile-a",
+                model_id="gpt-5.4",
+                deployment_id="production-deployment",
+                source="provider",
+            )
+        )
+
     with Session(engine) as session:
-        snapshot = TenantRepository(session).get_proxy_snapshot_by_api_key(
+        routing_snapshot = TenantRepository(session).get_proxy_snapshot_by_api_key(
             "cursor-key", cipher
         )
-        assert snapshot is not None
+        assert routing_snapshot is not None
+        assert len(routing_snapshot.profiles) == 1
+        snapshot = routing_snapshot.profiles[0]
         assert snapshot.profile_id == "profile-a"
         assert snapshot.profile_name == "Production"
         assert snapshot.history_generation == 3
         assert snapshot.profile_deleted is False
 
     with Session(engine) as session, session.begin():
-        tenant = session.get(Tenant, "acme")
-        tenant.active_profile_id = "profile-b"
+        session.get(ProviderProfile, "profile-a").route_priority = None
+        session.flush()
+        session.get(ProviderProfile, "profile-b").route_priority = 1
 
     assert snapshot.profile_id == "profile-a"
     assert snapshot.profile_name == "Production"
@@ -509,10 +526,10 @@ def test_proxy_snapshot_distinguishes_missing_profile_and_deleted_tombstone():
                     id="deleted-profile",
                     api_key_hash=hashlib.sha256(b"deleted-profile").hexdigest(),
                     custom_model_id="cursor-deleted",
-                    active_profile_id="profile-deleted",
                 ),
                 ProviderProfile(
                     id="profile-deleted",
+                    route_priority=1,
                     tenant_id="deleted-profile",
                     provider="azure",
                     display_name=None,
@@ -534,12 +551,13 @@ def test_proxy_snapshot_distinguishes_missing_profile_and_deleted_tombstone():
         )
 
     assert no_profile is not None
-    assert no_profile.profile_id is None
-    assert no_profile.provider is None
+    assert no_profile.profiles == ()
     assert deleted is not None
-    assert deleted.profile_id == "profile-deleted"
-    assert deleted.profile_deleted is True
-    assert deleted.history_generation == 4
+    assert deleted.profiles == ()
+    with Session(engine) as session:
+        tombstone = session.get(ProviderProfile, "profile-deleted")
+        assert tombstone.deleted_at is not None
+        assert tombstone.history_generation == 4
     engine.dispose()
 
 

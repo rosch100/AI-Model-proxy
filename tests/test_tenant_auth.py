@@ -14,7 +14,7 @@ from app import create_app
 from app.azure.adapter import AzureAdapter
 from app.exceptions import ServiceConfigurationError
 from app.persistence.database import Database
-from app.persistence.models import Base, ProviderProfile, Tenant
+from app.persistence.models import Base, ProviderCatalogEntry, ProviderProfile, Tenant
 from app.persistence.secrets import SecretCipher
 from app.tenants import TenantConfig, hash_api_key
 
@@ -161,6 +161,8 @@ def test_database_tenant_api_key_authenticates_against_persisted_profile(monkeyp
     with database.sessions.begin() as session:
         profile = ProviderProfile(
             id="profile-persisted",
+            route_priority=1,
+            default_model="gpt-5.4",
             tenant_id="persisted",
             provider="azure",
             settings={
@@ -173,9 +175,17 @@ def test_database_tenant_api_key_authenticates_against_persisted_profile(monkeyp
             id="persisted",
             api_key_hash=hash_api_key(api_key),
             custom_model_id="cursor-persisted-model",
-            active_profile_id=profile.id,
         )
         session.add_all((tenant, profile))
+        session.flush()
+        session.add(
+            ProviderCatalogEntry(
+                profile_id=profile.id,
+                model_id="gpt-5.4",
+                deployment_id="persisted-deployment",
+                source="provider",
+            )
+        )
 
     app = create_app(database_config)
     response = app.test_client().get(
@@ -301,6 +311,7 @@ def test_database_openai_provider_forwards_to_openai_compatible(monkeypatch):
     with database.sessions.begin() as session:
         profile = ProviderProfile(
             id="profile-openai",
+            route_priority=1,
             tenant_id="openai-tenant",
             provider="openai",
             settings={"organization": "", "project": ""},
@@ -311,18 +322,26 @@ def test_database_openai_provider_forwards_to_openai_compatible(monkeypatch):
             id="openai-tenant",
             api_key_hash=hash_api_key(api_key),
             custom_model_id="cursor-openai-model",
-            active_profile_id=profile.id,
         )
         session.add_all((tenant, profile))
+        session.flush()
+        session.add(
+            ProviderCatalogEntry(
+                profile_id=profile.id,
+                model_id="gpt-5.4",
+                source="provider",
+            )
+        )
 
     seen: dict[str, object] = {}
 
-    def fake_forward(req, snapshot):
+    def fake_forward(req, snapshot, *, routed=False):
+        assert routed
         seen["provider"] = snapshot.provider
         seen["default_model"] = snapshot.default_model
         return Response("openai-ok", status=200, mimetype="text/plain")
 
-    monkeypatch.setattr("app.blueprint.forward_openai_compatible", fake_forward)
+    monkeypatch.setattr("app.providers.routing.forward_openai_compatible", fake_forward)
     app = create_app(database_config)
     response = app.test_client().post(
         "/v1/chat/completions",

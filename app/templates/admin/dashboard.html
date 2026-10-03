@@ -26,19 +26,13 @@
           <span class="provider-status-indicator{% if provider.recency == 'live' %} is-live{% elif provider.state == 'Gespeichert' %} is-ready{% elif provider.state == 'Prüfung erforderlich' %} needs-attention{% endif %}" aria-hidden="true"></span>
           <div>
             <strong>{{ provider.label }}</strong>
-            <span>{{ provider.state }}{% if provider.is_active %} · in der Route{% endif %}{% if provider.last_request_label %} · zuletzt {{ provider.last_request_label }}{% else %} · keine Anfrage in 24 h{% endif %}</span>
+            <span>{{ provider.state }}{% if provider.is_active %} · in der Route{% endif %}{% if provider.last_request_label %} · zuletzt {{ provider.last_request_label }}{% if provider.last_request_at %} (<time datetime="{{ provider.last_request_at.isoformat() }}" data-local-time>{{ provider.last_request_at.isoformat() }}</time>){% endif %}{% else %} · keine Anfrage in 24 h{% endif %}</span>
           </div>
         </li>
       {% endfor %}
     </ul>
     <p class="dashboard-model-id">Custom-Model-ID: <code>{{ view.custom_model_id }}</code></p>
   </section>
-
-  {% if view.activity %}
-    {% with activity = view.activity %}
-      {% include "admin/_activity.html" %}
-    {% endwith %}
-  {% endif %}
 
   <section class="dashboard-section" aria-labelledby="accounts-title">
     <div class="section-heading">
@@ -102,7 +96,7 @@
             {% endif %}
 
             {% if account.last_successful_at %}
-              <p class="account-meta">Zeitraum: {{ account.period_start.strftime('%d.%m.%Y') }} – {{ account.period_end.strftime('%d.%m.%Y') }} UTC · aktualisiert {{ account.last_successful_at.strftime('%d.%m.%Y, %H:%M UTC') }}</p>
+              <p class="account-meta">Zeitraum: {{ account.period_start.strftime('%d.%m.%Y') }} – {{ account.period_end.strftime('%d.%m.%Y') }} UTC · aktualisiert <time datetime="{{ account.last_successful_at.isoformat() }}" data-local-time>{{ account.last_successful_at.isoformat() }}</time></p>
             {% elif not account.has_billing_scope %}
               <p class="account-meta">Kein Billing-Scope gebunden.</p>
             {% elif not account.has_billing_key %}
@@ -135,5 +129,11 @@
       </div>
     {% endif %}
   </section>
+
+  {% if view.activity %}
+    {% with activity = view.activity %}
+      {% include "admin/_activity.html" %}
+    {% endwith %}
+  {% endif %}
 </section>
 {% endblock %}

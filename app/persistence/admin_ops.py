@@ -3,9 +3,10 @@
 from __future__ import annotations
 
 import json
+import re
 import secrets
 from datetime import datetime, timezone
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 from sqlalchemy import delete, select
 from sqlalchemy.orm import Session
@@ -609,6 +610,128 @@ def replace_catalog_entries(
         _remove_from_route(
             session, profile, "system:catalog", "default_model_unavailable"
         )
+
+
+def bind_provider_cost_scope(
+    session: Session,
+    tenant_id: str,
+    profile_id: str,
+    provider: str,
+    scope_values: dict[str, str],
+    actor_id: str,
+) -> ProviderScopeBinding:
+    """Bind an exclusively confirmed OpenAI project or OpenRouter workspace."""
+    if provider not in {"openai", "openrouter"}:
+        raise ValueError("Provider billing scope is not configurable here.")
+    tenant = _lock_tenant(session, tenant_id)
+    profile = session.scalar(
+        select(ProviderProfile)
+        .where(
+            ProviderProfile.tenant_id == tenant.id,
+            ProviderProfile.id == profile_id,
+            ProviderProfile.provider == provider,
+            ProviderProfile.deleted_at.is_(None),
+        )
+        .with_for_update()
+    )
+    if profile is None:
+        raise LookupError("Provider account was not found for this tenant.")
+    existing_binding = session.scalar(
+        select(ProviderScopeBinding.id).where(
+            ProviderScopeBinding.tenant_id == tenant.id,
+            ProviderScopeBinding.profile_id == profile.id,
+        )
+    )
+    if existing_binding is not None:
+        raise ValueError("Billing scope is already bound to this account.")
+
+    nodes: list[ProviderScopeNode]
+    if provider == "openai":
+        organization_id = scope_values.get("organization", "").strip()
+        project_id = scope_values.get("project", "").strip()
+        if re.fullmatch(r"org-[A-Za-z0-9_-]+", organization_id) is None:
+            raise ValueError("OpenAI Organization-ID must start with 'org-'.")
+        if re.fullmatch(r"proj_[A-Za-z0-9_-]+", project_id) is None:
+            raise ValueError("OpenAI Project-ID must start with 'proj_'.")
+        organization_node = session.scalar(
+            select(ProviderScopeNode).where(
+                ProviderScopeNode.provider == provider,
+                ProviderScopeNode.scope_type == "organization",
+                ProviderScopeNode.canonical_scope_id == organization_id,
+            )
+        )
+        if organization_node is not None and organization_node.tenant_id != tenant.id:
+            raise ValueError("Provider scope is already bound.")
+        if organization_node is None:
+            organization_node = ProviderScopeNode(
+                id=str(uuid4()),
+                tenant_id=tenant.id,
+                provider=provider,
+                scope_type="organization",
+                canonical_scope_id=organization_id,
+            )
+            nodes = [organization_node]
+        else:
+            nodes = []
+        billing_node = ProviderScopeNode(
+            id=str(uuid4()),
+            tenant_id=tenant.id,
+            provider=provider,
+            scope_type="project",
+            canonical_scope_id=project_id,
+            parent_node_id=organization_node.id,
+        )
+        nodes.append(billing_node)
+    else:
+        try:
+            workspace_id = str(UUID(scope_values.get("workspace", "").strip()))
+        except ValueError as exc:
+            raise ValueError("OpenRouter Workspace-ID must be a UUID.") from exc
+        billing_node = ProviderScopeNode(
+            id=str(uuid4()),
+            tenant_id=tenant.id,
+            provider=provider,
+            scope_type="workspace",
+            canonical_scope_id=workspace_id,
+        )
+        nodes = [billing_node]
+
+    for node in nodes:
+        if (
+            session.scalar(
+                select(ProviderScopeNode.id).where(
+                    ProviderScopeNode.provider == node.provider,
+                    ProviderScopeNode.scope_type == node.scope_type,
+                    ProviderScopeNode.canonical_scope_id == node.canonical_scope_id,
+                )
+            )
+            is not None
+        ):
+            raise ValueError("Provider scope is already bound.")
+    session.add_all(nodes)
+    session.flush()
+    binding = ProviderScopeBinding(
+        id=str(uuid4()),
+        tenant_id=tenant.id,
+        provider=provider,
+        profile_id=profile.id,
+        purpose="billing",
+        node_id=billing_node.id,
+    )
+    session.add_all(
+        (
+            binding,
+            AuditEvent(
+                tenant_id=tenant.id,
+                actor_id=actor_id,
+                target=f"{provider}:profile:{profile.id}:billing-scope",
+                action="billing_scope.bind",
+                outcome="success",
+                details={"provider": provider, "purpose": "billing"},
+            ),
+        )
+    )
+    return binding
 
 
 def bind_azure_cost_scopes(

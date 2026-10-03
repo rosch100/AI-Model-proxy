@@ -7,9 +7,11 @@ from datetime import datetime, timedelta, timezone
 from functools import wraps
 from typing import Callable
 
+from cryptography.exceptions import InvalidTag
 from flask import (
     Blueprint,
     Flask,
+    abort,
     current_app,
     flash,
     g,
@@ -36,6 +38,9 @@ from app.admin.forms import (
     DeactivateProviderForm,
     DeleteProviderForm,
     LoginForm,
+    OpenAIProjectLookupForm,
+    OpenAIScopeForm,
+    OpenRouterScopeForm,
     PasswordChangeForm,
     ProviderProfileForm,
     ReorderProviderForm,
@@ -44,9 +49,9 @@ from app.admin.security import (
     ADMIN_COOKIE_NAME,
     ADMIN_COOKIE_PATH,
     GENERIC_LOGIN_ERROR,
+    SAVED_SECRET_MASK,
     admin_cookie_secure,
     csrf,
-    mask_secret,
     prefers_html,
 )
 from app.admin.view_models import (
@@ -76,6 +81,7 @@ from app.persistence.admin_auth import (
 from app.persistence.admin_ops import (
     activate_provider_profile,
     bind_azure_cost_scopes,
+    bind_provider_cost_scope,
     change_admin_password,
     create_provider_profile,
     deactivate_provider_profile,
@@ -87,7 +93,10 @@ from app.persistence.admin_ops import (
     update_provider_profile,
 )
 from app.persistence.database import Database
-from app.persistence.inference_activity import ACTIVITY_LOOKBACK_HOURS
+from app.persistence.inference_activity import (
+    ACTIVITY_LOOKBACK_HOURS,
+    ACTIVITY_LOOKBACK_OPTIONS,
+)
 from app.persistence.models import (
     AdminAccount,
     AuditEvent,
@@ -123,6 +132,7 @@ from app.providers.cost_jobs import (
     start_cost_refresh,
 )
 from app.providers.costs import CostRefreshError
+from app.providers.openai_admin import OpenAIProjectLookupError, list_openai_projects
 
 admin_bp = Blueprint("admin", __name__, url_prefix="/admin")
 
@@ -459,10 +469,46 @@ def webauthn_register_complete():
     return jsonify({"ok": True, "redirect": redirect_to})
 
 
+def _activity_period_hours() -> int:
+    """Validate the requested activity period against the visible UI options."""
+    raw_period = request.args.get("activity_hours")
+    if raw_period is None:
+        return ACTIVITY_LOOKBACK_HOURS
+    try:
+        period = int(raw_period)
+    except ValueError:
+        abort(400)
+    if period not in {hours for hours, _label in ACTIVITY_LOOKBACK_OPTIONS}:
+        abort(400)
+    return period
+
+
+def _activity_events(
+    session, tenant_id: str, lookback_hours: int, *, limit: int | None = None
+):
+    """Load recent tenant activity, optionally limiting the display list."""
+    lookback_start = datetime.now(timezone.utc) - timedelta(hours=lookback_hours)
+    statement = (
+        select(InferenceActivityEvent)
+        .where(
+            InferenceActivityEvent.tenant_id == tenant_id,
+            InferenceActivityEvent.occurred_at >= lookback_start,
+        )
+        .order_by(
+            InferenceActivityEvent.occurred_at.desc(),
+            InferenceActivityEvent.id.desc(),
+        )
+    )
+    if limit is not None:
+        statement = statement.limit(limit)
+    return tuple(session.scalars(statement))
+
+
 @admin_bp.get("/")
 @login_required
 def dashboard():
     """Show provider status and the latest successful cost snapshot per account."""
+    activity_hours = _activity_period_hours()
     database = _database()
     with database.sessions() as session:
         tenant = session.get(Tenant, g.admin.tenant_id)
@@ -568,30 +614,26 @@ def dashboard():
                 .order_by(CostUsageRecord.id)
             )
         )
-        lookback_start = datetime.now(timezone.utc) - timedelta(
-            hours=ACTIVITY_LOOKBACK_HOURS
-        )
-        activity_events = tuple(
-            session.scalars(
-                select(InferenceActivityEvent)
-                .where(
-                    InferenceActivityEvent.tenant_id == tenant.id,
-                    InferenceActivityEvent.occurred_at >= lookback_start,
-                )
-                .order_by(
-                    InferenceActivityEvent.occurred_at.desc(),
-                    InferenceActivityEvent.id.desc(),
-                )
-            )
+        activity_events = _activity_events(session, tenant.id, ACTIVITY_LOOKBACK_HOURS)
+        request_events = _activity_events(
+            session, tenant.id, activity_hours, limit=1000
         )
         view = dashboard_view(
-            tenant, profiles, bindings, jobs, records, activity_events
+            tenant,
+            profiles,
+            bindings,
+            jobs,
+            records,
+            activity_events,
+            request_events=request_events,
+            request_period_hours=activity_hours,
         )
         session.expunge_all()
     return render_template(
         "admin/dashboard.html",
         view=view,
         logout_form=LoginForm(),
+        activity_period_options=ACTIVITY_LOOKBACK_OPTIONS,
     )
 
 
@@ -599,30 +641,26 @@ def dashboard():
 @login_required
 def dashboard_activity():
     """Return the live activity fragment for HTMX polling."""
+    activity_hours = _activity_period_hours()
     database = _database()
     with database.sessions() as session:
         tenant = session.get(Tenant, g.admin.tenant_id)
-        lookback_start = datetime.now(timezone.utc) - timedelta(
-            hours=ACTIVITY_LOOKBACK_HOURS
-        )
-        activity_events = tuple(
-            session.scalars(
-                select(InferenceActivityEvent)
-                .where(
-                    InferenceActivityEvent.tenant_id == tenant.id,
-                    InferenceActivityEvent.occurred_at >= lookback_start,
-                )
-                .order_by(
-                    InferenceActivityEvent.occurred_at.desc(),
-                    InferenceActivityEvent.id.desc(),
-                )
-            )
+        activity_events = _activity_events(session, tenant.id, ACTIVITY_LOOKBACK_HOURS)
+        request_events = _activity_events(
+            session, tenant.id, activity_hours, limit=1000
         )
         activity = activity_board(
-            activity_events, custom_model_id=tenant.custom_model_id
+            activity_events,
+            custom_model_id=tenant.custom_model_id,
+            request_events=request_events,
+            request_period_hours=activity_hours,
         )
         session.expunge_all()
-    return render_template("admin/_activity.html", activity=activity)
+    return render_template(
+        "admin/_activity.html",
+        activity=activity,
+        activity_period_options=ACTIVITY_LOOKBACK_OPTIONS,
+    )
 
 
 @admin_bp.get("/settings/general")
@@ -712,6 +750,7 @@ def edit_connection_form(profile_id: str):
         )
         session.expunge(profile)
     form = _profile_form(profile, catalog_rows)
+    _set_profile_secret_display(form, profile)
     return render_template(
         "admin/settings/profile_form.html",
         form=form,
@@ -727,6 +766,7 @@ def create_connection():
     form = ProviderProfileForm()
     _set_profile_form_choices(form)
     if not form.validate_on_submit():
+        form.api_key.data = ""
         flash("Accountdaten sind unvollständig.", "error")
         return (
             render_template(
@@ -753,6 +793,7 @@ def create_connection():
                 g.admin.username,
             )
     except (LookupError, ValueError, IntegrityError):
+        form.api_key.data = ""
         flash("Account konnte nicht angelegt werden. Name und Angaben prüfen.", "error")
         return (
             render_template(
@@ -794,6 +835,7 @@ def update_connection(profile_id: str):
     _set_profile_form_choices(form, provider=profile.provider)
     _set_default_model_choices(form, profile, catalog_rows)
     if not form.validate_on_submit() or form.provider.data != profile.provider:
+        _set_profile_secret_display(form, profile)
         flash("Accountdaten sind ungültig.", "error")
         return (
             render_template(
@@ -814,10 +856,15 @@ def update_connection(profile_id: str):
                 form.display_name.data or "",
                 _provider_settings(form),
                 form.default_model.data or "",
-                form.api_key.data or None,
+                (
+                    form.api_key.data
+                    if form.api_key.data and form.api_key.data != SAVED_SECRET_MASK
+                    else None
+                ),
                 g.admin.username,
             )
     except (LookupError, ValueError, IntegrityError):
+        _set_profile_secret_display(form, profile)
         flash(
             "Account konnte nicht gespeichert werden. Name und Angaben prüfen.", "error"
         )
@@ -1093,26 +1140,172 @@ def save_azure_cost_scopes():
 @admin_bp.post("/settings/costs/billing")
 @login_required
 def save_billing():
-    """Store billing credentials for one account."""
+    """Store new billing credentials without replacing an existing masked key."""
     form = BillingCredentialsForm()
-    if not form.validate_on_submit() or not form.billing_secret.data:
-        flash("Billing-Schlüssel fehlt.", "error")
+    if not form.validate_on_submit():
+        flash("Billing-Angaben sind ungültig.", "error")
         return redirect(url_for("admin.settings_costs"))
     database = _database()
+    secret = form.billing_secret.data
+    if secret == SAVED_SECRET_MASK:
+        secret = ""
     try:
         with database.sessions.begin() as session:
-            save_billing_secret(
-                session,
-                database.secret_cipher,
-                g.admin.tenant_id,
-                form.profile_id.data or "",
-                form.billing_secret.data,
-                g.admin.username,
+            profile = session.scalar(
+                select(ProviderProfile).where(
+                    ProviderProfile.tenant_id == g.admin.tenant_id,
+                    ProviderProfile.id == (form.profile_id.data or ""),
+                    ProviderProfile.deleted_at.is_(None),
+                )
             )
+            if profile is None:
+                raise LookupError("Provider account was not found")
+            if secret:
+                save_billing_secret(
+                    session,
+                    database.secret_cipher,
+                    g.admin.tenant_id,
+                    profile.id,
+                    secret,
+                    g.admin.username,
+                )
+            elif not profile.billing_secret_ciphertext:
+                flash("Billing-Schlüssel fehlt.", "error")
+                return redirect(url_for("admin.settings_costs"))
     except (LookupError, ValueError) as exc:
         flash(str(exc), "error")
         return redirect(url_for("admin.settings_costs"))
-    flash("Billing-Schlüssel gespeichert.", "info")
+    flash(
+        (
+            "Billing-Schlüssel gespeichert."
+            if secret
+            else "Gespeicherter Billing-Schlüssel beibehalten."
+        ),
+        "info",
+    )
+    return redirect(url_for("admin.settings_costs"))
+
+
+@admin_bp.post("/settings/costs/openai-projects")
+@login_required
+def load_openai_projects():
+    """Load OpenAI projects server-side using the stored Admin API key."""
+    form = OpenAIProjectLookupForm()
+    if not form.validate_on_submit():
+        flash(
+            "OpenAI-Projektliste konnte nicht geladen werden: ungültige Anfrage.",
+            "error",
+        )
+        return redirect(url_for("admin.settings_costs"))
+    database = _database()
+    with database.sessions() as session:
+        profile = session.scalar(
+            select(ProviderProfile).where(
+                ProviderProfile.tenant_id == g.admin.tenant_id,
+                ProviderProfile.id == (form.profile_id.data or ""),
+                ProviderProfile.provider == "openai",
+                ProviderProfile.deleted_at.is_(None),
+            )
+        )
+        if profile is None:
+            flash("OpenAI-Account wurde nicht gefunden.", "error")
+            return redirect(url_for("admin.settings_costs"))
+        if not profile.billing_secret_ciphertext:
+            flash("Speichere zuerst den OpenAI Admin API Key.", "error")
+            return redirect(url_for("admin.settings_costs"))
+        try:
+            api_key = database.secret_cipher.decrypt(profile.billing_secret_ciphertext)
+        except (InvalidTag, ValueError, UnicodeDecodeError):
+            flash("Der gespeicherte OpenAI Admin API Key ist nicht lesbar.", "error")
+            return redirect(url_for("admin.settings_costs"))
+        profile_id = profile.id
+    organization_id = form.organization_id.data or ""
+    try:
+        projects = list_openai_projects(api_key, organization_id)
+    except OpenAIProjectLookupError as exc:
+        flash(str(exc), "error")
+        return (
+            render_template(
+                "admin/settings/costs.html",
+                **_costs_context(
+                    openai_scope_form_profile_id=profile_id,
+                    openai_organization_id=organization_id,
+                ),
+            ),
+            400,
+        )
+    if not projects:
+        flash("Die OpenAI-Organisation enthält keine aktiven Projekte.", "error")
+        return (
+            render_template(
+                "admin/settings/costs.html",
+                **_costs_context(
+                    openai_scope_form_profile_id=profile_id,
+                    openai_organization_id=organization_id,
+                ),
+            ),
+            400,
+        )
+    return render_template(
+        "admin/settings/costs.html",
+        **_costs_context(
+            openai_projects={profile_id: projects},
+            openai_scope_form_profile_id=profile_id,
+            openai_organization_id=form.organization_id.data or "",
+        ),
+    )
+
+
+@admin_bp.post("/settings/costs/openai-scope")
+@login_required
+def save_openai_cost_scope():
+    """Bind an OpenAI organization and project from the tenant admin page."""
+    form = OpenAIScopeForm()
+    if not form.validate_on_submit():
+        flash("OpenAI-Scope-Angaben sind ungültig oder unvollständig.", "error")
+        return redirect(url_for("admin.settings_costs"))
+    try:
+        with _database().sessions.begin() as session:
+            bind_provider_cost_scope(
+                session,
+                g.admin.tenant_id,
+                form.profile_id.data or "",
+                "openai",
+                {
+                    "organization": form.organization_id.data or "",
+                    "project": form.project_id.data or "",
+                },
+                g.admin.username,
+            )
+    except (LookupError, ValueError, IntegrityError) as exc:
+        flash(f"OpenAI-Scope konnte nicht gespeichert werden: {exc}", "error")
+        return redirect(url_for("admin.settings_costs"))
+    flash("OpenAI Organization- und Project-Scope wurden gespeichert.", "info")
+    return redirect(url_for("admin.settings_costs"))
+
+
+@admin_bp.post("/settings/costs/openrouter-scope")
+@login_required
+def save_openrouter_cost_scope():
+    """Bind an OpenRouter workspace from the tenant admin page."""
+    form = OpenRouterScopeForm()
+    if not form.validate_on_submit():
+        flash("OpenRouter-Scope-Angaben sind ungültig oder unvollständig.", "error")
+        return redirect(url_for("admin.settings_costs"))
+    try:
+        with _database().sessions.begin() as session:
+            bind_provider_cost_scope(
+                session,
+                g.admin.tenant_id,
+                form.profile_id.data or "",
+                "openrouter",
+                {"workspace": form.workspace_id.data or ""},
+                g.admin.username,
+            )
+    except (LookupError, ValueError, IntegrityError) as exc:
+        flash(f"OpenRouter-Scope konnte nicht gespeichert werden: {exc}", "error")
+        return redirect(url_for("admin.settings_costs"))
+    flash("OpenRouter-Workspace wurde gespeichert.", "info")
     return redirect(url_for("admin.settings_costs"))
 
 
@@ -1285,6 +1478,13 @@ def _load_tenant_profiles() -> tuple[Tenant, tuple[ProviderProfile, ...]]:
         return tenant, profiles
 
 
+def _set_profile_secret_display(
+    form: ProviderProfileForm, profile: ProviderProfile
+) -> None:
+    """Render an existing inference secret only as a non-secret sentinel."""
+    form.api_key.data = SAVED_SECRET_MASK if profile.inference_secret_ciphertext else ""
+
+
 def _set_profile_form_choices(
     form: ProviderProfileForm, provider: str | None = None
 ) -> None:
@@ -1424,8 +1624,12 @@ def _connection_context() -> dict[str, object]:
 def _costs_context(
     azure_scope_form: AzureScopeForm | None = None,
     azure_scope_form_profile_id: str | None = None,
+    openai_projects: dict[str, list[tuple[str, str]]] | None = None,
+    openai_scope_form_profile_id: str | None = None,
+    openai_organization_id: str = "",
 ) -> dict[str, object]:
     database = _database()
+    openai_projects = openai_projects or {}
     with database.sessions() as session:
         profiles = tuple(
             session.scalars(
@@ -1439,9 +1643,7 @@ def _costs_context(
         )
         billing_key_masks = {
             profile.id: (
-                mask_secret(
-                    database.secret_cipher.decrypt(profile.billing_secret_ciphertext)
-                )
+                SAVED_SECRET_MASK
                 if profile.provider in {"openai", "openrouter"}
                 and profile.billing_secret_ciphertext
                 else None
@@ -1486,6 +1688,18 @@ def _costs_context(
             binding.id: profile.display_name or profile.provider
             for profile, binding, _node in bindings
         }
+        openai_organization_ids = {}
+        for profile, binding, node in bindings:
+            if (
+                binding.provider == "openai"
+                and binding.purpose == "billing"
+                and node.parent_node_id is not None
+            ):
+                organization_node = session.get(ProviderScopeNode, node.parent_node_id)
+                if organization_node is not None:
+                    openai_organization_ids[profile.id] = (
+                        organization_node.canonical_scope_id
+                    )
         azure_bindings: dict[
             str, dict[str, tuple[ProviderScopeBinding, ProviderScopeNode]]
         ] = {}
@@ -1506,6 +1720,9 @@ def _costs_context(
             == profile_bindings["billing"][0].node_id
         )
         azure_scope_bound_profile_ids = frozenset(azure_bindings)
+        scope_bound_profile_ids = frozenset(
+            binding.profile_id for _profile, binding, _node in bindings
+        )
         session.expunge_all()
         return {
             "view": CostsView(
@@ -1519,7 +1736,16 @@ def _costs_context(
                 azure_costs_ready_profile_ids=azure_costs_ready_profile_ids,
                 azure_scope_bound_profile_ids=azure_scope_bound_profile_ids,
             ),
-            "billing_form": BillingCredentialsForm(),
+            "billing_forms": {
+                profile.id: BillingCredentialsForm(
+                    profile_id=profile.id,
+                    billing_secret=(
+                        SAVED_SECRET_MASK if billing_key_masks[profile.id] else ""
+                    ),
+                )
+                for profile in profiles
+                if profile.provider in {"openai", "openrouter"}
+            },
             "azure_scope_forms": {
                 profile.id: (
                     azure_scope_form
@@ -1531,6 +1757,29 @@ def _costs_context(
                 if profile.provider == "azure"
                 and profile.id not in azure_scope_bound_profile_ids
             },
+            "openai_scope_forms": {
+                profile.id: OpenAIScopeForm(
+                    profile_id=profile.id,
+                    organization_id=(
+                        openai_organization_id
+                        if profile.id == openai_scope_form_profile_id
+                        else str(profile.settings.get("organization", ""))
+                    ),
+                    project_id=str(profile.settings.get("project", "")),
+                )
+                for profile in profiles
+                if profile.provider == "openai"
+                and profile.id not in scope_bound_profile_ids
+            },
+            "openrouter_scope_forms": {
+                profile.id: OpenRouterScopeForm(profile_id=profile.id)
+                for profile in profiles
+                if profile.provider == "openrouter"
+                and profile.id not in scope_bound_profile_ids
+            },
+            "scope_bound_profile_ids": scope_bound_profile_ids,
+            "openai_organization_ids": openai_organization_ids,
+            "openai_projects": openai_projects,
             "logout_form": LoginForm(),
         }
 

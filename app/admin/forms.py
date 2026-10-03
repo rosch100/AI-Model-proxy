@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from flask_wtf import FlaskForm
 from wtforms import BooleanField, PasswordField, SelectField, StringField
-from wtforms.validators import DataRequired, Length, Optional, ValidationError
+from wtforms.validators import DataRequired, Length, Optional, Regexp, ValidationError
 from wtforms.widgets import PasswordInput
 
 from app.providers.azure_url import validate_azure_base_url
@@ -109,7 +109,7 @@ class ProviderProfileForm(FlaskForm):
         validate_choice=True,
         render_kw={"size": 8},
     )
-    api_key = PasswordField("Inference-Schlüssel", validators=[Optional()])
+    api_key = RevealablePasswordField("Inference-Schlüssel", validators=[Optional()])
     organization = StringField("Organisation (optional)", validators=[Optional()])
     project = StringField("Projekt (optional)", validators=[Optional()])
 
@@ -152,7 +152,54 @@ class BillingCredentialsForm(FlaskForm):
     """Profile-scoped optional billing credentials for cost refresh."""
 
     profile_id = StringField(validators=[DataRequired(), Length(max=36)])
-    billing_secret = PasswordField("Billing-Schlüssel *", validators=[Optional()])
+    billing_secret = RevealablePasswordField(
+        "Billing-Schlüssel *", validators=[Optional()]
+    )
+
+
+class OpenAIScopeForm(FlaskForm):
+    """Tenant-admin configuration for one OpenAI organization and project."""
+
+    profile_id = StringField(validators=[DataRequired(), Length(max=36)])
+    organization_id = StringField(
+        "OpenAI Organization-ID *",
+        validators=[DataRequired(), Length(max=128), Regexp(r"^org-[A-Za-z0-9_-]+$")],
+    )
+    project_id = StringField(
+        "OpenAI Project-ID *",
+        validators=[DataRequired(), Length(max=128), Regexp(r"^proj_[A-Za-z0-9_-]+$")],
+    )
+    exclusive_scope_confirmation = BooleanField(
+        "Organisation und Projekt sind ausschließlich diesem Tenant zugeordnet.",
+        validators=[
+            DataRequired(message="Die exklusive Scope-Zuordnung muss bestätigt werden.")
+        ],
+    )
+
+
+class OpenAIProjectLookupForm(FlaskForm):
+    """Request the active projects visible to one saved OpenAI Admin key."""
+
+    profile_id = StringField(validators=[DataRequired(), Length(max=36)])
+    organization_id = StringField(
+        "OpenAI Organization-ID *",
+        validators=[DataRequired(), Length(max=128), Regexp(r"^org-[A-Za-z0-9_-]+$")],
+    )
+
+
+class OpenRouterScopeForm(FlaskForm):
+    """Tenant-admin configuration for one OpenRouter workspace."""
+
+    profile_id = StringField(validators=[DataRequired(), Length(max=36)])
+    workspace_id = StringField(
+        "OpenRouter Workspace-ID *", validators=[DataRequired(), Length(max=36)]
+    )
+    exclusive_scope_confirmation = BooleanField(
+        "Der Workspace ist ausschließlich diesem Tenant zugeordnet.",
+        validators=[
+            DataRequired(message="Die exklusive Scope-Zuordnung muss bestätigt werden.")
+        ],
+    )
 
 
 class AzureScopeForm(FlaskForm):

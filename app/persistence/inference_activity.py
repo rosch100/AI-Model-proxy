@@ -13,6 +13,13 @@ from app.persistence.models import InferenceActivityEvent
 
 ACTIVITY_WINDOW_MINUTES = 15
 ACTIVITY_LOOKBACK_HOURS = 24
+ACTIVITY_LOOKBACK_OPTIONS = (
+    (1, "Letzte Stunde"),
+    (6, "Letzte 6 Stunden"),
+    (24, "Letzte 24 Stunden"),
+    (168, "Letzte 7 Tage"),
+    (720, "Letzte 30 Tage"),
+)
 
 
 @dataclass(frozen=True)

@@ -43,6 +43,16 @@ def forward_openai_compatible(
     inbound_model = payload.get("model")
     if inbound_model == snapshot.custom_model_id or not inbound_model:
         payload = {**payload, "model": snapshot.default_model}
+    tools = payload.get("tools")
+    if (
+        snapshot.provider == "openai"
+        and payload.get("model") == "gpt-6-luna"
+        and isinstance(tools, list)
+        and any(
+            isinstance(tool, dict) and tool.get("type") == "function" for tool in tools
+        )
+    ):
+        payload["reasoning_effort"] = "none"
     payload["stream"] = True
     origin = openai_compatible_base_url(snapshot.provider or "")
     headers = {

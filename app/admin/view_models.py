@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from app.persistence.models import (
     CostRefreshJob,
@@ -27,11 +27,14 @@ class ProviderStatus:
 
 @dataclass(frozen=True)
 class DashboardView:
-    """Aggregated tenant status shown on the admin home page."""
+    """Aggregated tenant status and cost preview shown on the home page."""
 
     tenant_id: str
     custom_model_id: str
     providers: tuple[ProviderStatus, ...]
+    cost_record_counts: dict[str, int] = field(default_factory=dict)
+    cost_records: tuple[CostUsageRecord, ...] = ()
+    cost_record_profile_names: dict[str, str] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -63,6 +66,7 @@ class CostsView:
     records: tuple[CostUsageRecord, ...]
     billing_key_masks: dict[str, str | None]
     azure_costs_ready_profile_ids: frozenset[str]
+    azure_scope_bound_profile_ids: frozenset[str]
 
 
 def provider_state(profile: ProviderProfile | None) -> str:

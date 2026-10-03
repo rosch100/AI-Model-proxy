@@ -5,12 +5,54 @@
 <section>
   <h1>Kosten</h1>
   <p class="lede">Abrechnungs- und Nutzungsdaten hängen von den Rechten und Filtermöglichkeiten des jeweiligen Anbieter-Endpunkts ab. Jeder Refresh bleibt dem ausgewählten Account und dessen operatorseitig gebundenem Scope zugeordnet.</p>
-  <p>Billing-Zugangsdaten sind vom Inference-Schlüssel getrennt. Tenant-eigene Scope-IDs werden hier nur angezeigt; ihre Bindung erfolgt ausschließlich operatorseitig.</p>
+  <p>Billing-Zugangsdaten sind vom Inference-Schlüssel getrennt. Azure verwendet die Hostidentität des Proxys; es werden keine Azure-Client-Secrets erfasst.</p>
+
+  <h2>Kosten- und Nutzungsarten</h2>
+  <dl class="cost-summary" aria-label="Verfügbare Kosten- und Nutzungswerte">
+    <div><dt>Tatsächliche Kosten</dt><dd>Provider-abgerechnete Kosten je verfügbarer Währung und Zeitbucket</dd><dd>{% if view.records|selectattr("kind", "equalto", "actual")|list %}{{ view.records|selectattr("kind", "equalto", "actual")|list|length }} Datensätze insgesamt{% else %}Noch keine Datensätze{% endif %}</dd></div>
+    <div><dt>Verbrauch</dt><dd>Provider-gemeldete Token- oder Ressourcenmetriken ohne erfundene Kostenumrechnung</dd><dd>{% if view.records|selectattr("kind", "equalto", "usage")|list %}{{ view.records|selectattr("kind", "equalto", "usage")|list|length }} Datensätze insgesamt{% else %}Noch keine Datensätze{% endif %}</dd></div>
+    <div><dt>Schätzungen</dt><dd>Nur mit belegter Preisquelle, Version, Modell und passender Usage-Grundlage</dd><dd>{% if view.records|selectattr("kind", "equalto", "estimate")|list %}{{ view.records|selectattr("kind", "equalto", "estimate")|list|length }} Datensätze insgesamt{% else %}Noch keine Datensätze{% endif %}</dd></div>
+  </dl>
   <ul>
     <li><strong>OpenAI:</strong> Admin API Key mit Organisationsrechten. Kosten und Input-/Output-Tokens werden auf das gebundene Projekt gefiltert.</li>
     <li><strong>OpenRouter:</strong> Management Key. Die Activity-API liefert OpenRouter- und BYOK-Kosten sowie Tokenverbrauch der letzten 30 abgeschlossenen UTC-Tage; die operatorseitige Billing-Bindung muss die Workspace-ID dieses Kontos enthalten und sie wird als Filter verwendet.</li>
     <li><strong>Azure-Hostidentität:</strong> Es wird keine Tenant-Credential eingegeben. Der Proxy verwendet seine operatorseitig konfigurierte Managed Identity (einschließlich User-assigned Managed Identity) auf Azure oder Workload Identity bzw. Zertifikatsidentität außerhalb Azure. Die gebundene Resource Group benötigt Cost Management Reader; die gebundene Cognitive-Services-Ressource benötigt Monitoring Reader für separat abgefragte Usage-Metriken.</li>
   </ul>
+
+  <h2>Azure-Billing konfigurieren</h2>
+  {% set azure_profiles = view.profiles|selectattr("provider", "equalto", "azure")|list %}
+  {% if azure_profiles %}
+    {% for profile in azure_profiles %}
+      <article class="cost-account">
+        <h3>{{ profile.display_name }} (Azure)</h3>
+        <p class="hint">Die Resource Group ist der Billing-Scope, die darin liegende Cognitive-Services-Ressource der Usage-Scope. Beide müssen ausschließlich diesem Tenant zugeordnet sein. Die Azure-Hostidentität benötigt Cost Management Reader auf der Gruppe und Monitoring Reader auf der Ressource.</p>
+        {% if profile.id in view.azure_scope_bound_profile_ids %}
+          <p>Azure-Scopes sind unveränderlich gebunden. Die gespeicherten Resource-Group- und Usage-ARM-IDs sind unten unter „Gebundene Scopes“ sichtbar.</p>
+        {% else %}
+          {% set scope_form = azure_scope_forms[profile.id] %}
+          <form method="post" action="{{ url_for('admin.save_azure_cost_scopes') }}" class="stack">
+            {{ scope_form.csrf_token }}
+            <input type="hidden" name="profile_id" value="{{ profile.id }}" />
+            <label for="azure-subscription-{{ profile.id }}">{{ scope_form.subscription_id.label.text }}
+              {{ scope_form.subscription_id(id="azure-subscription-" ~ profile.id, placeholder="00000000-0000-0000-0000-000000000000", autocomplete="off", aria_describedby="azure-scope-hint-" ~ profile.id) }}
+            </label>
+            {% if scope_form.errors %}<ul class="error-text">{% for field_errors in scope_form.errors.values() %}{% for error in field_errors %}<li>{{ error }}</li>{% endfor %}{% endfor %}</ul>{% endif %}
+            <label for="azure-resource-group-{{ profile.id }}">{{ scope_form.resource_group_arm_id.label.text }}
+              {{ scope_form.resource_group_arm_id(id="azure-resource-group-" ~ profile.id, placeholder="/subscriptions/<subscription-id>/resourceGroups/<resource-group>", autocomplete="off", aria_describedby="azure-scope-hint-" ~ profile.id) }}
+            </label>
+            <label for="azure-cognitive-resource-{{ profile.id }}">{{ scope_form.cognitive_resource_arm_id.label.text }}
+              {{ scope_form.cognitive_resource_arm_id(id="azure-cognitive-resource-" ~ profile.id, placeholder="/subscriptions/<id>/resourceGroups/<group>/providers/Microsoft.CognitiveServices/accounts/<account>", autocomplete="off", aria_describedby="azure-scope-hint-" ~ profile.id) }}
+            </label>
+            <label class="reveal-toggle">{{ scope_form.exclusive_scope_confirmation() }}{{ scope_form.exclusive_scope_confirmation.label.text }}</label>
+            <p id="azure-scope-hint-{{ profile.id }}" class="hint">ARM-IDs werden vor dem Speichern validiert; die Ressource muss in exakt dieser Subscription und Resource Group liegen. Eine spätere Änderung ist wegen unveränderlicher Scope-Attribution nicht möglich.</p>
+            <button type="submit">Azure Billing-Scope speichern</button>
+          </form>
+        {% endif %}
+      </article>
+    {% endfor %}
+  {% else %}
+    <p>Für Azure-Kostendaten zuerst einen Azure-Account unter <a href="{{ url_for('admin.settings_connection') }}">Verbindung</a> anlegen.</p>
+  {% endif %}
 
   <h2>Gebundene Scopes</h2>
   {% if view.bindings %}
@@ -20,7 +62,7 @@
       {% endfor %}
     </ul>
   {% else %}
-    <p>Kein Billing- oder Usage-Scope gebunden.</p>
+    <p>Kein Billing- oder Usage-Scope gebunden. Azure-Scopes können oben im Formular erfasst werden; OpenAI- und OpenRouter-Scopes benötigen eine operatorseitige Bindung.</p>
   {% endif %}
 
   <h2>Accounts</h2>
@@ -81,13 +123,27 @@
       {% endfor %}
     </ul>
   {% endif %}
-  {% if view.records %}
-    <h2>Datensätze</h2>
-    <ul>
-      {% for record in view.records %}
-        <li>{{ view.binding_profile_names.get(record.binding_id, record.provider) }} {{ record.kind }} {{ record.metric }}: {{ record.value }} {{ record.unit }}</li>
-      {% endfor %}
-    </ul>
-  {% endif %}
+  <h2>Kosten- und Verbrauchsdaten</h2>
+  <div class="table-scroll">
+    <table class="cost-records">
+      <caption>Provider-Datensätze, Buckets und Datenherkunft</caption>
+      <thead><tr><th scope="col">Account</th><th scope="col">Art / Metrik</th><th scope="col">Wert</th><th scope="col">Zeitraum (UTC)</th><th scope="col">Granularität</th><th scope="col">Quelle</th><th scope="col">Einschränkungen</th></tr></thead>
+      <tbody>
+        {% for record in view.records %}
+          <tr>
+            <td>{{ view.binding_profile_names.get(record.binding_id, record.provider) }}</td>
+            <td>{{ record.kind }} / {{ record.metric }}</td>
+            <td>{{ record.value }}{% if record.currency %} {{ record.currency }}{% else %} {{ record.unit }}{% endif %}</td>
+            <td>{{ record.bucket_start.strftime("%Y-%m-%d %H:%M") }} – {{ record.bucket_end.strftime("%Y-%m-%d %H:%M") }}</td>
+            <td>{{ record.granularity }}</td>
+            <td>{{ record.source }}</td>
+            <td>{{ record.dimensions.get("limitation", "—") }}</td>
+          </tr>
+        {% else %}
+          <tr><td colspan="7">Noch keine Datensätze. Nach dem ersten erfolgreichen Abruf erscheinen hier nur durch den Provider belegte Werte.</td></tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
 </section>
 {% endblock %}

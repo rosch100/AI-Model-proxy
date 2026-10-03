@@ -141,7 +141,7 @@ def test_route_downgrade_fails_before_schema_changes_when_multiple_profiles_are_
             connection.execute(
                 text("SELECT version_num FROM alembic_version")
             ).scalar_one()
-            == "20261005_provider_route"
+            == "20261006_inference_activity"
         )
 
 

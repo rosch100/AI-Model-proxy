@@ -16,6 +16,10 @@ from flask import Response, jsonify
 from urllib3.exceptions import MaxRetryError, NewConnectionError
 
 from app.common.sse import SSEDecoder, SSEEvent
+from app.persistence.inference_activity import (
+    parse_provider_usage,
+    record_inference_activity,
+)
 
 MAX_PREFLIGHT_BYTES = 65536
 MAX_PREFLIGHT_EVENTS = 32
@@ -319,9 +323,19 @@ def prepare_upstream(upstream: Any) -> PreparedUpstream:
     return PreparedUpstream(upstream, chain(buffered, reader.rest()), reader)
 
 
-def chat_stream(upstream: PreparedUpstream, model: str) -> Iterator[bytes]:
+def chat_stream(
+    upstream: PreparedUpstream,
+    model: str,
+    *,
+    activity_tenant_id: str | None = None,
+    activity_provider: str | None = None,
+    activity_profile_id: str | None = None,
+    inbound_model: object = None,
+    routed_model: object = None,
+) -> Iterator[bytes]:
     """Restore logical model identity while preserving choices and tool-call IDs."""
     decoder = SSEDecoder()
+    usage = None
     try:
         for chunk in upstream.iter_content():
             # Clear the recording buffer: this decoder is not a traffic recorder.
@@ -340,8 +354,12 @@ def chat_stream(upstream: PreparedUpstream, model: str) -> Iterator[bytes]:
                         b'"message":"Provider sent invalid SSE JSON."}}\n\n'
                     )
                     return
-                if isinstance(data, dict) and "model" in data:
-                    data = {**data, "model": model}
+                if isinstance(data, dict):
+                    parsed_usage = parse_provider_usage(data.get("usage"))
+                    if parsed_usage is not None:
+                        usage = parsed_usage
+                    if "model" in data:
+                        data = {**data, "model": model}
                 yield (
                     "data: "
                     + json.dumps(data, separators=(",", ":"), ensure_ascii=False)
@@ -353,4 +371,13 @@ def chat_stream(upstream: PreparedUpstream, model: str) -> Iterator[bytes]:
             b'"message":"Provider stream interrupted; not replayed."}}\n\n'
         )
     finally:
+        if activity_tenant_id is not None:
+            record_inference_activity(
+                tenant_id=activity_tenant_id,
+                provider=activity_provider,
+                profile_id=activity_profile_id,
+                inbound_model=inbound_model,
+                routed_model=routed_model,
+                usage=usage,
+            )
         upstream.close()

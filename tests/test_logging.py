@@ -3,7 +3,9 @@
 See: http://webtest.readthedocs.org/
 """
 
-from app.common.logging import redact_headers
+from flask import request
+
+from app.common.logging import log_inbound_model, redact_headers
 
 from .replay_base import ReplyBase
 
@@ -40,6 +42,32 @@ def test_redact_headers():
         "api-key": "",
         "api_key": "...",
     }
+
+
+def test_log_inbound_model_prints_model_without_prompt(app, mocker):
+    """Surface the Cursor model id without logging prompt text."""
+    printer = mocker.patch("app.common.logging.console.print")
+    with app.test_request_context(
+        "/v1/chat/completions",
+        method="POST",
+        json={
+            "model": "gpt-5",
+            "messages": [{"role": "user", "content": "secret-prompt"}],
+        },
+    ):
+        log_inbound_model(request)
+    printer.assert_called_once()
+    logged = printer.call_args.args[0]
+    assert logged == "INBOUND_MODEL: POST /v1/chat/completions model='gpt-5'"
+    assert "secret-prompt" not in logged
+
+
+def test_log_inbound_model_skips_get_without_body(app, mocker):
+    """Do not emit a model line for body-less GET requests."""
+    printer = mocker.patch("app.common.logging.console.print")
+    with app.test_request_context("/v1/models", method="GET"):
+        log_inbound_model(request)
+    printer.assert_not_called()
 
 
 def test_should_not_refact(mocker):

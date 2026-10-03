@@ -10,7 +10,7 @@ from .auth import current_tenant, is_tenant_auth_mode, require_auth
 from .azure.adapter import AzureAdapter
 from .codex.adapter import CodexAdapter
 from .codex.settings import codex_model_payload
-from .common.logging import console, log_request
+from .common.logging import console, log_inbound_model, log_request
 from .common.recording import (
     increment_last_recording,
     init_last_recording,
@@ -113,6 +113,7 @@ def catch_all(path: str):
     try:
         if current_app.config.get("LOG_CONTEXT"):
             log_request(request)
+        log_inbound_model(request)
         init_last_recording()
         increment_last_recording()
         record_payload(request.get_json(silent=True), "downstream_request")

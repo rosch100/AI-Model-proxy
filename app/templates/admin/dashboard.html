@@ -8,10 +8,37 @@
     <div>
       <p class="eyebrow">Mandant {{ view.tenant_id }}</p>
       <h1 id="dashboard-title">Übersicht</h1>
-      <p class="lede">Kosten und gemeldete Nutzung aus dem letzten erfolgreichen Refresh je Anbieter-Konto.</p>
+      <p class="lede">Live-Aktivität der Proxy-Anfragen plus Kosten aus dem letzten erfolgreichen Refresh je Anbieter-Konto.</p>
     </div>
     <a class="secondary-cta" href="{{ url_for('admin.settings_costs') }}">Kosten verwalten</a>
   </header>
+
+  <section class="dashboard-section provider-status-section" aria-labelledby="providers-title">
+    <div class="section-heading">
+      <div>
+        <h2 id="providers-title">Live-Verbindungen</h2>
+        <p class="section-caption">Welche Anbieter in der Route liegen und wann zuletzt eine Proxy-Anfrage dort ankam.</p>
+      </div>
+    </div>
+    <ul class="provider-status-grid">
+      {% for provider in view.providers %}
+        <li class="provider-status-card{% if provider.recency %} is-{{ provider.recency }}{% endif %}">
+          <span class="provider-status-indicator{% if provider.recency == 'live' %} is-live{% elif provider.state == 'Gespeichert' %} is-ready{% elif provider.state == 'Prüfung erforderlich' %} needs-attention{% endif %}" aria-hidden="true"></span>
+          <div>
+            <strong>{{ provider.label }}</strong>
+            <span>{{ provider.state }}{% if provider.is_active %} · in der Route{% endif %}{% if provider.last_request_label %} · zuletzt {{ provider.last_request_label }}{% else %} · keine Anfrage in 24 h{% endif %}</span>
+          </div>
+        </li>
+      {% endfor %}
+    </ul>
+    <p class="dashboard-model-id">Custom-Model-ID: <code>{{ view.custom_model_id }}</code></p>
+  </section>
+
+  {% if view.activity %}
+    {% with activity = view.activity %}
+      {% include "admin/_activity.html" %}
+    {% endwith %}
+  {% endif %}
 
   <section class="dashboard-section" aria-labelledby="accounts-title">
     <div class="section-heading">
@@ -107,19 +134,6 @@
         <a class="primary-cta" href="{{ url_for('admin.settings_costs') }}">Kosten einrichten und aktualisieren</a>
       </div>
     {% endif %}
-  </section>
-
-  <section class="dashboard-section provider-status-section" aria-labelledby="providers-title">
-    <h2 id="providers-title">Verbindung</h2>
-    <ul class="provider-status-grid">
-      {% for provider in view.providers %}
-        <li class="provider-status-card">
-          <span class="provider-status-indicator{% if provider.state == 'Gespeichert' %} is-ready{% elif provider.state == 'Prüfung erforderlich' %} needs-attention{% endif %}" aria-hidden="true"></span>
-          <div><strong>{{ provider.label }}</strong><span>{{ provider.state }}{% if provider.is_active %} · aktiv{% endif %}</span></div>
-        </li>
-      {% endfor %}
-    </ul>
-    <p class="dashboard-model-id">Custom-Model-ID: <code>{{ view.custom_model_id }}</code></p>
   </section>
 </section>
 {% endblock %}

@@ -304,12 +304,25 @@ def _prompt_scope_values(provider: str) -> dict[str, str]:
         return {"billing": billing_scope, "usage": usage_scope}
     if provider == "openai":
         return {
-            "organization": _opaque_scope_id(click.prompt("OpenAI organization ID")),
-            "billing": _opaque_scope_id(click.prompt("OpenAI project ID")),
+            "organization": _opaque_scope_id(
+                click.prompt(
+                    "OpenAI organization ID "
+                    "(platform.openai.com/settings/organization/general, org-…)"
+                )
+            ),
+            "billing": _opaque_scope_id(
+                click.prompt(
+                    "OpenAI project ID "
+                    "(platform.openai.com/settings/organization/projects, proj_…)"
+                )
+            ),
         }
     return {
         "billing": _canonical_openrouter_workspace_id(
-            click.prompt("OpenRouter workspace ID")
+            click.prompt(
+                "OpenRouter workspace UUID "
+                "(openrouter.ai Settings → Workspaces, nicht der API-Key)"
+            )
         )
     }
 

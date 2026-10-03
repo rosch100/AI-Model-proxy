@@ -191,12 +191,15 @@ def test_costs_page_explains_provider_specific_credentials_and_limits(admin_app)
     body = response.get_data(as_text=True)
 
     assert response.status_code == 200
-    assert "Billing-Zugangsdaten sind vom Inference-Schlüssel getrennt." in body
     assert "Admin API Key" in body
     assert "Management Key" in body
-    assert "Workspace-ID dieses Kontos enthalten" in body
-    assert "als Filter verwendet" in body
-    assert "keine Tenant-Credential eingegeben" in body
+    assert "platform.openai.com/settings/organization/admin-keys" in body
+    assert "openrouter.ai/settings/management-keys" in body
+    assert "flask tenants bind-billing-scope" in body
+    assert "sk-admin-" in body
+    assert "Usage API" in body
+    assert "Only management keys" in body
+    assert "keine Tenant-Credential" in body
     assert "letzten 30 abgeschlossenen UTC-Tage" in body
     assert "OpenRouter- und BYOK-Kosten sowie Tokenverbrauch" in body
     assert "Kosten und Input-/Output-Tokens" in body

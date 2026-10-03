@@ -211,6 +211,25 @@ def create_message_panel(msg: Dict[str, Any], idx: int, total: int) -> Panel:
     )
 
 
+def log_inbound_model(req: Request) -> None:
+    """Log only the Cursor model id; never prompt, tools, or credentials."""
+    payload = req.get_json(silent=True)
+    if not isinstance(payload, dict):
+        if req.method not in {"POST", "PUT", "PATCH"}:
+            return
+        model = "<missing>"
+    else:
+        raw_model = payload.get("model", "<missing>")
+        model = (
+            raw_model if isinstance(raw_model, str) else f"<{type(raw_model).__name__}>"
+        )
+    console.print(
+        f"INBOUND_MODEL: {req.method} {req.path} model={model!r}",
+        style="cyan",
+        markup=False,
+    )
+
+
 def log_request(req: Request) -> str:
     """Pretty-print a Flask request using Rich and return the request id."""
     request_id = uuid.uuid4().hex[:8]

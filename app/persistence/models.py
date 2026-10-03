@@ -511,3 +511,49 @@ class AuditEvent(Base):
     details: Mapped[dict[str, object]] = mapped_column(
         JSON, nullable=False, default=dict
     )
+
+
+class InferenceActivityEvent(Base):
+    """One completed proxy inference, for live tenant activity on the overview."""
+
+    __tablename__ = "inference_activity_events"
+    __table_args__ = (
+        CheckConstraint(
+            "provider IN ('azure', 'openai', 'openrouter')",
+            name="ck_inference_activity_provider",
+        ),
+        CheckConstraint(
+            "(input_tokens IS NULL) = (output_tokens IS NULL) "
+            "AND (input_tokens IS NULL) = (total_tokens IS NULL)",
+            name="ck_inference_activity_usage_complete",
+        ),
+        Index(
+            "ix_inference_activity_tenant_occurred",
+            "tenant_id",
+            "occurred_at",
+        ),
+        Index(
+            "ix_inference_activity_tenant_provider_model",
+            "tenant_id",
+            "provider",
+            "inbound_model",
+            "occurred_at",
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    tenant_id: Mapped[str] = mapped_column(ForeignKey("tenants.id"), nullable=False)
+    provider: Mapped[str] = mapped_column(String(16), nullable=False)
+    profile_id: Mapped[str | None] = mapped_column(
+        ForeignKey("provider_profiles.id", ondelete="SET NULL"), nullable=True
+    )
+    inbound_model: Mapped[str] = mapped_column(String(256), nullable=False)
+    routed_model: Mapped[str | None] = mapped_column(String(256), nullable=True)
+    input_tokens: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    output_tokens: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    cached_tokens: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    reasoning_tokens: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    total_tokens: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    occurred_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )

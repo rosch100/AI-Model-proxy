@@ -52,6 +52,7 @@ from app.admin.security import (
 from app.admin.view_models import (
     ConnectionView,
     CostsView,
+    activity_board,
     dashboard_view,
 )
 from app.admin.webauthn_service import (
@@ -86,11 +87,13 @@ from app.persistence.admin_ops import (
     update_provider_profile,
 )
 from app.persistence.database import Database
+from app.persistence.inference_activity import ACTIVITY_LOOKBACK_HOURS
 from app.persistence.models import (
     AdminAccount,
     AuditEvent,
     CostRefreshJob,
     CostUsageRecord,
+    InferenceActivityEvent,
     ProviderCatalogEntry,
     ProviderProfile,
     ProviderScopeBinding,
@@ -565,13 +568,55 @@ def dashboard():
                 .order_by(CostUsageRecord.id)
             )
         )
-        view = dashboard_view(tenant, profiles, bindings, jobs, records)
+        lookback_start = datetime.now(timezone.utc) - timedelta(
+            hours=ACTIVITY_LOOKBACK_HOURS
+        )
+        activity_events = tuple(
+            session.scalars(
+                select(InferenceActivityEvent)
+                .where(
+                    InferenceActivityEvent.tenant_id == tenant.id,
+                    InferenceActivityEvent.occurred_at >= lookback_start,
+                )
+                .order_by(InferenceActivityEvent.occurred_at.desc())
+            )
+        )
+        view = dashboard_view(
+            tenant, profiles, bindings, jobs, records, activity_events
+        )
         session.expunge_all()
     return render_template(
         "admin/dashboard.html",
         view=view,
         logout_form=LoginForm(),
     )
+
+
+@admin_bp.get("/activity")
+@login_required
+def dashboard_activity():
+    """Return the live activity fragment for HTMX polling."""
+    database = _database()
+    with database.sessions() as session:
+        tenant = session.get(Tenant, g.admin.tenant_id)
+        lookback_start = datetime.now(timezone.utc) - timedelta(
+            hours=ACTIVITY_LOOKBACK_HOURS
+        )
+        activity_events = tuple(
+            session.scalars(
+                select(InferenceActivityEvent)
+                .where(
+                    InferenceActivityEvent.tenant_id == tenant.id,
+                    InferenceActivityEvent.occurred_at >= lookback_start,
+                )
+                .order_by(InferenceActivityEvent.occurred_at.desc())
+            )
+        )
+        activity = activity_board(
+            activity_events, custom_model_id=tenant.custom_model_id
+        )
+        session.expunge_all()
+    return render_template("admin/_activity.html", activity=activity)
 
 
 @admin_bp.get("/settings/general")

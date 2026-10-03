@@ -2,14 +2,19 @@
 
 from __future__ import annotations
 
-from collections.abc import Iterable
+from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 
+from app.persistence.inference_activity import (
+    ACTIVITY_LOOKBACK_HOURS,
+    ACTIVITY_WINDOW_MINUTES,
+)
 from app.persistence.models import (
     CostRefreshJob,
     CostUsageRecord,
+    InferenceActivityEvent,
     ProviderCatalogEntry,
     ProviderProfile,
     ProviderScopeBinding,
@@ -26,6 +31,8 @@ class ProviderStatus:
     label: str
     state: str
     is_active: bool
+    recency: str | None = None
+    last_request_label: str | None = None
 
 
 @dataclass(frozen=True)
@@ -59,6 +66,45 @@ class DashboardAccountCost:
 
 
 @dataclass(frozen=True)
+class ModelActivityRow:
+    """One model series inside a provider on the live activity board."""
+
+    model: str
+    inbound_model: str
+    routed_model: str | None
+    tokens_per_minute: float | None
+    tokens_per_minute_label: str | None
+    requests_in_window: int
+    last_request_at: datetime
+    last_request_label: str
+    bar_percent: int
+    recency: str
+
+
+@dataclass(frozen=True)
+class ProviderActivityGroup:
+    """Live activity for one provider."""
+
+    provider: str
+    label: str
+    rows: tuple[ModelActivityRow, ...]
+
+
+@dataclass(frozen=True)
+class ActivityBoard:
+    """Current proxy throughput for the tenant overview."""
+
+    window_minutes: int
+    generated_at: datetime
+    total_tokens_per_minute: float | None
+    total_tokens_per_minute_label: str | None
+    total_requests_in_window: int
+    last_request_at: datetime | None
+    last_request_label: str | None
+    providers: tuple[ProviderActivityGroup, ...]
+
+
+@dataclass(frozen=True)
 class DashboardView:
     """Aggregated tenant status and latest cost snapshot for the home page."""
 
@@ -69,6 +115,7 @@ class DashboardView:
     accounts_with_cost_data: int = 0
     accounts_with_successful_refresh: int = 0
     cost_accounts: tuple[DashboardAccountCost, ...] = ()
+    activity: ActivityBoard | None = None
 
 
 @dataclass(frozen=True)
@@ -201,6 +248,9 @@ def dashboard_view(
     ] = (),
     jobs: tuple[CostRefreshJob, ...] = (),
     records: tuple[CostUsageRecord, ...] = (),
+    activity_events: Sequence[InferenceActivityEvent] = (),
+    *,
+    now: datetime | None = None,
 ) -> DashboardView:
     """Build provider status and latest-snapshot cost summaries for a tenant."""
     profiles_by_provider: dict[str, ProviderProfile] = {}
@@ -299,6 +349,35 @@ def dashboard_view(
         account.has_billing_scope and account.last_successful_at is not None
         for account in cost_accounts
     )
+    activity = activity_board(
+        activity_events,
+        custom_model_id=tenant.custom_model_id,
+        now=now,
+    )
+    latest_activity = {
+        group.provider: max(group.rows, key=lambda row: row.last_request_at)
+        for group in activity.providers
+        if group.rows
+    }
+    statuses = tuple(
+        ProviderStatus(
+            provider=status.provider,
+            label=status.label,
+            state=status.state,
+            is_active=status.is_active,
+            recency=(
+                latest_activity[status.provider].recency
+                if status.provider in latest_activity
+                else None
+            ),
+            last_request_label=(
+                latest_activity[status.provider].last_request_label
+                if status.provider in latest_activity
+                else None
+            ),
+        )
+        for status in statuses
+    )
     return DashboardView(
         tenant_id=tenant.id,
         custom_model_id=tenant.custom_model_id,
@@ -307,4 +386,207 @@ def dashboard_view(
         accounts_with_cost_data=accounts_with_cost_data,
         accounts_with_successful_refresh=accounts_with_successful_refresh,
         cost_accounts=tuple(cost_accounts),
+        activity=activity,
+    )
+
+
+def _aware_utc(moment: datetime) -> datetime:
+    """Normalize SQLite-naive and PostgreSQL-aware timestamps to UTC."""
+    if moment.tzinfo is None:
+        return moment.replace(tzinfo=timezone.utc)
+    return moment.astimezone(timezone.utc)
+
+
+def format_activity_rate(value: float) -> str:
+    """Format tokens or requests per minute with German grouping."""
+    if value >= 100:
+        return format(round(value), ",.0f").replace(",", ".")
+    formatted = format(value, ".1f")
+    integer, _separator, fraction = formatted.partition(".")
+    return f"{integer},{fraction}"
+
+
+def format_relative_time(moment: datetime, now: datetime) -> str:
+    """Return a compact German relative timestamp for live activity."""
+    if moment.tzinfo is None or now.tzinfo is None:
+        raise ValueError("Activity timestamps must be timezone-aware")
+    elapsed = (now - moment).total_seconds()
+    if elapsed < 10:
+        return "gerade eben"
+    if elapsed < 60:
+        return f"vor {int(elapsed)} s"
+    if elapsed < 3600:
+        return f"vor {int(elapsed // 60)} min"
+    if moment.astimezone(timezone.utc).date() == now.astimezone(timezone.utc).date():
+        return moment.astimezone(timezone.utc).strftime("%H:%M UTC")
+    return moment.astimezone(timezone.utc).strftime("%d.%m. %H:%M UTC")
+
+
+@dataclass
+class _ActivityAccumulator:
+    inbound_model: str
+    routed_model: str | None
+    last_request_at: datetime
+    window_tokens: int = 0
+    window_requests: int = 0
+    window_with_usage: int = 0
+
+
+def _display_model(
+    inbound_model: str, routed_model: str | None, custom_model_id: str
+) -> str:
+    if inbound_model == custom_model_id and routed_model:
+        return routed_model
+    return inbound_model
+
+
+def _recency_class(
+    last_request_at: datetime, window_start: datetime, now: datetime
+) -> str:
+    if last_request_at >= now - timedelta(minutes=2):
+        return "live"
+    if last_request_at >= window_start:
+        return "recent"
+    return "idle"
+
+
+def activity_board(
+    events: Sequence[InferenceActivityEvent],
+    *,
+    custom_model_id: str,
+    now: datetime | None = None,
+    window_minutes: int = ACTIVITY_WINDOW_MINUTES,
+    lookback_hours: int = ACTIVITY_LOOKBACK_HOURS,
+) -> ActivityBoard:
+    """Aggregate recent inferences into provider/model throughput bars."""
+    clock = now or datetime.now(timezone.utc)
+    if clock.tzinfo is None:
+        raise ValueError("Activity board clock must be timezone-aware")
+    window_start = clock - timedelta(minutes=window_minutes)
+    lookback_start = clock - timedelta(hours=lookback_hours)
+    buckets: dict[tuple[str, str], _ActivityAccumulator] = {}
+    for event in events:
+        occurred_at = _aware_utc(event.occurred_at)
+        if occurred_at < lookback_start:
+            continue
+        display = _display_model(
+            event.inbound_model, event.routed_model, custom_model_id
+        )
+        key = (event.provider, display)
+        bucket = buckets.get(key)
+        if bucket is None:
+            bucket = _ActivityAccumulator(
+                inbound_model=event.inbound_model,
+                routed_model=event.routed_model,
+                last_request_at=occurred_at,
+            )
+            buckets[key] = bucket
+        if occurred_at > bucket.last_request_at:
+            bucket.last_request_at = occurred_at
+            bucket.inbound_model = event.inbound_model
+            bucket.routed_model = event.routed_model
+        if occurred_at < window_start:
+            continue
+        bucket.window_requests += 1
+        if event.total_tokens is None:
+            continue
+        bucket.window_tokens += event.total_tokens
+        bucket.window_with_usage += 1
+
+    prepared: list[tuple[str, str, _ActivityAccumulator, float | None]] = []
+    scale = 0.0
+    for (provider, model), bucket in buckets.items():
+        tokens_per_minute = (
+            bucket.window_tokens / window_minutes if bucket.window_with_usage else None
+        )
+        weight = (
+            tokens_per_minute
+            if tokens_per_minute is not None
+            else float(bucket.window_requests)
+        )
+        scale = max(scale, weight)
+        prepared.append((provider, model, bucket, tokens_per_minute))
+
+    grouped: dict[str, list[ModelActivityRow]] = {
+        name: [] for name in ("azure", "openai", "openrouter")
+    }
+    for provider, model, bucket, tokens_per_minute in prepared:
+        weight = (
+            tokens_per_minute
+            if tokens_per_minute is not None
+            else float(bucket.window_requests)
+        )
+        grouped.setdefault(provider, []).append(
+            ModelActivityRow(
+                model=model,
+                inbound_model=bucket.inbound_model,
+                routed_model=bucket.routed_model,
+                tokens_per_minute=tokens_per_minute,
+                tokens_per_minute_label=(
+                    None
+                    if tokens_per_minute is None
+                    else format_activity_rate(tokens_per_minute)
+                ),
+                requests_in_window=bucket.window_requests,
+                last_request_at=bucket.last_request_at,
+                last_request_label=format_relative_time(bucket.last_request_at, clock),
+                bar_percent=0 if scale <= 0 else round(100 * weight / scale),
+                recency=_recency_class(bucket.last_request_at, window_start, clock),
+            )
+        )
+
+    providers = []
+    total_tokens = 0.0
+    total_with_usage = 0
+    total_requests = 0
+    last_request_at = None
+    for provider, rows in grouped.items():
+        ordered = tuple(
+            sorted(
+                rows,
+                key=lambda row: (
+                    -(row.tokens_per_minute or 0.0),
+                    -row.requests_in_window,
+                    -row.last_request_at.timestamp(),
+                    row.model,
+                ),
+            )
+        )
+        if not ordered:
+            continue
+        providers.append(
+            ProviderActivityGroup(
+                provider=provider,
+                label=_PROVIDER_LABELS[provider],
+                rows=ordered,
+            )
+        )
+        for row in ordered:
+            total_requests += row.requests_in_window
+            if row.tokens_per_minute is not None:
+                total_tokens += row.tokens_per_minute * window_minutes
+                total_with_usage += 1
+            if last_request_at is None or row.last_request_at > last_request_at:
+                last_request_at = row.last_request_at
+
+    total_tokens_per_minute = (
+        total_tokens / window_minutes if total_with_usage else None
+    )
+    return ActivityBoard(
+        window_minutes=window_minutes,
+        generated_at=clock,
+        total_tokens_per_minute=total_tokens_per_minute,
+        total_tokens_per_minute_label=(
+            None
+            if total_tokens_per_minute is None
+            else format_activity_rate(total_tokens_per_minute)
+        ),
+        total_requests_in_window=total_requests,
+        last_request_at=last_request_at,
+        last_request_label=(
+            format_relative_time(last_request_at, clock)
+            if last_request_at is not None
+            else None
+        ),
+        providers=tuple(providers),
     )

@@ -58,7 +58,7 @@ def load_billing_binding(session: Session, tenant_id: str, profile_id: str) -> t
         .with_for_update()
     )
     if binding is None:
-        raise LookupError(f"No billing scope is bound to {profile.display_name}")
+        raise LookupError(f"Kein Billing-Scope ist an {profile.display_name} gebunden")
     node = session.get(ProviderScopeNode, binding.node_id)
     if node is None:
         raise LookupError(f"No {profile.provider} billing scope node is bound")

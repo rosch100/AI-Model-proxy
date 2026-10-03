@@ -635,7 +635,7 @@ def test_route_migration_follows_current_head_and_emits_lossless_transition():
     """Offline SQL includes pointer transfer and a loss-preventing downgrade guard."""
     root = Path(__file__).resolve().parents[1]
     script = ScriptDirectory.from_config(Config(str(root / "alembic.ini")))
-    migration = script.get_revision(script.get_current_head()).module
+    migration = script.get_revision("20261005_provider_route").module
     assert migration.down_revision == "20261004_clear_azure_billing"
     output = StringIO()
     context = MigrationContext.configure(

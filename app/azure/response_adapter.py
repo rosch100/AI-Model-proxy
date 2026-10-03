@@ -21,6 +21,10 @@ from rich.markup import escape as rich_escape
 from ..common.logging import console, create_message_panel
 from ..common.sse import chunks_to_sse, sse_to_events
 from ..exceptions import ClientClosedConnection
+from ..persistence.inference_activity import (
+    parse_provider_usage,
+    record_inference_activity,
+)
 from ..providers.failover_upstream import PreparedUpstream, sanitize_error_event
 from ..reasoning_display import (
     parse_reasoning_display_mode,
@@ -558,6 +562,23 @@ class ResponseAdapter:
                 f"input={input_tokens} (cached={cached_tokens}, {cache_pct:.0f}%) "
                 f"output={output_tokens} (reasoning={reasoning_tokens}) "
                 f"total={total_tokens}"
+            )
+            record_inference_activity(
+                tenant_id=self.adapter.activity_tenant_id,
+                provider=self.adapter.activity_provider,
+                profile_id=self.adapter.activity_profile_id,
+                inbound_model=self.adapter.inbound_model,
+                routed_model=self.adapter.activity_routed_model,
+                usage=parse_provider_usage(usage),
+            )
+        elif self.adapter.activity_tenant_id is not None:
+            record_inference_activity(
+                tenant_id=self.adapter.activity_tenant_id,
+                provider=self.adapter.activity_provider,
+                profile_id=self.adapter.activity_profile_id,
+                inbound_model=self.adapter.inbound_model,
+                routed_model=self.adapter.activity_routed_model,
+                usage=None,
             )
         return None
 

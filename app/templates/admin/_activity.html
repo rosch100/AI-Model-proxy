@@ -1,0 +1,90 @@
+<section
+  id="dashboard-activity"
+  class="dashboard-section activity-section"
+  aria-labelledby="activity-title"
+  hx-get="{{ url_for('admin.dashboard_activity') }}"
+  hx-trigger="every 15s"
+  hx-swap="outerHTML"
+>
+  <div class="section-heading">
+    <div>
+      <h2 id="activity-title">Aktuelle Aktivität</h2>
+      <p class="section-caption">
+        Tokens je Minute über die letzten {{ activity.window_minutes }} Minuten, gruppiert nach Anbieter und Modell.
+        Letzte Abfrage unabhängig vom Fenster. Aktualisiert alle 15 Sekunden.
+      </p>
+    </div>
+    {% if activity.last_request_label %}
+      <p class="activity-updated">Zuletzt {{ activity.last_request_label }}</p>
+    {% endif %}
+  </div>
+
+  {% if activity.providers %}
+    <dl class="activity-summary">
+      <div>
+        <dt>Tokens / min</dt>
+        <dd>
+          {% if activity.total_tokens_per_minute_label %}
+            {{ activity.total_tokens_per_minute_label }}
+          {% else %}
+            <span class="activity-unknown">unbekannt</span>
+          {% endif %}
+        </dd>
+      </div>
+      <div>
+        <dt>Anfragen im Fenster</dt>
+        <dd>{{ activity.total_requests_in_window }}</dd>
+      </div>
+    </dl>
+
+    <div class="activity-providers">
+      {% for group in activity.providers %}
+        <article class="activity-provider" data-provider="{{ group.provider }}">
+          <h3>{{ group.label }}</h3>
+          <ul class="activity-rows">
+            {% for row in group.rows %}
+              <li class="activity-row is-{{ row.recency }}">
+                <div class="activity-row-head">
+                  <div>
+                    <strong>{{ row.model }}</strong>
+                    {% if row.inbound_model != row.model %}
+                      <span class="activity-inbound">Anfrage: <code>{{ row.inbound_model }}</code></span>
+                    {% elif row.routed_model and row.routed_model != row.model %}
+                      <span class="activity-inbound">Upstream: <code>{{ row.routed_model }}</code></span>
+                    {% endif %}
+                  </div>
+                  <p class="activity-row-metrics">
+                    {% if row.tokens_per_minute_label %}
+                      <span>{{ row.tokens_per_minute_label }} Tok/min</span>
+                    {% else %}
+                      <span>Tokens unbekannt</span>
+                    {% endif %}
+                    <span>{{ row.requests_in_window }} Anfragen</span>
+                    <time datetime="{{ row.last_request_at.isoformat() }}">{{ row.last_request_label }}</time>
+                  </p>
+                </div>
+                <div
+                  class="activity-meter"
+                  role="meter"
+                  aria-label="{{ row.model }} {{ group.label }}"
+                  aria-valuemin="0"
+                  aria-valuemax="100"
+                  aria-valuenow="{{ row.bar_percent }}"
+                  aria-valuetext="{% if row.tokens_per_minute_label %}{{ row.tokens_per_minute_label }} Tokens je Minute{% else %}{{ row.requests_in_window }} Anfragen ohne Tokenangabe{% endif %}, zuletzt {{ row.last_request_label }}"
+                >
+                  <span class="activity-meter-fill" style="width: {{ row.bar_percent }}%;"></span>
+                </div>
+              </li>
+            {% endfor %}
+          </ul>
+        </article>
+      {% endfor %}
+    </div>
+  {% else %}
+    <div class="empty-state">
+      <span class="empty-state-mark" aria-hidden="true">·</span>
+      <h3>Keine aktuelle Proxy-Aktivität</h3>
+      <p>In den letzten 24 Stunden hat dieser Mandant noch keine Chat-Anfragen über den Proxy gesendet.</p>
+    </div>
+  {% endif %}
+</section>

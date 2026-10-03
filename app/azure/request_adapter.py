@@ -355,6 +355,10 @@ class RequestAdapter:
         """
         # Reset per-request state
         self.adapter.inbound_model = None
+        self.adapter.activity_tenant_id = None
+        self.adapter.activity_provider = None
+        self.adapter.activity_profile_id = None
+        self.adapter.activity_routed_model = None
 
         # Parse request body (Cursor sometimes sends malformed payloads)
         payload = req.get_json(silent=True, force=False)
@@ -388,6 +392,15 @@ class RequestAdapter:
                     "the tenant deployment map."
                 )
             payload = {**payload, "model": tenant.default_model}
+
+        if isinstance(tenant, DatabaseTenantSnapshot):
+            routed_model = payload.get("model")
+            self.adapter.activity_tenant_id = tenant.id
+            self.adapter.activity_provider = tenant.provider or "azure"
+            self.adapter.activity_profile_id = tenant.profile_id
+            self.adapter.activity_routed_model = (
+                routed_model if isinstance(routed_model, str) else None
+            )
 
         # Derive conversation_id from Cursor's metadata.cursorConversationId.
         # This is unique per conversation, matching Codex CLI's use of

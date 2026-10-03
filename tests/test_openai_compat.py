@@ -99,3 +99,4 @@ def test_forwarding_applies_luna_tool_reasoning_compatibility_only_when_needed(
     assert sent_payload["model"] == model
     assert sent_payload["reasoning_effort"] == expected_effort
     assert sent_payload["tools"] == tools
+    assert sent_payload["stream_options"]["include_usage"] is True

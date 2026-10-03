@@ -63,6 +63,12 @@ class AzureAdapter:
         # Composition: child adapters get a reference to this orchestrator
         self.request_adapter = RequestAdapter(self)
         self.response_adapter = ResponseAdapter(self)
+        self.inbound_model = None
+        self.include_usage = False
+        self.activity_tenant_id: str | None = None
+        self.activity_provider: str | None = None
+        self.activity_profile_id: str | None = None
+        self.activity_routed_model: str | None = None
 
     # Public API
     def forward(

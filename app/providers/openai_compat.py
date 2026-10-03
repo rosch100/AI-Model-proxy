@@ -60,6 +60,10 @@ def forward_openai_compatible(
     ):
         payload["reasoning_effort"] = "none"
     payload["stream"] = True
+    stream_options = payload.get("stream_options")
+    if not isinstance(stream_options, dict):
+        stream_options = {}
+    payload["stream_options"] = {**stream_options, "include_usage": True}
     origin = openai_compatible_base_url(snapshot.provider or "")
     headers = {
         "Authorization": f"Bearer {snapshot.inference_secret}",
@@ -86,7 +90,17 @@ def forward_openai_compatible(
     if routed:
         prepared = prepare_upstream(upstream)
         response = Response(
-            stream_with_context(chat_stream(prepared, snapshot.custom_model_id)),
+            stream_with_context(
+                chat_stream(
+                    prepared,
+                    snapshot.custom_model_id,
+                    activity_tenant_id=snapshot.id,
+                    activity_provider=snapshot.provider,
+                    activity_profile_id=snapshot.profile_id,
+                    inbound_model=inbound_model,
+                    routed_model=payload.get("model"),
+                )
+            ),
             content_type="text/event-stream",
             headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
         )

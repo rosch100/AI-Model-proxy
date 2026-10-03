@@ -1,0 +1,117 @@
+"""Persist and load per-request inference activity for the tenant overview."""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from datetime import datetime, timezone
+
+from flask import current_app
+from sqlalchemy.exc import SQLAlchemyError
+
+from app.persistence.database import Database
+from app.persistence.models import InferenceActivityEvent
+
+ACTIVITY_WINDOW_MINUTES = 15
+ACTIVITY_LOOKBACK_HOURS = 24
+
+
+@dataclass(frozen=True)
+class ParsedTokenUsage:
+    """Token counts reported by an upstream provider for one request."""
+
+    input_tokens: int
+    output_tokens: int
+    cached_tokens: int
+    reasoning_tokens: int
+    total_tokens: int
+
+
+def _as_token_count(value: object) -> int | None:
+    if isinstance(value, bool) or not isinstance(value, int | float):
+        return None
+    if value < 0 or int(value) != value:
+        return None
+    return int(value)
+
+
+def parse_provider_usage(usage: object) -> ParsedTokenUsage | None:
+    """Read Azure Responses or Chat Completions usage without inventing counts."""
+    if not isinstance(usage, dict):
+        return None
+    input_tokens = _as_token_count(
+        usage.get("input_tokens", usage.get("prompt_tokens"))
+    )
+    output_tokens = _as_token_count(
+        usage.get("output_tokens", usage.get("completion_tokens"))
+    )
+    if input_tokens is None or output_tokens is None:
+        return None
+    input_details = usage.get("input_tokens_details") or usage.get(
+        "prompt_tokens_details"
+    )
+    output_details = usage.get("output_tokens_details") or usage.get(
+        "completion_tokens_details"
+    )
+    cached_tokens = 0
+    reasoning_tokens = 0
+    if isinstance(input_details, dict):
+        parsed_cached = _as_token_count(input_details.get("cached_tokens"))
+        if parsed_cached is not None:
+            cached_tokens = parsed_cached
+    if isinstance(output_details, dict):
+        parsed_reasoning = _as_token_count(output_details.get("reasoning_tokens"))
+        if parsed_reasoning is not None:
+            reasoning_tokens = parsed_reasoning
+    total_tokens = _as_token_count(usage.get("total_tokens"))
+    if total_tokens is None:
+        total_tokens = input_tokens + output_tokens
+    return ParsedTokenUsage(
+        input_tokens=input_tokens,
+        output_tokens=output_tokens,
+        cached_tokens=cached_tokens,
+        reasoning_tokens=reasoning_tokens,
+        total_tokens=total_tokens,
+    )
+
+
+def record_inference_activity(
+    *,
+    tenant_id: str | None,
+    provider: str | None,
+    profile_id: str | None,
+    inbound_model: object,
+    routed_model: object,
+    usage: ParsedTokenUsage | None,
+    occurred_at: datetime | None = None,
+) -> None:
+    """Store one completed inference. Skip single-mode and invalid identities."""
+    if tenant_id is None or provider not in {"azure", "openai", "openrouter"}:
+        return
+    if not isinstance(inbound_model, str) or not inbound_model:
+        return
+    routed = routed_model if isinstance(routed_model, str) and routed_model else None
+    database = current_app.extensions.get("database")
+    if not isinstance(database, Database):
+        return
+    moment = occurred_at or datetime.now(timezone.utc)
+    if moment.tzinfo is None:
+        raise ValueError("Inference activity timestamps must be timezone-aware")
+    try:
+        with database.sessions.begin() as session:
+            session.add(
+                InferenceActivityEvent(
+                    tenant_id=tenant_id,
+                    provider=provider,
+                    profile_id=profile_id,
+                    inbound_model=inbound_model,
+                    routed_model=routed,
+                    input_tokens=None if usage is None else usage.input_tokens,
+                    output_tokens=None if usage is None else usage.output_tokens,
+                    cached_tokens=None if usage is None else usage.cached_tokens,
+                    reasoning_tokens=None if usage is None else usage.reasoning_tokens,
+                    total_tokens=None if usage is None else usage.total_tokens,
+                    occurred_at=moment,
+                )
+            )
+    except SQLAlchemyError:
+        current_app.logger.exception("Failed to record inference activity")

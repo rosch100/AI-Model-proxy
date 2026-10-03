@@ -26,6 +26,24 @@ def routed_profiles(
     return profiles[:1] if azure_only else profiles
 
 
+def _azure_profile_for_catalog_model(
+    profiles: tuple[DatabaseTenantSnapshot, ...], model: object
+) -> DatabaseTenantSnapshot | None:
+    """Return the Azure account that already publishes this Cursor model ID."""
+    if not isinstance(model, str) or not model:
+        return None
+    requested = model.casefold()
+    for profile in profiles:
+        if profile.provider != "azure":
+            continue
+        deployments = profile.azure_model_deployments
+        if model in deployments or any(
+            published.casefold() == requested for published in deployments
+        ):
+            return profile
+    return None
+
+
 def forward_tenant_route(
     req: Request, snapshot: DatabaseTenantRoutingSnapshot, *, azure_only: bool = False
 ) -> Response:
@@ -37,13 +55,18 @@ def forward_tenant_route(
             message = "The active tenant provider is not available on the Azure route."
         raise ServiceConfigurationError(message)
     payload = req.get_json(silent=True)
-    if (
-        not isinstance(payload, dict)
-        or payload.get("model") != snapshot.custom_model_id
-    ):
+    if not isinstance(payload, dict):
         raise ServiceConfigurationError(
             "Request model must match the tenant's Cursor model ID."
         )
+    inbound_model = payload.get("model")
+    if inbound_model != snapshot.custom_model_id:
+        azure_profile = _azure_profile_for_catalog_model(profiles, inbound_model)
+        if azure_profile is None:
+            raise ServiceConfigurationError(
+                "Request model must match the tenant's Cursor model ID."
+            )
+        return AzureAdapter().forward(req, azure_profile)
     if azure_only:
         return AzureAdapter().forward(req, profiles[0])
     for profile in profiles:

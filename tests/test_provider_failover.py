@@ -4,6 +4,7 @@ import json
 
 import pytest
 import requests
+from flask import Response
 
 from app.persistence.admin_ops import (
     activate_provider_profile,
@@ -199,6 +200,28 @@ def test_unknown_model_rejected_before_upstream(routed_app, requests_mock):
     """Reject unmapped models without contacting any provider."""
     response = post(routed_app, model="unmapped-model")
     assert response.status_code == 400
+    assert requests_mock.call_count == 0
+
+
+def test_azure_catalog_model_pins_to_azure_without_failover(
+    routed_app, monkeypatch, requests_mock
+):
+    """Keep Cursor Azure catalog IDs on the first matching Azure account."""
+    calls: list[str | None] = []
+
+    def fake_forward(self, req, snapshot=None):
+        calls.append(None if snapshot is None else snapshot.provider)
+        return Response("azure-catalog", status=200)
+
+    def fail_attempt(self, req, snapshot):
+        raise AssertionError("catalog model IDs must not enter provider failover")
+
+    monkeypatch.setattr("app.azure.adapter.AzureAdapter.forward", fake_forward)
+    monkeypatch.setattr("app.azure.adapter.AzureAdapter.forward_attempt", fail_attempt)
+    response = post(routed_app, model="gpt-5.4")
+    azure = post(routed_app, path="/azure/v1/chat/completions", model="gpt-5.4")
+    assert response.status_code == azure.status_code == 200
+    assert calls == ["azure", "azure"]
     assert requests_mock.call_count == 0
 
 

@@ -2,6 +2,8 @@
 
 import json
 
+import pytest
+
 from app.azure.adapter import AzureAdapter
 
 
@@ -382,6 +384,27 @@ def test_response_adapter_closes_visible_reasoning_before_terminal_event(app):
 
     deltas = [msg["choices"][0]["delta"] for msg in messages[:-1]]
     assert deltas[-1] == {"role": "assistant", "content": "\n\n</details>\n\n"}
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {"type": "response.failed", "response": {"error": None}},
+        {"type": "response.failed", "response": {}},
+        {"type": "response.failed"},
+        {"type": "response.failed", "response": None},
+        None,
+    ],
+)
+def test_response_adapter_handles_failed_event_without_error_details(app, payload):
+    """Missing Azure error details must not crash the downstream stream."""
+    messages = _azure_messages(
+        app,
+        [_sse("response.failed", payload)],
+    )
+
+    failure_message = messages[0]["choices"][0]["delta"]["content"]
+    assert "failed response without error details" in failure_message
 
 
 def test_response_adapter_closes_visible_reasoning_before_failure_message(app):

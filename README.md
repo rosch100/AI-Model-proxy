@@ -262,10 +262,11 @@ Root and `/azure` expose the Azure model list for the authenticated principal (g
 | --- | --- |
 | `gpt-6-astra` | Azure Responses enabled; proxy E2E not yet verified |
 | `gpt-6-luna` | Azure Responses enabled; proxy E2E not yet verified |
-| `gpt-6-sol` | Azure Responses enabled; proxy E2E not yet verified |
-| `gpt-5.6-luna` | Azure Responses enabled; proxy E2E not yet verified |
-| `gpt-5.6-sol` | Azure Responses enabled; proxy E2E not yet verified |
-| `gpt-5.6-terra` | Azure Responses enabled; proxy E2E not yet verified |
+| `gpt-6-sol` | Available only on tenant `altanis-ai`; proxy E2E verified |
+| `gpt-6.1-sol` | Available on both tenants; proxy E2E verified |
+| `gpt-5.6-luna` | Not deployed on the configured tenant accounts |
+| `gpt-5.6-sol` | Not deployed on the configured tenant accounts |
+| `gpt-5.6-terra` | Not deployed on the configured tenant accounts |
 | `gpt-5.5` | Verified |
 | `gpt-5.4` | Verified |
 | `gpt-5.4-mini` | Verified |
@@ -281,16 +282,23 @@ Root and `/azure` expose the Azure model list for the authenticated principal (g
 | `gpt-5-mini` | Verified |
 | `gpt-5-codex` | Expected (same Responses API) |
 
-Example account mapping used in `.env.example` (`AzureOpenAI-Instanz2`, as of 2026-09-28):
+Default account mapping in `.env.example` (`AzureOpenAI-Instanz2`, verified 2026-10-01):
 
 | Cursor model ID | Azure deployment name |
 | --- | --- |
-| `gpt-5.6-luna` | `gpt-5-6-luna-api` |
-| `gpt-5.6-sol` | `gpt-5-6-sol-api` |
-| `gpt-5.6-terra` | `gpt-5-6-terra-api` |
 | `gpt-6-astra` | `gpt-6-astra-api` |
 | `gpt-6-luna` | `gpt-6-luna-api` |
-| `gpt-6-sol` | `gpt-6-sol-api` |
+| `gpt-6.1-sol` | `gpt-6.1-sol-api` |
+
+The `altanis-ai` tenant additionally exposes `gpt-6-sol` and maps the other
+three models to deployments with matching names. Both tenants were verified
+with successful Azure Responses requests on 2026-10-01.
+
+If Cursor requests a model that is not in the active deployment map (unknown
+ID or known but not provided for that resource), the proxy falls back to the
+cheapest configured preference model, typically `gpt-6-luna`. When none of the
+preference models are mapped, the request still fails with a configuration
+error.
 
 Default Codex model list (override with `CODEX_SUPPORTED_MODELS`):
 

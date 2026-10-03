@@ -356,21 +356,14 @@ def test_costs_page_shows_azure_host_identity_and_bound_scope_controls(admin_app
     assert "acme-rg" in body
 
 
-def test_dashboard_shows_cost_schema_when_no_cost_records_exist(admin_app):
-    """The overview presents cost categories and columns before first refresh."""
+def test_dashboard_shows_cost_setup_when_no_cost_records_exist(admin_app):
+    """The overview guides a tenant to billing setup before the first refresh."""
     body = _authenticated_admin_client(admin_app).get("/admin/").get_data(as_text=True)
 
-    assert "Kostenübersicht" in body
-    assert "Tatsächliche Kosten" in body
-    assert "Verbrauch" in body
-    assert "Schätzungen" in body
-    assert "Noch keine Datensätze" in body
-    assert "Account" in body
-    assert "Metrik" in body
-    assert "Wert" in body
-    assert "Zeitraum (UTC)" in body
-    assert "Granularität" in body
-    assert "Quelle" in body
+    assert "Kostenübersicht nach Konto" in body
+    assert "Noch keine Kostendaten" in body
+    assert "Kein Billing-Scope gebunden" in body
+    assert 'href="/admin/settings/costs"' in body
 
 
 def test_costs_page_renders_azure_scope_fields_before_binding(admin_app):

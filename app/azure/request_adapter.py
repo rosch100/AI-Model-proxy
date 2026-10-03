@@ -12,8 +12,13 @@ from typing import Any, Dict, List
 from flask import Request, current_app
 
 from ..auth import current_tenant
+from ..common.logging import console
 from ..exceptions import CursorConfigurationError, ServiceConfigurationError
-from ..models import SUPPORTED_MODELS, SUPPORTED_MODELS_TEXT
+from ..models import (
+    SUPPORTED_MODELS,
+    SUPPORTED_MODELS_TEXT,
+    select_fallback_public_model,
+)
 from ..tenants import AUTH_MODE_TENANT, DatabaseTenantSnapshot, TenantConfig
 
 _STRIPPED_UPSTREAM_HEADERS = frozenset(
@@ -217,8 +222,6 @@ class RequestAdapter:
         # Debug: log the shape of first tool to understand what Cursor sends
         if tools:
             sample = tools[0] if isinstance(tools[0], dict) else {}
-            from ..common.logging import console
-
             console.print(
                 f"[bold yellow]TOOL_DEBUG:[/bold yellow] count={len(tools)}, "
                 f"first_keys={list(sample.keys())[:10]}, type={sample.get('type')}, "
@@ -234,8 +237,6 @@ class RequestAdapter:
                 if tool.get("name"):
                     out.append(tool)
                 else:
-                    from ..common.logging import console
-
                     console.print(
                         f"[bold red]TOOL_SKIPPED:[/bold red] tool has no 'function' and no 'name'. "
                         f"keys={list(tool.keys())[:10]}"
@@ -249,8 +250,6 @@ class RequestAdapter:
                 "strict": False,
             }
             out.append(transformed)
-
-        from ..common.logging import console
 
         console.print(
             f"[bold yellow]TOOL_TRANSFORM:[/bold yellow] {len(tools)} tools in → {len(out)} tools out"
@@ -283,8 +282,12 @@ class RequestAdapter:
     ) -> Dict[str, Any]:
         """Resolve the Azure deployment and reasoning settings for this request."""
         inbound_model = payload.get("model")
+        if not isinstance(inbound_model, str) or not inbound_model.strip():
+            raise CursorConfigurationError("Model name must be a non-empty string.")
+        if any(character.isspace() for character in inbound_model):
+            raise CursorConfigurationError("Model name must not contain whitespace.")
 
-        model_key = (inbound_model or "").lower()
+        model_key = inbound_model.lower()
         # Allow effort-suffixed names (e.g. gpt-5.6-sol-high) since Cursor only
         # sends reasoning.effort for model names it recognizes.
         suffix_effort = None
@@ -295,18 +298,26 @@ class RequestAdapter:
                     model_key = base
                     suffix_effort = effort
                     break
-        if model_key not in SUPPORTED_MODELS:
-            raise CursorConfigurationError(
-                "Model name must be one of:\n"
-                f"{SUPPORTED_MODELS_TEXT}\n"
-                f"\nGot: {inbound_model}"
-            )
-
+        supported = model_key in SUPPORTED_MODELS
         if model_key not in deployment_map:
-            raise CursorConfigurationError(
-                f"Model {model_key!r} is supported by the proxy but not configured "
-                "for this Azure resource."
+            fallback_model = select_fallback_public_model(deployment_map)
+            if fallback_model is None:
+                if not supported:
+                    raise CursorConfigurationError(
+                        "Model name must be one of:\n"
+                        f"{SUPPORTED_MODELS_TEXT}\n"
+                        f"\nGot: {inbound_model}"
+                    )
+                raise CursorConfigurationError(
+                    f"Model {model_key!r} is supported by the proxy but not configured "
+                    "for this Azure resource."
+                )
+            console.print(
+                f"MODEL_FALLBACK: inbound={inbound_model!r} → {fallback_model}",
+                style="yellow",
+                markup=False,
             )
+            model_key = fallback_model
         azure_deployment = deployment_map[model_key]
         inbound_reasoning = (
             payload.get("reasoning") if isinstance(payload, dict) else None
@@ -346,10 +357,14 @@ class RequestAdapter:
         self.adapter.inbound_model = None
 
         # Parse request body (Cursor sometimes sends malformed payloads)
-        payload = req.get_json(silent=True, force=False) or {}
+        payload = req.get_json(silent=True, force=False)
+        if payload is None:
+            payload = {}
+        elif not isinstance(payload, dict):
+            raise CursorConfigurationError("Request body must be a JSON object.")
 
         # Determine target model
-        inbound_model = payload.get("model") if isinstance(payload, dict) else None
+        inbound_model = payload.get("model")
         self.adapter.inbound_model = inbound_model
 
         settings = current_app.config
@@ -414,8 +429,6 @@ class RequestAdapter:
         azure_deployment = resolved_reasoning["azure_deployment"]
         reasoning_effort = resolved_reasoning["reasoning_effort"]
         inbound_summary = resolved_reasoning["inbound_summary"]
-
-        from ..common.logging import console
 
         # Log request details including cache-relevant fields
         input_len = len(raw_input) if raw_input else 0

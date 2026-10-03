@@ -1,50 +1,125 @@
 {% extends "admin/base.html" %}
 {% set current_user_nav = true %}
+{% set main_class = "dashboard-main" %}
 {% block title %}Übersicht · Altanis Proxy{% endblock %}
 {% block content %}
-<section>
-  <h1>Mandant {{ view.tenant_id }}</h1>
-  <p class="lede">Status der gespeicherten Anbieterprofile.</p>
-  <p>Custom-Model-ID: <code>{{ view.custom_model_id }}</code></p>
-  <ul class="status-list">
-    {% for provider in view.providers %}
-      <li>
-        <strong>{{ provider.label }}</strong>
-        — {{ provider.state }}
-        {% if provider.is_active %}(aktiv){% endif %}
-      </li>
-    {% endfor %}
-  </ul>
-
-  <section aria-labelledby="cost-overview-heading">
-    <h2 id="cost-overview-heading">Kostenübersicht</h2>
-    <p class="lede">Abrechnungswerte und Provider-Verbrauch werden getrennt und mit ihrer tatsächlichen Granularität angezeigt.</p>
-    <dl class="cost-summary" aria-label="Kosten- und Usage-Datensätze">
-      <div><dt>Tatsächliche Kosten</dt><dd>{% if view.cost_record_counts.actual %}{{ view.cost_record_counts.actual }} Datensätze{% else %}Noch keine Datensätze{% endif %}</dd><dd>Provider-Abrechnung, nach Währung getrennt</dd></div>
-      <div><dt>Verbrauch</dt><dd>{% if view.cost_record_counts.usage %}{{ view.cost_record_counts.usage }} Datensätze{% else %}Noch keine Datensätze{% endif %}</dd><dd>Provider-gemeldete Usage-Metriken</dd></div>
-      <div><dt>Schätzungen</dt><dd>{% if view.cost_record_counts.estimate %}{{ view.cost_record_counts.estimate }} Datensätze{% else %}Noch keine Datensätze{% endif %}</dd><dd>Nur mit belastbarer Preis- und Usage-Quelle</dd></div>
-    </dl>
-    <div class="table-scroll">
-      <table class="cost-records">
-        <caption>Letzte verifizierte Kosten- und Usage-Buckets</caption>
-        <thead><tr><th scope="col">Account</th><th scope="col">Art / Metrik</th><th scope="col">Wert</th><th scope="col">Zeitraum (UTC)</th><th scope="col">Granularität</th><th scope="col">Quelle</th></tr></thead>
-        <tbody>
-          {% for record in view.cost_records %}
-            <tr>
-              <td>{{ view.cost_record_profile_names.get(record.binding_id, record.provider) }}</td>
-              <td>{{ record.kind }} / {{ record.metric }}</td>
-              <td>{{ record.value }}{% if record.currency %} {{ record.currency }}{% else %} {{ record.unit }}{% endif %}</td>
-              <td>{{ record.bucket_start.strftime("%Y-%m-%d %H:%M") }} – {{ record.bucket_end.strftime("%Y-%m-%d %H:%M") }}</td>
-              <td>{{ record.granularity }}</td>
-              <td>{{ record.source }}</td>
-            </tr>
-          {% else %}
-            <tr><td colspan="6">Noch keine Datensätze. Nach Einrichtung der Billing-Scopes und dem ersten erfolgreichen Refresh erscheinen hier die belegten Werte.</td></tr>
-          {% endfor %}
-        </tbody>
-      </table>
+<section class="dashboard-page" aria-labelledby="dashboard-title">
+  <header class="dashboard-heading">
+    <div>
+      <p class="eyebrow">Mandant {{ view.tenant_id }}</p>
+      <h1 id="dashboard-title">Übersicht</h1>
+      <p class="lede">Kosten und gemeldete Nutzung aus dem letzten erfolgreichen Refresh je Anbieter-Konto.</p>
     </div>
-    <p><a href="{{ url_for('admin.settings_costs') }}">Kosten, Billing-Zugänge und Zeiträume öffnen</a></p>
+    <a class="secondary-cta" href="{{ url_for('admin.settings_costs') }}">Kosten verwalten</a>
+  </header>
+
+  <section class="dashboard-section" aria-labelledby="accounts-title">
+    <div class="section-heading">
+      <div>
+        <h2 id="accounts-title">Kostenübersicht nach Konto</h2>
+        <p class="section-caption">Kostenwährungen und Nutzungsmesswerte bleiben getrennt. Für jedes Konto wird nur der letzte erfolgreiche Snapshot gezeigt; spätere Fehlversuche erscheinen als Status.</p>
+      </div>
+    </div>
+
+    {% if view.cost_accounts %}
+      <div class="account-cost-list">
+        {% for account in view.cost_accounts %}
+          <article class="account-cost-card">
+            <header class="account-cost-heading">
+              <div>
+                <p class="eyebrow">{{ account.provider_label }}</p>
+                <h3>{{ account.profile_name }}</h3>
+              </div>
+              {% if account.last_job_status %}
+                <span class="refresh-badge{% if account.last_job_status in ('Fehlgeschlagen', 'Nicht verfügbar') %} refresh-badge-warning{% elif account.last_job_status in ('Aktualisierung läuft', 'Wiederholung geplant') %} refresh-badge-pending{% endif %}">{{ account.last_job_status }}</span>
+              {% endif %}
+            </header>
+
+            {% if account.actual_costs or account.estimates or account.usage %}
+              <div class="account-cost-stats">
+                {% if account.actual_costs %}
+                  <div>
+                    <h4>Ist-Kosten</h4>
+                    <ul class="detail-values">
+                      {% for metric in account.actual_costs %}
+                        <li><span>{{ metric.label }}</span><strong>{{ metric.formatted_value }} {{ metric.currency }}</strong></li>
+                      {% endfor %}
+                    </ul>
+                  </div>
+                {% endif %}
+                {% if account.estimates %}
+                  <div>
+                    <h4>Schätzungen</h4>
+                    <ul class="detail-values">
+                      {% for metric in account.estimates %}
+                        <li><span>{{ metric.label }}</span><strong>{{ metric.formatted_value }} {{ metric.currency }}</strong></li>
+                      {% endfor %}
+                    </ul>
+                  </div>
+                {% endif %}
+                {% if account.usage %}
+                  <div>
+                    <h4>Nutzung</h4>
+                    <ul class="detail-values">
+                      {% for metric in account.usage %}
+                        <li><span>{{ metric.label }}</span><strong>{{ metric.formatted_value }}</strong></li>
+                      {% endfor %}
+                    </ul>
+                  </div>
+                {% endif %}
+              </div>
+            {% elif account.last_successful_at %}
+              <p class="account-empty">Der letzte erfolgreiche Refresh lieferte keine Kosten- oder Nutzungsdaten.</p>
+            {% else %}
+              <p class="account-empty">Für dieses Konto liegen noch keine erfolgreichen Kosten- oder Nutzungsdaten vor.</p>
+            {% endif %}
+
+            {% if account.last_successful_at %}
+              <p class="account-meta">Zeitraum: {{ account.period_start.strftime('%d.%m.%Y') }} – {{ account.period_end.strftime('%d.%m.%Y') }} UTC · aktualisiert {{ account.last_successful_at.strftime('%d.%m.%Y, %H:%M UTC') }}</p>
+            {% elif not account.has_billing_scope %}
+              <p class="account-meta">Kein Billing-Scope gebunden.</p>
+            {% elif not account.has_billing_key %}
+              <p class="account-meta">Billing-Zugang fehlt noch.</p>
+            {% else %}
+              <p class="account-meta">Es gibt noch keinen erfolgreichen Abruf.</p>
+            {% endif %}
+            {% if account.last_job_message %}
+              <p class="account-error">{{ account.last_job_message }}</p>
+            {% endif %}
+          </article>
+        {% endfor %}
+      </div>
+    {% endif %}
+
+    {% if view.accounts_with_cost_data == 0 %}
+      <div class="empty-state">
+        <span class="empty-state-mark" aria-hidden="true">—</span>
+        <h3>Noch keine Kostendaten</h3>
+        {% if view.billing_scope_count == 0 %}
+          <p>Kein Billing-Scope gebunden. Hinterlege zuerst den passenden Scope und Anbieterzugang.</p>
+        {% elif view.accounts_with_successful_refresh == 0 %}
+          <p>Billing-Scope ist vorhanden, aber es wurde noch kein erfolgreicher Kosten-Refresh gespeichert.</p>
+        {% elif view.accounts_with_successful_refresh == view.billing_scope_count %}
+          <p>Die letzten erfolgreichen Kosten-Refreshes lieferten keine Kostendaten.</p>
+        {% else %}
+          <p>Einige Konten wurden noch nicht erfolgreich aktualisiert; erfolgreiche Refreshes lieferten keine Kostendaten.</p>
+        {% endif %}
+        <a class="primary-cta" href="{{ url_for('admin.settings_costs') }}">Kosten einrichten und aktualisieren</a>
+      </div>
+    {% endif %}
+  </section>
+
+  <section class="dashboard-section provider-status-section" aria-labelledby="providers-title">
+    <h2 id="providers-title">Verbindung</h2>
+    <ul class="provider-status-grid">
+      {% for provider in view.providers %}
+        <li class="provider-status-card">
+          <span class="provider-status-indicator{% if provider.state == 'Gespeichert' %} is-ready{% elif provider.state == 'Prüfung erforderlich' %} needs-attention{% endif %}" aria-hidden="true"></span>
+          <div><strong>{{ provider.label }}</strong><span>{{ provider.state }}{% if provider.is_active %} · aktiv{% endif %}</span></div>
+        </li>
+      {% endfor %}
+    </ul>
+    <p class="dashboard-model-id">Custom-Model-ID: <code>{{ view.custom_model_id }}</code></p>
   </section>
 </section>
 {% endblock %}

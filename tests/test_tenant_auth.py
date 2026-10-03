@@ -54,14 +54,23 @@ def tenant_app(tenant_keys) -> Flask:
             tenant_keys["acme"],
             azure_base_url="https://acme.openai.azure.com",
             azure_api_key="acme-azure-key",
-            deployments={"gpt-5.4": "acme-gpt54", "gpt-5.5": "acme-gpt55"},
+            deployments={
+                "gpt-6-astra": "gpt-6-astra-api",
+                "gpt-6-luna": "gpt-6-luna-api",
+                "gpt-6.1-sol": "gpt-6.1-sol-api",
+            },
         ),
         _tenant(
             "beta",
             tenant_keys["beta"],
             azure_base_url="https://beta.openai.azure.com",
             azure_api_key="beta-azure-key",
-            deployments={"gpt-5.4": "beta-gpt54"},
+            deployments={
+                "gpt-6-astra": "gpt-6-astra",
+                "gpt-6-luna": "gpt-6-luna",
+                "gpt-6-sol": "gpt-6-sol",
+                "gpt-6.1-sol": "gpt-6.1-sol",
+            },
         ),
     )
     config = type(
@@ -403,8 +412,17 @@ def test_tenant_models_are_isolated(tenant_testapp, tenant_keys):
         status=200,
     ).json
 
-    assert [item["id"] for item in acme["data"]] == ["gpt-5.4", "gpt-5.5"]
-    assert [item["id"] for item in beta["data"]] == ["gpt-5.4"]
+    assert [item["id"] for item in acme["data"]] == [
+        "gpt-6-astra",
+        "gpt-6-luna",
+        "gpt-6.1-sol",
+    ]
+    assert [item["id"] for item in beta["data"]] == [
+        "gpt-6-astra",
+        "gpt-6-luna",
+        "gpt-6-sol",
+        "gpt-6.1-sol",
+    ]
 
 
 def test_tenant_resolution_is_independent_of_public_hostname(
@@ -424,7 +442,11 @@ def test_tenant_resolution_is_independent_of_public_hostname(
     ]
 
     assert responses[0] == responses[1]
-    assert [item["id"] for item in responses[0]["data"]] == ["gpt-5.4", "gpt-5.5"]
+    assert [item["id"] for item in responses[0]["data"]] == [
+        "gpt-6-astra",
+        "gpt-6-luna",
+        "gpt-6.1-sol",
+    ]
 
 
 def test_tenant_azure_credentials_and_cache_keys_are_isolated(tenant_app, tenant_keys):
@@ -432,7 +454,7 @@ def test_tenant_azure_credentials_and_cache_keys_are_isolated(tenant_app, tenant
     adapter = AzureAdapter().request_adapter
     conversation_id = "conv-shared-across-tenants"
     payload = {
-        "model": "gpt-5.4",
+        "model": "gpt-6-luna",
         "input": [{"role": "user", "content": [{"type": "input_text", "text": "Hi"}]}],
         "metadata": {"cursorConversationId": conversation_id},
         "stream": True,
@@ -466,8 +488,8 @@ def test_tenant_azure_credentials_and_cache_keys_are_isolated(tenant_app, tenant
     assert beta_kwargs["url"] == "https://beta.openai.azure.com/openai/v1/responses"
     assert acme_kwargs["headers"]["api-key"] == "acme-azure-key"
     assert beta_kwargs["headers"]["api-key"] == "beta-azure-key"
-    assert acme_kwargs["json"]["model"] == "acme-gpt54"
-    assert beta_kwargs["json"]["model"] == "beta-gpt54"
+    assert acme_kwargs["json"]["model"] == "gpt-6-luna-api"
+    assert beta_kwargs["json"]["model"] == "gpt-6-luna"
     assert acme_kwargs["json"]["prompt_cache_key"] == f"acme:{conversation_id}"
     assert beta_kwargs["json"]["prompt_cache_key"] == f"beta:{conversation_id}"
     assert acme_kwargs["headers"]["session_id"] == f"acme:{conversation_id}"

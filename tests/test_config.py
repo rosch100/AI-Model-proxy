@@ -124,12 +124,9 @@ class TestConfig:
             == "https://azureopenai-instanz2.cognitiveservices.azure.com/openai/v1/responses"
         )
         expected_azure_deployments = {
-            "gpt-5.6-luna": "gpt-5-6-luna-api",
-            "gpt-5.6-sol": "gpt-5-6-sol-api",
-            "gpt-5.6-terra": "gpt-5-6-terra-api",
             "gpt-6-astra": "gpt-6-astra-api",
             "gpt-6-luna": "gpt-6-luna-api",
-            "gpt-6-sol": "gpt-6-sol-api",
+            "gpt-6.1-sol": "gpt-6.1-sol-api",
         }
         assert settings.AZURE_MODEL_DEPLOYMENTS == expected_azure_deployments
         assert settings.SERVICE_API_KEY in (None, "")

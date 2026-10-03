@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import json
-from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from functools import wraps
 from typing import Callable
@@ -460,57 +459,117 @@ def webauthn_register_complete():
 @admin_bp.get("/")
 @login_required
 def dashboard():
-    """Show provider status and the latest verified cost records."""
-    tenant, profiles = _load_tenant_profiles()
-    dashboard = dashboard_view(tenant, profiles)
+    """Show provider status and the latest successful cost snapshot per account."""
     database = _database()
     with database.sessions() as session:
-        counts = dict(
-            session.execute(
-                select(CostUsageRecord.kind, func.count(CostUsageRecord.id))
-                .where(CostUsageRecord.tenant_id == g.admin.tenant_id)
-                .group_by(CostUsageRecord.kind)
-            ).all()
-        )
-        records = tuple(
+        tenant = session.get(Tenant, g.admin.tenant_id)
+        profiles = tuple(
             session.scalars(
-                select(CostUsageRecord)
-                .where(CostUsageRecord.tenant_id == g.admin.tenant_id)
-                .order_by(
-                    CostUsageRecord.bucket_start.desc(), CostUsageRecord.id.desc()
+                select(ProviderProfile)
+                .where(
+                    ProviderProfile.tenant_id == tenant.id,
+                    ProviderProfile.deleted_at.is_(None),
                 )
-                .limit(10)
+                .order_by(ProviderProfile.provider, ProviderProfile.display_name)
             )
         )
-        record_bindings = {
-            binding.id: (profile.display_name or profile.provider)
-            for profile, binding in session.execute(
-                select(ProviderProfile, ProviderScopeBinding)
+        bindings = tuple(
+            session.execute(
+                select(ProviderProfile, ProviderScopeBinding, ProviderScopeNode)
                 .join(
                     ProviderScopeBinding,
                     (ProviderScopeBinding.profile_id == ProviderProfile.id)
                     & (ProviderScopeBinding.tenant_id == ProviderProfile.tenant_id),
                 )
-                .where(
-                    ProviderProfile.tenant_id == g.admin.tenant_id,
-                    ProviderProfile.deleted_at.is_(None),
+                .join(
+                    ProviderScopeNode,
+                    ProviderScopeNode.id == ProviderScopeBinding.node_id,
                 )
+                .where(
+                    ProviderProfile.tenant_id == tenant.id,
+                    ProviderProfile.deleted_at.is_(None),
+                    ProviderScopeBinding.purpose == "billing",
+                )
+                .order_by(ProviderProfile.provider, ProviderProfile.display_name)
+            ).all()
+        )
+        binding_ids = tuple(binding.id for _profile, binding, _node in bindings)
+        ranked_jobs = (
+            select(
+                CostRefreshJob.id.label("job_id"),
+                func.row_number()
+                .over(
+                    partition_by=CostRefreshJob.binding_id,
+                    order_by=(
+                        CostRefreshJob.created_at.desc(),
+                        CostRefreshJob.id.desc(),
+                    ),
+                )
+                .label("job_rank"),
             )
-        }
-    dashboard = replace(
-        dashboard,
-        cost_record_counts={
-            kind: counts.get(kind, 0) for kind in ("actual", "usage", "estimate")
-        },
-        cost_records=records,
-        cost_record_profile_names={
-            record.binding_id: record_bindings.get(record.binding_id, record.provider)
-            for record in records
-        },
-    )
+            .where(
+                CostRefreshJob.tenant_id == tenant.id,
+                CostRefreshJob.binding_id.in_(binding_ids),
+            )
+            .subquery()
+        )
+        ranked_successes = (
+            select(
+                CostRefreshJob.id.label("job_id"),
+                func.row_number()
+                .over(
+                    partition_by=CostRefreshJob.binding_id,
+                    order_by=(
+                        CostRefreshJob.created_at.desc(),
+                        CostRefreshJob.id.desc(),
+                    ),
+                )
+                .label("success_rank"),
+            )
+            .where(
+                CostRefreshJob.tenant_id == tenant.id,
+                CostRefreshJob.binding_id.in_(binding_ids),
+                CostRefreshJob.status == "success",
+            )
+            .subquery()
+        )
+        latest_attempts = tuple(
+            session.scalars(
+                select(CostRefreshJob)
+                .join(ranked_jobs, ranked_jobs.c.job_id == CostRefreshJob.id)
+                .where(ranked_jobs.c.job_rank == 1)
+            )
+        )
+        latest_successes = tuple(
+            session.scalars(
+                select(CostRefreshJob)
+                .join(ranked_successes, ranked_successes.c.job_id == CostRefreshJob.id)
+                .where(ranked_successes.c.success_rank == 1)
+            )
+        )
+        jobs = tuple(
+            sorted(
+                {job.id: job for job in latest_attempts + latest_successes}.values(),
+                key=lambda job: (job.created_at, job.id),
+                reverse=True,
+            )
+        )
+        successful_job_ids = tuple(job.id for job in latest_successes)
+        records = tuple(
+            session.scalars(
+                select(CostUsageRecord)
+                .where(
+                    CostUsageRecord.tenant_id == tenant.id,
+                    CostUsageRecord.job_id.in_(successful_job_ids),
+                )
+                .order_by(CostUsageRecord.id)
+            )
+        )
+        view = dashboard_view(tenant, profiles, bindings, jobs, records)
+        session.expunge_all()
     return render_template(
         "admin/dashboard.html",
-        view=dashboard,
+        view=view,
         logout_form=LoginForm(),
     )
 

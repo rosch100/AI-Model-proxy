@@ -35,7 +35,7 @@ class TestBadSummaryLevel(ReplyBase):
 
 
 class TestBadModelName(ReplyBase):
-    """Test a single ping-pong interaction, no tool calls."""
+    """Unknown models still fail when no fallback preference is configured."""
 
     expected_upstream_request_body = None
     expected_downstream_status_code = 400
@@ -47,6 +47,10 @@ class TestBadModelName(ReplyBase):
             "Got: foo-minimal"
         ).replace("\n", "\n\t")
     ).encode()
+
+    def modify_settings(self, app) -> None:
+        """Leave only a non-preference deployment so fallback cannot apply."""
+        app.config["AZURE_MODEL_DEPLOYMENTS"] = {"gpt-6-sol": "gpt-6-sol"}
 
     @property
     def downstream_request_body(self) -> str:

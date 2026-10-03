@@ -9,12 +9,9 @@ from app.models import SUPPORTED_MODELS
 from app.tenants import DatabaseTenantSnapshot
 
 DEPLOYED_MODEL_ROUTES = (
-    ("gpt-5.6-luna", "gpt-5-6-luna-api"),
-    ("gpt-5.6-sol", "gpt-5-6-sol-api"),
-    ("gpt-5.6-terra", "gpt-5-6-terra-api"),
     ("gpt-6-astra", "gpt-6-astra-api"),
     ("gpt-6-luna", "gpt-6-luna-api"),
-    ("gpt-6-sol", "gpt-6-sol-api"),
+    ("gpt-6.1-sol", "gpt-6.1-sol-api"),
 )
 
 
@@ -68,11 +65,114 @@ def test_request_adapter_accepts_supported_bare_models(app, model_name):
     assert request_kwargs["json"]["reasoning"]["effort"] == "medium"
 
 
-def test_request_adapter_rejects_supported_model_without_deployment_mapping(app):
-    """Reject globally supported model IDs absent from this resource's map."""
+def test_request_adapter_falls_back_to_luna_for_unmapped_supported_model(app):
+    """Route supported-but-unmapped models to the cheapest configured preference."""
     adapter = AzureAdapter().request_adapter
     app.config["AZURE_MODEL_DEPLOYMENTS"] = {
         "gpt-6-luna": "gpt-6-luna-api",
+        "gpt-6-sol": "gpt-6-sol-api",
+    }
+
+    resolved = adapter._resolve_model_and_reasoning(
+        {"model": "gpt-5.4"},
+        app.config["AZURE_MODEL_DEPLOYMENTS"],
+    )
+
+    assert resolved["azure_deployment"] == "gpt-6-luna-api"
+    assert resolved["reasoning_effort"] == "high"
+
+
+@pytest.mark.parametrize("model", [None, "", "  "])
+def test_request_adapter_rejects_missing_or_empty_model(app, model):
+    """Fallback must not turn a malformed request into a billable model call."""
+    adapter = AzureAdapter().request_adapter
+
+    with pytest.raises(CursorConfigurationError, match="non-empty string"):
+        adapter._resolve_model_and_reasoning(
+            {"model": model},
+            {"gpt-6-luna": "gpt-6-luna-api"},
+        )
+
+
+@pytest.mark.parametrize(
+    "model",
+    [" gpt-6-luna", "gpt-6-luna ", " gpt-6-luna ", "gpt-6 luna"],
+)
+def test_request_adapter_rejects_model_with_whitespace(app, model):
+    """Do not silently reroute malformed model IDs to a billable fallback."""
+    adapter = AzureAdapter().request_adapter
+
+    with pytest.raises(CursorConfigurationError, match="must not contain whitespace"):
+        adapter._resolve_model_and_reasoning(
+            {"model": model},
+            {"gpt-6-luna": "gpt-6-luna-api"},
+        )
+
+
+def test_request_adapter_rejects_non_object_json_body(app):
+    """Reject valid JSON arrays before mapping request fields."""
+    adapter = AzureAdapter().request_adapter
+    request = app.test_request_context(
+        "/chat/completions",
+        method="POST",
+        data="[]",
+        content_type="application/json",
+        headers={"Authorization": "Bearer test-service-api-key"},
+    ).request
+
+    with pytest.raises(CursorConfigurationError, match="JSON object"):
+        adapter.adapt(request)
+
+
+def test_request_adapter_falls_back_to_luna_for_unknown_model(app):
+    """Route unknown model IDs to Luna when it is configured."""
+    adapter = AzureAdapter().request_adapter
+    app.config["AZURE_MODEL_DEPLOYMENTS"] = {
+        "gpt-6-luna": "gpt-6-luna-api",
+    }
+
+    resolved = adapter._resolve_model_and_reasoning(
+        {"model": "totally-unknown-model"},
+        app.config["AZURE_MODEL_DEPLOYMENTS"],
+    )
+
+    assert resolved["azure_deployment"] == "gpt-6-luna-api"
+
+
+def test_request_adapter_falls_back_for_model_name_containing_rich_markup(app):
+    """Untrusted model IDs are logged as plain text without breaking fallback."""
+    adapter = AzureAdapter().request_adapter
+    deployment_map = {"gpt-6-luna": "gpt-6-luna-api"}
+
+    resolved = adapter._resolve_model_and_reasoning(
+        {"model": "[/bold]unknown-model"},
+        deployment_map,
+    )
+
+    assert resolved["azure_deployment"] == "gpt-6-luna-api"
+
+
+def test_request_adapter_preserves_effort_suffix_when_falling_back(app):
+    """Keep Cursor effort suffixes when falling back to a preference model."""
+    adapter = AzureAdapter().request_adapter
+    app.config["AZURE_MODEL_DEPLOYMENTS"] = {
+        "gpt-6-luna": "gpt-6-luna-api",
+    }
+
+    resolved = adapter._resolve_model_and_reasoning(
+        {"model": "gpt-5.4-low"},
+        app.config["AZURE_MODEL_DEPLOYMENTS"],
+    )
+
+    assert resolved["azure_deployment"] == "gpt-6-luna-api"
+    assert resolved["reasoning_effort"] == "low"
+
+
+def test_request_adapter_rejects_when_no_fallback_preference_is_configured(app):
+    """Fail closed when neither the requested nor any preference model is mapped."""
+    adapter = AzureAdapter().request_adapter
+    app.config["AZURE_MODEL_DEPLOYMENTS"] = {
+        "gpt-6-sol": "gpt-6-sol-api",
     }
 
     with pytest.raises(CursorConfigurationError, match="not configured"):
@@ -80,6 +180,36 @@ def test_request_adapter_rejects_supported_model_without_deployment_mapping(app)
             {"model": "gpt-5.4"},
             app.config["AZURE_MODEL_DEPLOYMENTS"],
         )
+
+
+def test_request_adapter_rejects_unknown_model_without_fallback_preference(app):
+    """Keep rejecting unknown IDs when no cheap preference model is available."""
+    adapter = AzureAdapter().request_adapter
+    app.config["AZURE_MODEL_DEPLOYMENTS"] = {
+        "gpt-6-sol": "gpt-6-sol-api",
+    }
+
+    with pytest.raises(CursorConfigurationError, match="Model name must be one of"):
+        adapter._resolve_model_and_reasoning(
+            {"model": "foo-minimal"},
+            app.config["AZURE_MODEL_DEPLOYMENTS"],
+        )
+
+
+def test_request_adapter_does_not_fallback_for_explicitly_mapped_model(app):
+    """Keep explicit mapped models on their own deployment."""
+    adapter = AzureAdapter().request_adapter
+    app.config["AZURE_MODEL_DEPLOYMENTS"] = {
+        "gpt-6-luna": "gpt-6-luna-api",
+        "gpt-6.1-sol": "gpt-6.1-sol-api",
+    }
+
+    resolved = adapter._resolve_model_and_reasoning(
+        {"model": "gpt-6.1-sol"},
+        app.config["AZURE_MODEL_DEPLOYMENTS"],
+    )
+
+    assert resolved["azure_deployment"] == "gpt-6.1-sol-api"
 
 
 @pytest.mark.parametrize("effort", ("minimal", "low", "medium", "high"))

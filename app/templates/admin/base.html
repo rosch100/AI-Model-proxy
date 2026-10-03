@@ -27,7 +27,7 @@
       </form>
     </header>
     {% endif %}
-    <main id="content">
+    <main id="content" class="{{ main_class|default('') }}">
       {% with messages = get_flashed_messages(with_categories=true) %}
         {% if messages %}
           <ul class="flashes">

@@ -584,18 +584,23 @@ class ResponseAdapter:
 
     def _failed(self, obj: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
         """Handle response.failed events and emit a single chunk."""
-        error = obj.get("response", {}).get("error", {})
+        response = obj.get("response") if isinstance(obj, dict) else None
+        error = response.get("error") if isinstance(response, dict) else None
+        if not isinstance(error, dict) or not error:
+            message = (
+                "Azure reported a failed response without error details. "
+                "This may be an Azure-side issue rather than a proxy bug."
+            )
+        else:
+            code = str(error.get("code") or "unknown")
+            error_message = str(error.get("message") or "")
+            message = (
+                f"Azure raised a '{code}' error with the following message:\n\n\n"
+                f"_**{error_message}**_\n\n\n"
+                "This may be an Azure-side issue rather than a proxy bug."
+            )
         return self._build_completion_chunk(
-            delta={
-                "role": "assistant",
-                "content": "Azure raised a '"
-                + error.get("code", "")
-                + "' error with the following message:\n\n\n"
-                + "_**"
-                + error.get("message", "")
-                + "**_\n\n\n"
-                "This may be an Azure-side issue rather than a proxy bug.",
-            }
+            delta={"role": "assistant", "content": message}
         )
 
     @staticmethod

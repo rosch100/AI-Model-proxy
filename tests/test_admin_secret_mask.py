@@ -354,3 +354,325 @@ def test_costs_page_shows_azure_host_identity_and_bound_scope_controls(admin_app
     assert 'name="client_secret"' not in body
     assert "Azure-Service-Principal" not in body
     assert "acme-rg" in body
+
+
+def test_dashboard_shows_cost_schema_when_no_cost_records_exist(admin_app):
+    """The overview presents cost categories and columns before first refresh."""
+    body = _authenticated_admin_client(admin_app).get("/admin/").get_data(as_text=True)
+
+    assert "Kostenübersicht" in body
+    assert "Tatsächliche Kosten" in body
+    assert "Verbrauch" in body
+    assert "Schätzungen" in body
+    assert "Noch keine Datensätze" in body
+    assert "Account" in body
+    assert "Metrik" in body
+    assert "Wert" in body
+    assert "Zeitraum (UTC)" in body
+    assert "Granularität" in body
+    assert "Quelle" in body
+
+
+def test_costs_page_renders_azure_scope_fields_before_binding(admin_app):
+    """Unbound Azure profiles expose the two required ARM ID input fields."""
+    database = admin_app.extensions["database"]
+    with database.sessions.begin() as session:
+        session.add(
+            ProviderProfile(
+                id="azure-profile",
+                tenant_id="acme",
+                provider="azure",
+                display_name="Azure Production",
+                settings={},
+            )
+        )
+
+    body = (
+        _authenticated_admin_client(admin_app)
+        .get("/admin/settings/costs")
+        .get_data(as_text=True)
+    )
+
+    assert 'name="subscription_id"' in body
+    assert 'name="resource_group_arm_id"' in body
+    assert 'name="cognitive_resource_arm_id"' in body
+    assert 'name="exclusive_scope_confirmation"' in body
+    assert "Resource Group ARM-ID" in body
+    assert "Cognitive-Services-Ressource ARM-ID" in body
+    assert "Azure Billing-Scope speichern" in body
+    assert 'name="client_secret"' not in body
+
+
+def test_azure_scope_form_binds_only_matching_tenant_exclusive_scopes(admin_app):
+    """The form stores a confirmed Azure resource group and its child resource."""
+    database = admin_app.extensions["database"]
+    with database.sessions.begin() as session:
+        session.add(
+            ProviderProfile(
+                id="azure-profile",
+                tenant_id="acme",
+                provider="azure",
+                display_name="Azure Production",
+                settings={},
+            )
+        )
+    client = _authenticated_admin_client(admin_app)
+    page = client.get("/admin/settings/costs").get_data(as_text=True)
+    csrf_token = re.search(r'name="csrf_token" type="hidden" value="([^"]+)"', page)
+    assert csrf_token is not None
+
+    response = client.post(
+        "/admin/settings/costs/azure-scope",
+        data={
+            "csrf_token": csrf_token.group(1),
+            "profile_id": "azure-profile",
+            "subscription_id": "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
+            "resource_group_arm_id": (
+                "/subscriptions/aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa/"
+                "resourceGroups/acme-rg"
+            ),
+            "cognitive_resource_arm_id": (
+                "/subscriptions/aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa/"
+                "resourceGroups/acme-rg/providers/Microsoft.CognitiveServices/"
+                "accounts/acme-ai"
+            ),
+            "exclusive_scope_confirmation": "y",
+        },
+    )
+
+    assert response.status_code == 302
+    with database.sessions() as session:
+        bindings = list(session.scalars(select(ProviderScopeBinding)))
+        nodes = list(session.scalars(select(ProviderScopeNode)))
+        event = session.scalar(
+            select(AuditEvent).where(AuditEvent.action == "billing_scope.bind")
+        )
+        assert {binding.purpose for binding in bindings} == {"billing", "usage"}
+        assert {node.canonical_scope_id for node in nodes} == {
+            "/subscriptions/aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa/"
+            "resourcegroups/acme-rg",
+            "/subscriptions/aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa/"
+            "resourcegroups/acme-rg/providers/microsoft.cognitiveservices/"
+            "accounts/acme-ai",
+        }
+        assert event is not None
+        assert event.tenant_id == "acme"
+
+
+def test_azure_scope_form_rejects_usage_outside_selected_resource_group(admin_app):
+    """A Cognitive Services ARM ID must be a child of the entered billing scope."""
+    database = admin_app.extensions["database"]
+    with database.sessions.begin() as session:
+        session.add(
+            ProviderProfile(
+                id="azure-profile",
+                tenant_id="acme",
+                provider="azure",
+                display_name="Azure Production",
+                settings={},
+            )
+        )
+    client = _authenticated_admin_client(admin_app)
+    page = client.get("/admin/settings/costs").get_data(as_text=True)
+    csrf_token = re.search(r'name="csrf_token" type="hidden" value="([^"]+)"', page)
+    assert csrf_token is not None
+
+    response = client.post(
+        "/admin/settings/costs/azure-scope",
+        data={
+            "csrf_token": csrf_token.group(1),
+            "profile_id": "azure-profile",
+            "subscription_id": "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
+            "resource_group_arm_id": (
+                "/subscriptions/aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa/"
+                "resourceGroups/acme-rg"
+            ),
+            "cognitive_resource_arm_id": (
+                "/subscriptions/aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa/"
+                "resourceGroups/other-rg/providers/Microsoft.CognitiveServices/"
+                "accounts/acme-ai"
+            ),
+            "exclusive_scope_confirmation": "y",
+        },
+    )
+
+    assert response.status_code == 400
+    with database.sessions() as session:
+        assert list(session.scalars(select(ProviderScopeBinding))) == []
+        assert list(session.scalars(select(ProviderScopeNode))) == []
+
+
+def test_azure_scope_form_errors_and_values_stay_with_selected_profile(admin_app):
+    """A failed scope submission must not be repeated on another Azure profile."""
+    database = admin_app.extensions["database"]
+    with database.sessions.begin() as session:
+        for profile_id, display_name in (
+            ("azure-production", "Azure Production"),
+            ("azure-staging", "Azure Staging"),
+        ):
+            session.add(
+                ProviderProfile(
+                    id=profile_id,
+                    tenant_id="acme",
+                    provider="azure",
+                    display_name=display_name,
+                    settings={},
+                )
+            )
+
+    client = _authenticated_admin_client(admin_app)
+    page = client.get("/admin/settings/costs").get_data(as_text=True)
+    csrf_token = re.search(r'name="csrf_token" type="hidden" value="([^"]+)"', page)
+    assert csrf_token is not None
+    resource_group = (
+        "/subscriptions/aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa/" "resourceGroups/acme-rg"
+    )
+    invalid_resource = (
+        "/subscriptions/aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa/"
+        "resourceGroups/other-rg/providers/Microsoft.CognitiveServices/"
+        "accounts/acme-ai"
+    )
+
+    response = client.post(
+        "/admin/settings/costs/azure-scope",
+        data={
+            "csrf_token": csrf_token.group(1),
+            "profile_id": "azure-production",
+            "subscription_id": "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
+            "resource_group_arm_id": resource_group,
+            "cognitive_resource_arm_id": invalid_resource,
+            "exclusive_scope_confirmation": "y",
+        },
+    )
+
+    assert response.status_code == 400
+    body = response.get_data(as_text=True)
+    articles = re.findall(r'<article class="cost-account">([\s\S]*?)</article>', body)
+    assert len(articles) == 2
+    assert invalid_resource in articles[0]
+    assert invalid_resource not in articles[1]
+    assert "other-rg" not in articles[1]
+
+
+def test_default_model_editor_rejects_a_new_model_outside_catalog(admin_app):
+    """The fallback option preserves current configuration but cannot activate a missing model."""
+    database = admin_app.extensions["database"]
+    with database.sessions.begin() as session:
+        profile = create_provider_profile(
+            session,
+            database.secret_cipher,
+            "acme",
+            "openai",
+            "Production",
+            {},
+            "gpt-6-luna",
+            "sk-test",
+            "ada",
+        )
+        replace_catalog_entries(session, profile, [("gpt-6-astra", None)], None)
+        profile_id = profile.id
+        session.get(Tenant, "acme").active_profile_id = profile_id
+
+    client = _authenticated_admin_client(admin_app)
+    page = client.get(f"/admin/settings/connection/{profile_id}/edit")
+    body = page.get_data(as_text=True)
+    csrf_token = re.search(r'name="csrf_token" type="hidden" value="([^"]+)"', body)
+    assert csrf_token is not None
+
+    response = client.post(
+        f"/admin/settings/connection/{profile_id}/edit",
+        data={
+            "csrf_token": csrf_token.group(1),
+            "provider": "openai",
+            "display_name": "Production",
+            "default_model": "gpt-unsupported",
+            "api_key": "",
+            "organization": "",
+            "project": "",
+        },
+    )
+
+    assert response.status_code == 400
+    with database.sessions() as session:
+        assert session.get(ProviderProfile, profile_id).default_model == "gpt-6-luna"
+
+
+def test_default_model_editor_keeps_missing_saved_model_editable(admin_app):
+    """An active profile remains editable when its saved model left the catalog."""
+    database = admin_app.extensions["database"]
+    with database.sessions.begin() as session:
+        profile = create_provider_profile(
+            session,
+            database.secret_cipher,
+            "acme",
+            "openai",
+            "Production",
+            {},
+            "gpt-6-luna",
+            "sk-test",
+            "ada",
+        )
+        replace_catalog_entries(session, profile, [("gpt-6-astra", None)], None)
+        profile_id = profile.id
+        session.get(Tenant, "acme").active_profile_id = profile_id
+
+    client = _authenticated_admin_client(admin_app)
+    page = client.get(f"/admin/settings/connection/{profile_id}/edit")
+    assert page.status_code == 200
+    body = page.get_data(as_text=True)
+    assert 'value="gpt-6-luna"' in body
+    csrf_token = re.search(r'name="csrf_token" type="hidden" value="([^"]+)"', body)
+    assert csrf_token is not None
+
+    response = client.post(
+        f"/admin/settings/connection/{profile_id}/edit",
+        data={
+            "csrf_token": csrf_token.group(1),
+            "provider": "openai",
+            "display_name": "Updated Production",
+            "default_model": "gpt-6-luna",
+            "api_key": "",
+            "organization": "",
+            "project": "",
+        },
+    )
+
+    assert response.status_code == 302
+    with database.sessions() as session:
+        profile = session.get(ProviderProfile, profile_id)
+        assert profile.display_name == "Updated Production"
+        assert profile.default_model == "gpt-6-luna"
+
+
+def test_default_model_editor_is_catalog_scrollbox(admin_app):
+    """Editing a profile selects its default from its persisted catalog."""
+    database = admin_app.extensions["database"]
+    with database.sessions.begin() as session:
+        profile = create_provider_profile(
+            session,
+            database.secret_cipher,
+            "acme",
+            "openai",
+            "Production",
+            {},
+            "gpt-6-luna",
+            "sk-test",
+            "ada",
+        )
+        replace_catalog_entries(
+            session,
+            profile,
+            [("gpt-6-luna", None), ("gpt-6-astra", None)],
+            None,
+        )
+        profile_id = profile.id
+
+    response = _authenticated_admin_client(admin_app).get(
+        f"/admin/settings/connection/{profile_id}/edit"
+    )
+    assert response.status_code == 200, response.get_data(as_text=True)
+    body = response.get_data(as_text=True)
+
+    assert re.search(r'<select[^>]*name="default_model"[^>]*size="8"', body)
+    assert re.search(r'<option[^>]*selected[^>]*value="gpt-6-luna"[^>]*>', body)
+    assert 'value="gpt-6-astra"' in body

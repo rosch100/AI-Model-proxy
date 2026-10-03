@@ -18,11 +18,13 @@ from app.persistence.models import (
     ProviderCatalogEntry,
     ProviderProfile,
     ProviderScopeBinding,
+    ProviderScopeNode,
     Tenant,
     provider_profile_name_key,
 )
 from app.persistence.repositories import validate_routed_profile
 from app.persistence.secrets import SecretCipher
+from app.providers.azure_scope import canonical_cost_scopes
 from app.providers.azure_url import validate_azure_base_url
 from app.providers.catalog import selectable_catalog_models
 from app.tenants import hash_api_key
@@ -285,12 +287,30 @@ def update_provider_profile(
                 ProviderCatalogEntry.profile_id == profile.id
             )
         )
+        selectable_models = {
+            model_id
+            for model_id, _deployment_id in selectable_catalog_models(
+                profile.provider,
+                [(entry.model_id, entry.deployment_id) for entry in catalog],
+            )
+        }
+        if (
+            normalized_default_model != profile.default_model
+            and normalized_default_model not in selectable_models
+        ):
+            raise ValueError(
+                f"The default model for {profile.display_name} is not in its available catalog"
+            )
         candidate = ProviderProfile(
             provider=profile.provider,
-            display_name=profile.display_name,
+            display_name=name,
             settings=normalized_settings,
             default_model=normalized_default_model,
-            inference_secret_ciphertext=profile.inference_secret_ciphertext,
+            inference_secret_ciphertext=(
+                cipher.encrypt(inference_secret)
+                if inference_secret
+                else profile.inference_secret_ciphertext
+            ),
         )
         validate_routed_profile(
             candidate, [(entry.model_id, entry.deployment_id) for entry in catalog]
@@ -589,6 +609,112 @@ def replace_catalog_entries(
         _remove_from_route(
             session, profile, "system:catalog", "default_model_unavailable"
         )
+
+
+def bind_azure_cost_scopes(
+    session: Session,
+    tenant_id: str,
+    profile_id: str,
+    subscription_id: str,
+    resource_group_arm_id: str,
+    cognitive_resource_arm_id: str,
+    actor_id: str,
+) -> tuple[ProviderScopeBinding, ProviderScopeBinding]:
+    """Bind one exclusively confirmed Azure resource group and child resource."""
+    profile = session.scalar(
+        select(ProviderProfile)
+        .where(
+            ProviderProfile.tenant_id == tenant_id,
+            ProviderProfile.id == profile_id,
+            ProviderProfile.provider == "azure",
+            ProviderProfile.deleted_at.is_(None),
+        )
+        .with_for_update()
+    )
+    if profile is None:
+        raise LookupError("Azure provider profile was not found for this tenant.")
+    if (
+        session.scalar(
+            select(ProviderScopeBinding.id).where(
+                ProviderScopeBinding.tenant_id == tenant_id,
+                ProviderScopeBinding.profile_id == profile_id,
+            )
+        )
+        is not None
+    ):
+        raise ValueError("Azure scopes are already bound to this account.")
+
+    billing_scope, usage_scope = canonical_cost_scopes(
+        subscription_id,
+        resource_group_arm_id,
+        cognitive_resource_arm_id,
+    )
+    for scope_type, scope_id in (
+        ("resource_group", billing_scope),
+        ("cognitive_resource", usage_scope),
+    ):
+        if (
+            session.scalar(
+                select(ProviderScopeNode.id).where(
+                    ProviderScopeNode.provider == "azure",
+                    ProviderScopeNode.scope_type == scope_type,
+                    ProviderScopeNode.canonical_scope_id == scope_id,
+                )
+            )
+            is not None
+        ):
+            raise ValueError("Provider scope is already bound.")
+
+    billing_node = ProviderScopeNode(
+        id=str(uuid4()),
+        tenant_id=tenant_id,
+        provider="azure",
+        scope_type="resource_group",
+        canonical_scope_id=billing_scope,
+    )
+    usage_node = ProviderScopeNode(
+        id=str(uuid4()),
+        tenant_id=tenant_id,
+        provider="azure",
+        scope_type="cognitive_resource",
+        canonical_scope_id=usage_scope,
+        parent_node_id=billing_node.id,
+    )
+    session.add_all((billing_node, usage_node))
+    session.flush()
+    billing_binding = ProviderScopeBinding(
+        id=str(uuid4()),
+        tenant_id=tenant_id,
+        provider="azure",
+        profile_id=profile_id,
+        purpose="billing",
+        node_id=billing_node.id,
+    )
+    session.add(billing_binding)
+    session.flush()
+    usage_binding = ProviderScopeBinding(
+        id=str(uuid4()),
+        tenant_id=tenant_id,
+        provider="azure",
+        profile_id=profile_id,
+        purpose="usage",
+        node_id=usage_node.id,
+        parent_binding_id=billing_binding.id,
+    )
+    session.add_all(
+        (
+            usage_binding,
+            AuditEvent(
+                tenant_id=tenant_id,
+                actor_id=actor_id,
+                target=f"azure:profile:{profile_id}:cost-scopes",
+                action="billing_scope.bind",
+                outcome="success",
+                details={"provider": "azure", "purposes": ["billing", "usage"]},
+            ),
+        )
+    )
+    return billing_binding, usage_binding
 
 
 def save_billing_secret(

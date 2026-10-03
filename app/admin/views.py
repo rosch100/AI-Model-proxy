@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from functools import wraps
 from typing import Callable
@@ -19,7 +20,7 @@ from flask import (
     request,
     url_for,
 )
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError
 from webauthn.helpers import parse_authentication_credential_json
 from webauthn.helpers.exceptions import (
@@ -31,6 +32,7 @@ from webauthn.helpers.exceptions import (
 
 from app.admin.forms import (
     ActivateProviderForm,
+    AzureScopeForm,
     BillingCredentialsForm,
     DeactivateProviderForm,
     DeleteProviderForm,
@@ -48,7 +50,11 @@ from app.admin.security import (
     mask_secret,
     prefers_html,
 )
-from app.admin.view_models import ConnectionView, CostsView, dashboard_view
+from app.admin.view_models import (
+    ConnectionView,
+    CostsView,
+    dashboard_view,
+)
 from app.admin.webauthn_service import (
     begin_authentication,
     begin_registration,
@@ -69,6 +75,7 @@ from app.persistence.admin_auth import (
 )
 from app.persistence.admin_ops import (
     activate_provider_profile,
+    bind_azure_cost_scopes,
     change_admin_password,
     create_provider_profile,
     deactivate_provider_profile,
@@ -453,11 +460,57 @@ def webauthn_register_complete():
 @admin_bp.get("/")
 @login_required
 def dashboard():
-    """Show tenant and provider status from the database."""
+    """Show provider status and the latest verified cost records."""
     tenant, profiles = _load_tenant_profiles()
+    dashboard = dashboard_view(tenant, profiles)
+    database = _database()
+    with database.sessions() as session:
+        counts = dict(
+            session.execute(
+                select(CostUsageRecord.kind, func.count(CostUsageRecord.id))
+                .where(CostUsageRecord.tenant_id == g.admin.tenant_id)
+                .group_by(CostUsageRecord.kind)
+            ).all()
+        )
+        records = tuple(
+            session.scalars(
+                select(CostUsageRecord)
+                .where(CostUsageRecord.tenant_id == g.admin.tenant_id)
+                .order_by(
+                    CostUsageRecord.bucket_start.desc(), CostUsageRecord.id.desc()
+                )
+                .limit(10)
+            )
+        )
+        record_bindings = {
+            binding.id: (profile.display_name or profile.provider)
+            for profile, binding in session.execute(
+                select(ProviderProfile, ProviderScopeBinding)
+                .join(
+                    ProviderScopeBinding,
+                    (ProviderScopeBinding.profile_id == ProviderProfile.id)
+                    & (ProviderScopeBinding.tenant_id == ProviderProfile.tenant_id),
+                )
+                .where(
+                    ProviderProfile.tenant_id == g.admin.tenant_id,
+                    ProviderProfile.deleted_at.is_(None),
+                )
+            )
+        }
+    dashboard = replace(
+        dashboard,
+        cost_record_counts={
+            kind: counts.get(kind, 0) for kind in ("actual", "usage", "estimate")
+        },
+        cost_records=records,
+        cost_record_profile_names={
+            record.binding_id: record_bindings.get(record.binding_id, record.provider)
+            for record in records
+        },
+    )
     return render_template(
         "admin/dashboard.html",
-        view=dashboard_view(tenant, profiles),
+        view=dashboard,
         logout_form=LoginForm(),
     )
 
@@ -513,6 +566,7 @@ def create_connection_form():
         ("openai", "OpenAI"),
         ("openrouter", "OpenRouter"),
     ]
+    form.default_model.choices = [("", "Nach dem Katalogabruf auswählen")]
     provider = request.args.get("provider", "")
     if provider in {"azure", "openai", "openrouter"}:
         form.provider.data = provider
@@ -539,10 +593,18 @@ def edit_connection_form(profile_id: str):
         )
         if profile is None:
             return "Not Found", 404
+        catalog_rows = tuple(
+            session.scalars(
+                select(ProviderCatalogEntry)
+                .where(ProviderCatalogEntry.profile_id == profile.id)
+                .order_by(ProviderCatalogEntry.model_id)
+            )
+        )
         session.expunge(profile)
+    form = _profile_form(profile, catalog_rows)
     return render_template(
         "admin/settings/profile_form.html",
-        form=_profile_form(profile),
+        form=form,
         profile=profile,
         logout_form=LoginForm(),
     )
@@ -610,10 +672,17 @@ def update_connection(profile_id: str):
         )
         if profile is None:
             return "Not Found", 404
+        catalog_rows = tuple(
+            session.scalars(
+                select(ProviderCatalogEntry)
+                .where(ProviderCatalogEntry.profile_id == profile.id)
+                .order_by(ProviderCatalogEntry.model_id)
+            )
+        )
         session.expunge(profile)
     form = ProviderProfileForm()
     _set_profile_form_choices(form, provider=profile.provider)
-    _set_profile_model_choices(form, profile)
+    _set_default_model_choices(form, profile, catalog_rows)
     if not form.validate_on_submit() or form.provider.data != profile.provider:
         flash("Accountdaten sind ungültig.", "error")
         return (
@@ -867,6 +936,50 @@ def settings_costs():
     return render_template("admin/settings/costs.html", **_costs_context())
 
 
+@admin_bp.post("/settings/costs/azure-scope")
+@login_required
+def save_azure_cost_scopes():
+    """Bind tenant-confirmed Azure billing and usage scopes to one profile."""
+    form = AzureScopeForm()
+    if not form.validate_on_submit():
+        flash("Azure-Scope-Angaben sind ungültig oder unvollständig.", "error")
+        return (
+            render_template(
+                "admin/settings/costs.html",
+                **_costs_context(
+                    azure_scope_form=form,
+                    azure_scope_form_profile_id=form.profile_id.data,
+                ),
+            ),
+            400,
+        )
+    try:
+        with _database().sessions.begin() as session:
+            bind_azure_cost_scopes(
+                session,
+                g.admin.tenant_id,
+                form.profile_id.data or "",
+                form.subscription_id.data or "",
+                form.resource_group_arm_id.data or "",
+                form.cognitive_resource_arm_id.data or "",
+                g.admin.username,
+            )
+    except (LookupError, ValueError, IntegrityError) as exc:
+        flash(f"Azure-Scopes konnten nicht gebunden werden: {exc}", "error")
+        return (
+            render_template(
+                "admin/settings/costs.html",
+                **_costs_context(
+                    azure_scope_form=form,
+                    azure_scope_form_profile_id=form.profile_id.data,
+                ),
+            ),
+            400,
+        )
+    flash("Azure-Billing- und Usage-Scope wurden gespeichert.", "info")
+    return redirect(url_for("admin.settings_costs"))
+
+
 @admin_bp.post("/settings/costs/billing")
 @login_required
 def save_billing():
@@ -1074,8 +1187,11 @@ def _set_profile_form_choices(
     )
 
 
-def _profile_form(profile: ProviderProfile) -> ProviderProfileForm:
-    """Populate non-secret account settings; credentials are never rendered."""
+def _profile_form(
+    profile: ProviderProfile,
+    catalog_rows: tuple[ProviderCatalogEntry, ...],
+) -> ProviderProfileForm:
+    """Populate profile fields and catalog-backed model choices."""
     form = ProviderProfileForm(
         provider=profile.provider,
         display_name=profile.display_name or "",
@@ -1085,25 +1201,25 @@ def _profile_form(profile: ProviderProfile) -> ProviderProfileForm:
         project=str(profile.settings.get("project", "")),
         api_key="",
     )
-    _set_profile_form_choices(form, profile.provider)
-    _set_profile_model_choices(form, profile)
+    _set_default_model_choices(form, profile, catalog_rows)
     return form
 
 
-def _set_profile_model_choices(
-    form: ProviderProfileForm, profile: ProviderProfile
+def _set_default_model_choices(
+    form: ProviderProfileForm,
+    profile: ProviderProfile,
+    catalog_rows: tuple[ProviderCatalogEntry, ...],
 ) -> None:
-    """Bind model targets to the saved account catalog, never free-form IDs."""
-    with _database().sessions() as session:
-        entries = session.execute(
-            select(ProviderCatalogEntry.model_id, ProviderCatalogEntry.deployment_id)
-            .where(ProviderCatalogEntry.profile_id == profile.id)
-            .order_by(ProviderCatalogEntry.model_id)
-        ).all()
-    models = selectable_catalog_models(profile.provider, entries)
-    form.default_model.choices = [("", "Standardmodell wählen")] + [
-        (model, model) for model, _deployment in models
-    ]
+    """Use only this profile's catalog entries in its scrollbox."""
+    models = selectable_catalog_models(
+        profile.provider,
+        [(entry.model_id, entry.deployment_id) for entry in catalog_rows],
+    )
+    choices = [(model_id, model_id) for model_id, _deployment_id in models]
+    saved_model = profile.default_model
+    if saved_model and saved_model not in {model_id for model_id, _ in choices}:
+        choices.insert(0, (saved_model, f"{saved_model} (nicht im aktuellen Katalog)"))
+    form.default_model.choices = [("", "Standardmodell wählen"), *choices]
 
 
 def _provider_settings(form: ProviderProfileForm) -> dict[str, object]:
@@ -1195,7 +1311,10 @@ def _connection_context() -> dict[str, object]:
         }
 
 
-def _costs_context() -> dict[str, object]:
+def _costs_context(
+    azure_scope_form: AzureScopeForm | None = None,
+    azure_scope_form_profile_id: str | None = None,
+) -> dict[str, object]:
     database = _database()
     with database.sessions() as session:
         profiles = tuple(
@@ -1276,6 +1395,7 @@ def _costs_context() -> dict[str, object]:
             and profile_bindings["usage"][1].parent_node_id
             == profile_bindings["billing"][0].node_id
         )
+        azure_scope_bound_profile_ids = frozenset(azure_bindings)
         session.expunge_all()
         return {
             "view": CostsView(
@@ -1287,8 +1407,20 @@ def _costs_context() -> dict[str, object]:
                 records=records,
                 billing_key_masks=billing_key_masks,
                 azure_costs_ready_profile_ids=azure_costs_ready_profile_ids,
+                azure_scope_bound_profile_ids=azure_scope_bound_profile_ids,
             ),
             "billing_form": BillingCredentialsForm(),
+            "azure_scope_forms": {
+                profile.id: (
+                    azure_scope_form
+                    if profile.id == azure_scope_form_profile_id
+                    and azure_scope_form is not None
+                    else AzureScopeForm(formdata=None)
+                )
+                for profile in profiles
+                if profile.provider == "azure"
+                and profile.id not in azure_scope_bound_profile_ids
+            },
             "logout_form": LoginForm(),
         }
 

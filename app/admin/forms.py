@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from flask_wtf import FlaskForm
-from wtforms import PasswordField, SelectField, StringField
+from wtforms import BooleanField, PasswordField, SelectField, StringField
 from wtforms.validators import DataRequired, Length, Optional, ValidationError
 from wtforms.widgets import PasswordInput
 
@@ -104,8 +104,10 @@ class ProviderProfileForm(FlaskForm):
     base_url = StringField("Azure Base-URL *")
     default_model = SelectField(
         "Standardmodell",
-        validators=[Optional()],
-        choices=[("", "Katalog zuerst laden")],
+        validators=[Optional(), Length(max=256)],
+        choices=[("", "Nach dem Katalogabruf auswählen")],
+        validate_choice=True,
+        render_kw={"size": 8},
     )
     api_key = PasswordField("Inference-Schlüssel", validators=[Optional()])
     organization = StringField("Organisation (optional)", validators=[Optional()])
@@ -151,3 +153,25 @@ class BillingCredentialsForm(FlaskForm):
 
     profile_id = StringField(validators=[DataRequired(), Length(max=36)])
     billing_secret = PasswordField("Billing-Schlüssel *", validators=[Optional()])
+
+
+class AzureScopeForm(FlaskForm):
+    """Tenant-confirmed Azure scopes for one provider profile."""
+
+    profile_id = StringField(validators=[DataRequired(), Length(max=36)])
+    subscription_id = StringField(
+        "Azure Subscription-ID *", validators=[DataRequired(), Length(max=36)]
+    )
+    resource_group_arm_id = StringField(
+        "Resource Group ARM-ID *", validators=[DataRequired(), Length(max=1024)]
+    )
+    cognitive_resource_arm_id = StringField(
+        "Cognitive-Services-Ressource ARM-ID *",
+        validators=[DataRequired(), Length(max=1024)],
+    )
+    exclusive_scope_confirmation = BooleanField(
+        "Ich bestätige, dass beide Azure-Scopes ausschließlich diesem Tenant zugeordnet sind.",
+        validators=[
+            DataRequired(message="Die exklusive Scope-Zuordnung muss bestätigt werden.")
+        ],
+    )

@@ -15,5 +15,36 @@
       </li>
     {% endfor %}
   </ul>
+
+  <section aria-labelledby="cost-overview-heading">
+    <h2 id="cost-overview-heading">Kostenübersicht</h2>
+    <p class="lede">Abrechnungswerte und Provider-Verbrauch werden getrennt und mit ihrer tatsächlichen Granularität angezeigt.</p>
+    <dl class="cost-summary" aria-label="Kosten- und Usage-Datensätze">
+      <div><dt>Tatsächliche Kosten</dt><dd>{% if view.cost_record_counts.actual %}{{ view.cost_record_counts.actual }} Datensätze{% else %}Noch keine Datensätze{% endif %}</dd><dd>Provider-Abrechnung, nach Währung getrennt</dd></div>
+      <div><dt>Verbrauch</dt><dd>{% if view.cost_record_counts.usage %}{{ view.cost_record_counts.usage }} Datensätze{% else %}Noch keine Datensätze{% endif %}</dd><dd>Provider-gemeldete Usage-Metriken</dd></div>
+      <div><dt>Schätzungen</dt><dd>{% if view.cost_record_counts.estimate %}{{ view.cost_record_counts.estimate }} Datensätze{% else %}Noch keine Datensätze{% endif %}</dd><dd>Nur mit belastbarer Preis- und Usage-Quelle</dd></div>
+    </dl>
+    <div class="table-scroll">
+      <table class="cost-records">
+        <caption>Letzte verifizierte Kosten- und Usage-Buckets</caption>
+        <thead><tr><th scope="col">Account</th><th scope="col">Art / Metrik</th><th scope="col">Wert</th><th scope="col">Zeitraum (UTC)</th><th scope="col">Granularität</th><th scope="col">Quelle</th></tr></thead>
+        <tbody>
+          {% for record in view.cost_records %}
+            <tr>
+              <td>{{ view.cost_record_profile_names.get(record.binding_id, record.provider) }}</td>
+              <td>{{ record.kind }} / {{ record.metric }}</td>
+              <td>{{ record.value }}{% if record.currency %} {{ record.currency }}{% else %} {{ record.unit }}{% endif %}</td>
+              <td>{{ record.bucket_start.strftime("%Y-%m-%d %H:%M") }} – {{ record.bucket_end.strftime("%Y-%m-%d %H:%M") }}</td>
+              <td>{{ record.granularity }}</td>
+              <td>{{ record.source }}</td>
+            </tr>
+          {% else %}
+            <tr><td colspan="6">Noch keine Datensätze. Nach Einrichtung der Billing-Scopes und dem ersten erfolgreichen Refresh erscheinen hier die belegten Werte.</td></tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+    <p><a href="{{ url_for('admin.settings_costs') }}">Kosten, Billing-Zugänge und Zeiträume öffnen</a></p>
+  </section>
 </section>
 {% endblock %}

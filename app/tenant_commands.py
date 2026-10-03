@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import os
 import secrets
-import unicodedata
 from uuid import UUID, uuid4
 
 import click
@@ -27,6 +26,10 @@ from .persistence.models import (
     Tenant,
 )
 from .persistence.repositories import import_tenants
+from .providers.azure_scope import (
+    canonical_cognitive_resource_id,
+    canonical_resource_group_id,
+)
 from .providers.cost_jobs import fail_stale_running_jobs
 
 
@@ -319,90 +322,17 @@ def _canonical_openrouter_workspace_id(workspace_id: str) -> str:
 
 
 def _canonical_azure_resource_group(scope_id: str) -> str:
-    parts = scope_id.strip("/").split("/")
-    if (
-        len(parts) != 4
-        or parts[0].casefold() != "subscriptions"
-        or parts[2].casefold() != "resourcegroups"
-        or any(not part for part in parts)
-    ):
-        raise click.ClickException(
-            "Azure billing scope must be a Resource Group ARM ID."
-        )
     try:
-        subscription_id = str(UUID(parts[1]))
+        return canonical_resource_group_id(scope_id)
     except ValueError as exc:
-        raise click.ClickException(
-            "Azure scope has an invalid subscription GUID."
-        ) from exc
-    if "?" in scope_id or "#" in scope_id or "://" in scope_id:
-        raise click.ClickException(
-            "Azure scope must not contain a URL, query, or fragment."
-        )
-    resource_group = parts[3]
-    if not _is_valid_azure_resource_name(resource_group, max_length=90):
-        raise click.ClickException("Azure Resource Group name is invalid.")
-    return f"/subscriptions/{subscription_id}/resourcegroups/{resource_group.lower()}"
+        raise click.ClickException(str(exc)) from exc
 
 
 def _canonical_azure_cognitive_resource(scope_id: str) -> str:
-    parts = scope_id.strip("/").split("/")
-    if (
-        len(parts) != 8
-        or parts[0].casefold() != "subscriptions"
-        or parts[2].casefold() != "resourcegroups"
-        or parts[4].casefold() != "providers"
-        or parts[5].casefold() != "microsoft.cognitiveservices"
-        or parts[6].casefold() != "accounts"
-        or any(not part for part in parts)
-    ):
-        raise click.ClickException(
-            "Azure usage scope must be a Cognitive Services account ARM ID."
-        )
     try:
-        subscription_id = str(UUID(parts[1]))
+        return canonical_cognitive_resource_id(scope_id)
     except ValueError as exc:
-        raise click.ClickException(
-            "Azure scope has an invalid subscription GUID."
-        ) from exc
-    if "?" in scope_id or "#" in scope_id or "://" in scope_id:
-        raise click.ClickException(
-            "Azure scope must not contain a URL, query, or fragment."
-        )
-    resource_group = parts[3]
-    account_name = parts[7]
-    if not _is_valid_azure_resource_name(resource_group, max_length=90):
-        raise click.ClickException("Azure Resource Group name is invalid.")
-    if not _is_valid_cognitive_account_name(account_name):
-        raise click.ClickException("Azure Cognitive Services account name is invalid.")
-    return (
-        f"/subscriptions/{subscription_id}/resourcegroups/{resource_group.lower()}"
-        f"/providers/microsoft.cognitiveservices/accounts/{account_name.casefold()}"
-    )
-
-
-def _is_valid_azure_resource_name(name: str, *, max_length: int) -> bool:
-    return (
-        1 <= len(name) <= max_length
-        and name[-1] != "."
-        and all(
-            unicodedata.category(character) in {"Lu", "Ll", "Lt", "Lm", "Lo", "Nd"}
-            or character in "_.()-"
-            for character in name
-        )
-    )
-
-
-def _is_valid_cognitive_account_name(name: str) -> bool:
-    return (
-        2 <= len(name) <= 64
-        and name[0].isalnum()
-        and name[-1].isalnum()
-        and all(
-            character.isascii() and (character.isalnum() or character == "-")
-            for character in name
-        )
-    )
+        raise click.ClickException(str(exc)) from exc
 
 
 def _opaque_scope_id(scope_id: str) -> str:

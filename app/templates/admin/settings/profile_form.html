@@ -27,9 +27,12 @@
       <div data-provider-fields="openrouter"{% if not profile and form.provider.data != "openrouter" %} hidden{% endif %}><p class="hint">OpenRouter verwendet die Standard-API-Adresse.</p></div>
     {% endif %}
     {% if not profile %}
-      <p class="hint">Nach dem Anlegen können Sie den Anbieter-Katalog laden. Das erste verfügbare Modell wird automatisch als Standardmodell gesetzt.</p>
+      <p class="hint">Nach dem Anlegen können Sie den Anbieter-Katalog laden. Das erste verfügbare Modell wird automatisch als Standardmodell gesetzt; anschließend kann es hier geändert werden.</p>
+    {% elif form.default_model.choices|length <= 1 %}
+      <p class="hint">Für dieses Konto ist noch kein Katalogmodell verfügbar. Laden Sie zuerst den Katalog auf der Verbindungsseite.</p>
     {% endif %}
-    <label>{{ form.default_model.label }}{{ form.default_model(maxlength=256) }}</label>
+    <label>{{ form.default_model.label }}{{ form.default_model(aria_describedby="default-model-hint") }}</label>
+    {% if profile %}<p id="default-model-hint" class="hint">Auswahl aus dem Katalog dieses Accounts. Die Scrollbox zeigt mehrere Modelle gleichzeitig.</p>{% endif %}
     <label>{{ form.api_key.label }}{% if profile and profile.inference_secret_ciphertext %} (leer lassen, um den gespeicherten Schlüssel beizubehalten){% endif %}{{ form.api_key(autocomplete="new-password") }}</label>
     {% if profile and profile.inference_secret_ciphertext %}
       <p class="hint">API-Schlüssel ist gespeichert und wird aus Sicherheitsgründen nicht erneut angezeigt.</p>

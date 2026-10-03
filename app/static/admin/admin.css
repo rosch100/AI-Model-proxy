@@ -245,6 +245,62 @@ code {
   gap: 1.2rem;
 }
 
+.cost-summary {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(min(100%, 14rem), 1fr));
+  gap: 0.8rem;
+  margin: 1rem 0;
+}
+
+.cost-summary > div {
+  padding: 0.9rem;
+  background: color-mix(in srgb, white 70%, var(--grain));
+  border-top: 3px solid var(--moss);
+}
+
+.cost-summary dt {
+  font-weight: 700;
+}
+
+.cost-summary dd {
+  margin: 0.45rem 0 0;
+}
+
+.cost-account {
+  margin: 1rem 0;
+  padding: 0.9rem;
+  border: 1px solid color-mix(in srgb, var(--moss) 25%, transparent);
+}
+
+.table-scroll {
+  max-width: 100%;
+  overflow-x: auto;
+}
+
+.cost-records {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 0.92rem;
+}
+
+.cost-records caption {
+  text-align: left;
+  font-weight: 700;
+  padding: 0.5rem 0;
+}
+
+.cost-records th,
+.cost-records td {
+  padding: 0.55rem;
+  border-bottom: 1px solid color-mix(in srgb, var(--moss) 25%, transparent);
+  text-align: left;
+  vertical-align: top;
+}
+
+.cost-records th {
+  white-space: nowrap;
+}
+
 .error-text {
   color: var(--flash-error);
 }

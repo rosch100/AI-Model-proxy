@@ -7,6 +7,8 @@ from wtforms import PasswordField, SelectField, StringField
 from wtforms.validators import DataRequired, Length, Optional, ValidationError
 from wtforms.widgets import PasswordInput
 
+from app.providers.azure_url import validate_azure_base_url
+
 
 class RevealablePasswordField(PasswordField):
     """Password field that keeps the submitted/stored value for masked display."""
@@ -84,8 +86,8 @@ class OpenRouterConnectionForm(FlaskForm):
     )
 
 
-class ActivateProviderForm(FlaskForm):
-    """Activate one saved provider profile for proxy traffic."""
+class ProviderProfileForm(FlaskForm):
+    """Provider-specific settings for creating or editing one named account."""
 
     provider = SelectField(
         "Anbieter *",
@@ -96,16 +98,45 @@ class ActivateProviderForm(FlaskForm):
         ],
         validators=[DataRequired()],
     )
+    display_name = StringField(
+        "Account-Name *", validators=[DataRequired(), Length(max=128)]
+    )
+    base_url = StringField("Azure Base-URL *")
+    default_model = StringField(
+        "Standardmodell", validators=[Optional(), Length(max=256)]
+    )
+    api_key = PasswordField("Inference-Schlüssel", validators=[Optional()])
+    organization = StringField("Organisation (optional)", validators=[Optional()])
+    project = StringField("Projekt (optional)", validators=[Optional()])
+
+    def validate_base_url(self, field: StringField) -> None:
+        """Validate Azure endpoints only when Azure is the selected provider."""
+        if self.provider.data != "azure":
+            return
+        try:
+            field.data = validate_azure_base_url(field.data)
+        except ValueError as exc:
+            raise ValidationError(str(exc)) from exc
+
+
+class ActivateProviderForm(FlaskForm):
+    """Activate one saved provider profile for proxy traffic."""
+
+    profile_id = StringField(validators=[DataRequired(), Length(max=36)])
+
+
+class DeactivateProviderForm(FlaskForm):
+    """CSRF-protected request to explicitly clear the active profile."""
+
+
+class DeleteProviderForm(FlaskForm):
+    """CSRF-protected request to remove one provider profile."""
+
+    profile_id = StringField(validators=[DataRequired(), Length(max=36)])
 
 
 class BillingCredentialsForm(FlaskForm):
-    """Optional billing credentials for OpenAI or OpenRouter cost refresh."""
+    """Profile-scoped optional billing credentials for cost refresh."""
 
-    provider = SelectField(
-        "Anbieter *",
-        choices=[("openai", "OpenAI"), ("openrouter", "OpenRouter")],
-        validators=[DataRequired()],
-    )
-    billing_secret = PasswordField(
-        "Provider-Schlüssel mit Billing-Rechten *", validators=[Optional()]
-    )
+    profile_id = StringField(validators=[DataRequired(), Length(max=36)])
+    billing_secret = PasswordField("Billing-Schlüssel *", validators=[Optional()])

@@ -160,7 +160,9 @@ def downgrade() -> None:
             + "; ".join(conflicts)
         )
 
-    op.drop_constraint("uq_binding_node_id", "provider_scope_bindings", type_="unique")
+    op.drop_constraint(
+        "uq_binding_node_id", "provider_scope_bindings", type_="unique"
+    )
     op.create_unique_constraint(
         "uq_binding_tenant_purpose",
         "provider_scope_bindings",

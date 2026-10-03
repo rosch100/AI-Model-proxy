@@ -20,6 +20,7 @@ from flask import (
     url_for,
 )
 from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
 from webauthn.helpers import parse_authentication_credential_json
 from webauthn.helpers.exceptions import (
     InvalidAuthenticationResponse,
@@ -30,12 +31,12 @@ from webauthn.helpers.exceptions import (
 
 from app.admin.forms import (
     ActivateProviderForm,
-    AzureConnectionForm,
     BillingCredentialsForm,
+    DeactivateProviderForm,
+    DeleteProviderForm,
     LoginForm,
-    OpenAIConnectionForm,
-    OpenRouterConnectionForm,
     PasswordChangeForm,
+    ProviderProfileForm,
 )
 from app.admin.security import (
     ADMIN_COOKIE_NAME,
@@ -68,10 +69,12 @@ from app.persistence.admin_auth import (
 from app.persistence.admin_ops import (
     activate_provider_profile,
     change_admin_password,
+    create_provider_profile,
+    delete_provider_profile,
     replace_catalog_entries,
     rotate_api_key,
     save_billing_secret,
-    upsert_provider_profile,
+    update_provider_profile,
 )
 from app.persistence.database import Database
 from app.persistence.models import (
@@ -95,6 +98,7 @@ from app.persistence.passkeys import (
     list_passkeys,
     store_challenge,
 )
+from app.providers.azure_url import validate_azure_base_url
 from app.providers.catalog import (
     CatalogRefreshError,
     azure_deployments_from_catalog,
@@ -386,9 +390,11 @@ def webauthn_register_complete():
     label_text = label.strip() if isinstance(label, str) else "Passkey"
     database = _database()
     config = _webauthn_config()
-    with database.sessions.begin() as session:
-        account = session.get(AdminAccount, g.admin.account_id)
-        try:
+    already_enrolled = False
+    try:
+        with database.sessions.begin() as session:
+            account = session.get(AdminAccount, g.admin.account_id)
+            already_enrolled = account_has_passkeys(session, account.id)
             challenge = consume_challenge(
                 session,
                 challenge_id,
@@ -421,16 +427,24 @@ def webauthn_register_complete():
                     details={"label": passkey.label},
                 )
             )
-        except (
-            LookupError,
-            InvalidRegistrationResponse,
-            WebAuthnException,
-            TypeError,
-            ValueError,
-            KeyError,
-        ):
-            return _json_error("Passkey-Registrierung fehlgeschlagen.")
-    return jsonify({"ok": True, "redirect": url_for("admin.dashboard")})
+    except IntegrityError:
+        return _json_error(
+            "Dieser Passkey ist bereits registriert. Nutze ein anderes Gerät "
+            "oder einen Security Key."
+        )
+    except (
+        LookupError,
+        InvalidRegistrationResponse,
+        WebAuthnException,
+        TypeError,
+        ValueError,
+        KeyError,
+    ):
+        return _json_error("Passkey-Registrierung fehlgeschlagen.")
+    redirect_to = (
+        url_for("admin.account") if already_enrolled else url_for("admin.dashboard")
+    )
+    return jsonify({"ok": True, "redirect": redirect_to})
 
 
 @admin_bp.get("/")
@@ -478,142 +492,268 @@ def rotate_key():
 @admin_bp.get("/settings/connection")
 @login_required
 def settings_connection():
-    """Render provider connection forms and catalog status."""
+    """Render provider accounts grouped by provider."""
     return render_template(
         "admin/settings/connection.html",
         **_connection_context(),
     )
 
 
-@admin_bp.post("/settings/connection/azure")
+@admin_bp.get("/settings/connection/create")
 @login_required
-def save_azure_connection():
-    """Save Azure inference settings without activating the profile."""
-    database = _database()
-    with database.sessions() as session:
-        catalog_rows = _catalog_tuples(session, g.admin.tenant_id, "azure")
-    selectable = selectable_catalog_models("azure", catalog_rows)
-    form = AzureConnectionForm()
-    form.default_model.choices = _model_choices(selectable)
-    if not form.default_model.choices:
-        flash("Zuerst den Azure-Katalog aktualisieren.", "error")
-        return redirect(url_for("admin.settings_connection"))
-    if not form.validate_on_submit():
-        flash("Azure-Verbindung ist unvollständig.", "error")
-        return redirect(url_for("admin.settings_connection"))
-    deployments = azure_deployments_from_catalog(catalog_rows)
-    if form.default_model.data not in deployments:
-        flash("Standardmodell ist im Azure-Katalog nicht enthalten.", "error")
-        return redirect(url_for("admin.settings_connection"))
-    _save_profile(
-        "azure",
-        {
-            "base_url": (form.base_url.data or "").rstrip("/"),
-            "model_deployments": deployments,
-        },
-        form.default_model.data or "",
-        form.api_key.data,
+def create_connection_form():
+    """Choose a provider, then show its account-specific configuration."""
+    form = ProviderProfileForm()
+    form.provider.choices = [
+        ("", "Anbieter wählen"),
+        ("azure", "Azure"),
+        ("openai", "OpenAI"),
+        ("openrouter", "OpenRouter"),
+    ]
+    provider = request.args.get("provider", "")
+    if provider in {"azure", "openai", "openrouter"}:
+        form.provider.data = provider
+    return render_template(
+        "admin/settings/profile_form.html",
+        form=form,
+        profile=None,
+        logout_form=LoginForm(),
     )
-    flash("Azure-Verbindung gespeichert.", "info")
-    return redirect(url_for("admin.settings_connection"))
 
 
-@admin_bp.post("/settings/connection/openai")
+@admin_bp.get("/settings/connection/<profile_id>/edit")
 @login_required
-def save_openai_connection():
-    """Save OpenAI inference settings without activating the profile."""
-    database = _database()
-    with database.sessions() as session:
-        catalog_rows = _catalog_tuples(session, g.admin.tenant_id, "openai")
-    selectable = selectable_catalog_models("openai", catalog_rows)
-    form = OpenAIConnectionForm()
-    form.default_model.choices = _model_choices(selectable)
-    if not form.default_model.choices:
-        flash("Zuerst den OpenAI-Katalog aktualisieren.", "error")
-        return redirect(url_for("admin.settings_connection"))
-    if not form.validate_on_submit():
-        flash("OpenAI-Verbindung ist unvollständig.", "error")
-        return redirect(url_for("admin.settings_connection"))
-    _save_profile(
-        "openai",
-        {
-            "organization": form.organization.data or "",
-            "project": form.project.data or "",
-        },
-        form.default_model.data or "",
-        form.api_key.data,
-    )
-    flash("OpenAI-Verbindung gespeichert.", "info")
-    return redirect(url_for("admin.settings_connection"))
-
-
-@admin_bp.post("/settings/connection/openrouter")
-@login_required
-def save_openrouter_connection():
-    """Save OpenRouter inference settings without activating the profile."""
-    database = _database()
-    with database.sessions() as session:
-        catalog_rows = _catalog_tuples(session, g.admin.tenant_id, "openrouter")
-    selectable = selectable_catalog_models("openrouter", catalog_rows)
-    form = OpenRouterConnectionForm()
-    form.default_model.choices = _model_choices(selectable)
-    if not form.default_model.choices:
-        flash("Zuerst den OpenRouter-Katalog aktualisieren.", "error")
-        return redirect(url_for("admin.settings_connection"))
-    if not form.validate_on_submit():
-        flash("OpenRouter-Verbindung ist unvollständig.", "error")
-        return redirect(url_for("admin.settings_connection"))
-    _save_profile(
-        "openrouter",
-        {},
-        form.default_model.data or "",
-        form.api_key.data,
-    )
-    flash("OpenRouter-Verbindung gespeichert.", "info")
-    return redirect(url_for("admin.settings_connection"))
-
-
-@admin_bp.post("/settings/connection/activate")
-@login_required
-def activate_connection():
-    """Activate one saved provider profile for proxy traffic."""
-    form = ActivateProviderForm()
-    if not form.validate_on_submit():
-        flash("Aktivierung fehlgeschlagen.", "error")
-        return redirect(url_for("admin.settings_connection"))
-    database = _database()
-    try:
-        with database.sessions.begin() as session:
-            tenant = session.get(Tenant, g.admin.tenant_id)
-            activate_provider_profile(
-                session, tenant, form.provider.data or "", g.admin.username
-            )
-    except (LookupError, ValueError) as exc:
-        flash(str(exc), "error")
-        return redirect(url_for("admin.settings_connection"))
-    flash("Anbieter aktiviert.", "info")
-    return redirect(url_for("admin.settings_connection"))
-
-
-@admin_bp.post("/settings/connection/refresh-catalog")
-@login_required
-def refresh_catalog():
-    """Refresh the model catalog for one provider outside the database write."""
-    provider = request.form.get("provider", "")
+def edit_connection_form(profile_id: str):
+    """Render an edit form only for an account owned by this tenant."""
     database = _database()
     with database.sessions() as session:
         profile = session.scalar(
             select(ProviderProfile).where(
+                ProviderProfile.id == profile_id,
                 ProviderProfile.tenant_id == g.admin.tenant_id,
-                ProviderProfile.provider == provider,
+                ProviderProfile.deleted_at.is_(None),
             )
         )
-        if profile is None or not profile.inference_secret_ciphertext:
+        if profile is None:
+            return "Not Found", 404
+        session.expunge(profile)
+    return render_template(
+        "admin/settings/profile_form.html",
+        form=_profile_form(profile),
+        profile=profile,
+        logout_form=LoginForm(),
+    )
+
+
+@admin_bp.post("/settings/connection/create")
+@login_required
+def create_connection():
+    """Create a named, inactive profile with provider-specific settings."""
+    form = ProviderProfileForm()
+    _set_profile_form_choices(form)
+    if not form.validate_on_submit():
+        flash("Accountdaten sind unvollständig.", "error")
+        return (
+            render_template(
+                "admin/settings/profile_form.html",
+                form=form,
+                profile=None,
+                logout_form=LoginForm(),
+            ),
+            400,
+        )
+    provider = form.provider.data or ""
+    settings = _provider_settings(form)
+    try:
+        with _database().sessions.begin() as session:
+            create_provider_profile(
+                session,
+                _database().secret_cipher,
+                g.admin.tenant_id,
+                provider,
+                form.display_name.data or "",
+                settings,
+                form.default_model.data or "",
+                form.api_key.data or None,
+                g.admin.username,
+            )
+    except (LookupError, ValueError, IntegrityError):
+        flash("Account konnte nicht angelegt werden. Name und Angaben prüfen.", "error")
+        return (
+            render_template(
+                "admin/settings/profile_form.html",
+                form=form,
+                profile=None,
+                logout_form=LoginForm(),
+            ),
+            400,
+        )
+    flash("Account gespeichert. Er ist noch nicht aktiv.", "info")
+    return redirect(url_for("admin.settings_connection"))
+
+
+@admin_bp.post("/settings/connection/<profile_id>/edit")
+@login_required
+def update_connection(profile_id: str):
+    """Update account settings without changing provider identity."""
+    database = _database()
+    with database.sessions() as session:
+        profile = session.scalar(
+            select(ProviderProfile).where(
+                ProviderProfile.id == profile_id,
+                ProviderProfile.tenant_id == g.admin.tenant_id,
+                ProviderProfile.deleted_at.is_(None),
+            )
+        )
+        if profile is None:
+            return "Not Found", 404
+        session.expunge(profile)
+    form = ProviderProfileForm()
+    _set_profile_form_choices(form, provider=profile.provider)
+    if not form.validate_on_submit() or form.provider.data != profile.provider:
+        flash("Accountdaten sind ungültig.", "error")
+        return (
+            render_template(
+                "admin/settings/profile_form.html",
+                form=form,
+                profile=profile,
+                logout_form=LoginForm(),
+            ),
+            400,
+        )
+    try:
+        with database.sessions.begin() as session:
+            update_provider_profile(
+                session,
+                database.secret_cipher,
+                g.admin.tenant_id,
+                profile_id,
+                form.display_name.data or "",
+                _provider_settings(form),
+                form.default_model.data or "",
+                form.api_key.data or None,
+                g.admin.username,
+            )
+    except (LookupError, ValueError, IntegrityError):
+        flash(
+            "Account konnte nicht gespeichert werden. Name und Angaben prüfen.", "error"
+        )
+        return (
+            render_template(
+                "admin/settings/profile_form.html",
+                form=form,
+                profile=profile,
+                logout_form=LoginForm(),
+            ),
+            400,
+        )
+    flash("Account aktualisiert.", "info")
+    return redirect(url_for("admin.settings_connection"))
+
+
+@admin_bp.post("/settings/connection/<profile_id>/delete")
+@login_required
+def delete_connection(profile_id: str):
+    """Soft-delete one provider account owned by the current tenant."""
+    form = DeleteProviderForm()
+    if not form.validate_on_submit() or form.profile_id.data != profile_id:
+        return "Bad Request", 400
+    try:
+        with _database().sessions.begin() as session:
+            delete_provider_profile(
+                session, g.admin.tenant_id, profile_id, g.admin.username
+            )
+    except LookupError:
+        return "Not Found", 404
+    except ValueError:
+        flash(
+            "Account kann nicht entfernt werden, solange Provider-Scopes gebunden sind.",
+            "error",
+        )
+        return redirect(url_for("admin.settings_connection"))
+    flash("Account entfernt.", "info")
+    return redirect(url_for("admin.settings_connection"))
+
+
+@admin_bp.post("/settings/connection/<profile_id>/activate")
+@login_required
+def activate_connection(profile_id: str):
+    """Activate one tenant-owned account by its immutable profile ID."""
+    form = ActivateProviderForm()
+    if not form.validate_on_submit() or form.profile_id.data != profile_id:
+        return "Bad Request", 400
+    database = _database()
+    try:
+        with database.sessions.begin() as session:
+            tenant = session.scalar(
+                select(Tenant).where(Tenant.id == g.admin.tenant_id).with_for_update()
+            )
+            activate_provider_profile(session, tenant, profile_id, g.admin.username)
+    except LookupError:
+        return "Not Found", 404
+    except ValueError as exc:
+        flash(str(exc), "error")
+        return redirect(url_for("admin.settings_connection"))
+    flash("Account aktiviert.", "info")
+    return redirect(url_for("admin.settings_connection"))
+
+
+@admin_bp.post("/settings/connection/deactivate")
+@login_required
+def deactivate_connection():
+    """Explicitly disable proxy forwarding by clearing the active profile."""
+    form = DeactivateProviderForm()
+    if not form.validate_on_submit():
+        return "Bad Request", 400
+    database = _database()
+    with database.sessions.begin() as session:
+        tenant = session.scalar(
+            select(Tenant).where(Tenant.id == g.admin.tenant_id).with_for_update()
+        )
+        tenant.active_profile_id = None
+        session.add(
+            AuditEvent(
+                tenant_id=tenant.id,
+                actor_id=g.admin.username,
+                target="tenant:active-profile",
+                action="profile.deactivate",
+                outcome="success",
+                details={},
+            )
+        )
+    flash(
+        "Kein Account aktiv. Proxy-Anfragen sind bis zur nächsten Aktivierung nicht verfügbar.",
+        "warning",
+    )
+    return redirect(url_for("admin.settings_connection"))
+
+
+@admin_bp.post("/settings/connection/<profile_id>/catalog")
+@login_required
+def refresh_catalog(profile_id: str):
+    """Refresh one profile's catalog without holding a DB transaction on I/O."""
+    database = _database()
+    with database.sessions.begin() as session:
+        profile = session.scalar(
+            select(ProviderProfile)
+            .where(
+                ProviderProfile.id == profile_id,
+                ProviderProfile.tenant_id == g.admin.tenant_id,
+                ProviderProfile.deleted_at.is_(None),
+            )
+            .with_for_update()
+        )
+        if profile is None:
+            return "Not Found", 404
+        if not profile.inference_secret_ciphertext:
             flash("Für den Katalog-Refresh fehlt ein gespeicherter Schlüssel.", "error")
             return redirect(url_for("admin.settings_connection"))
-        secret = database.secret_cipher.decrypt(profile.inference_secret_ciphertext)
+        provider = profile.provider
+        inference_secret_ciphertext = profile.inference_secret_ciphertext
+        secret = database.secret_cipher.decrypt(inference_secret_ciphertext)
         settings = dict(profile.settings)
-        profile_id = profile.id
+        profile.catalog_generation += 1
+        catalog_generation = profile.catalog_generation
     try:
         entries = refresh_provider_catalog(provider, settings, secret)
         error = None
@@ -621,32 +761,48 @@ def refresh_catalog():
         entries = []
         error = str(exc)
     with database.sessions.begin() as session:
-        profile = session.get(ProviderProfile, profile_id)
+        profile = session.scalar(
+            select(ProviderProfile)
+            .where(
+                ProviderProfile.id == profile_id,
+                ProviderProfile.tenant_id == g.admin.tenant_id,
+                ProviderProfile.deleted_at.is_(None),
+            )
+            .with_for_update()
+        )
+        if profile is None:
+            return "Not Found", 404
+        if (
+            profile.provider != provider
+            or profile.inference_secret_ciphertext != inference_secret_ciphertext
+            or dict(profile.settings) != settings
+            or profile.catalog_generation != catalog_generation
+        ):
+            flash(
+                "Accountdaten wurden während des Katalog-Refreshs geändert. "
+                "Bitte den Katalog erneut aktualisieren.",
+                "warning",
+            )
+            return redirect(url_for("admin.settings_connection"))
         replace_catalog_entries(session, profile, entries, error)
         if error is None and provider == "azure":
             deployments = azure_deployments_from_catalog(entries)
-            updated = dict(profile.settings)
-            updated["model_deployments"] = deployments
-            profile.settings = updated
-            if deployments and (
-                not profile.default_model or profile.default_model not in deployments
-            ):
+            profile.settings = {**profile.settings, "model_deployments": deployments}
+            if deployments and profile.default_model not in deployments:
                 profile.default_model = next(iter(deployments))
         elif error is None and provider in {"openai", "openrouter"}:
             selectable = selectable_catalog_models(provider, entries)
             model_ids = [model_id for model_id, _ in selectable]
-            if model_ids and (
-                not profile.default_model or profile.default_model not in model_ids
-            ):
+            if model_ids and profile.default_model not in model_ids:
                 profile.default_model = model_ids[0]
-    if error is None:
-        selectable = selectable_catalog_models(provider, entries)
-        flash(
-            f"Katalog aktualisiert — {len(selectable)} wählbare Modelle übernommen.",
-            "info",
-        )
-    else:
-        flash(error, "error")
+    flash(
+        (
+            f"Katalog aktualisiert — {len(selectable_catalog_models(provider, entries))} wählbare Modelle übernommen."
+            if error is None
+            else error
+        ),
+        "info" if error is None else "error",
+    )
     return redirect(url_for("admin.settings_connection"))
 
 
@@ -660,7 +816,7 @@ def settings_costs():
 @admin_bp.post("/settings/costs/billing")
 @login_required
 def save_billing():
-    """Store OpenAI or OpenRouter billing credentials."""
+    """Store billing credentials for one account."""
     form = BillingCredentialsForm()
     if not form.validate_on_submit() or not form.billing_secret.data:
         flash("Billing-Schlüssel fehlt.", "error")
@@ -672,11 +828,11 @@ def save_billing():
                 session,
                 database.secret_cipher,
                 g.admin.tenant_id,
-                form.provider.data or "",
+                form.profile_id.data or "",
                 form.billing_secret.data,
                 g.admin.username,
             )
-    except LookupError as exc:
+    except (LookupError, ValueError) as exc:
         flash(str(exc), "error")
         return redirect(url_for("admin.settings_costs"))
     flash("Billing-Schlüssel gespeichert.", "info")
@@ -686,20 +842,21 @@ def save_billing():
 @admin_bp.post("/settings/costs/refresh")
 @login_required
 def refresh_costs():
-    """Refresh provider costs; provider I/O stays outside the write transaction."""
-    provider = request.form.get("provider", "")
+    """Refresh one profile's costs; provider I/O stays outside the write transaction."""
+    profile_id = request.form.get("profile_id", "")
     database = _database()
     end = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
     start = end - timedelta(days=30)
     try:
         with database.sessions.begin() as session:
-            profile, binding, node, job = start_cost_refresh(
-                session, g.admin.tenant_id, provider, start, end
+            profile, binding, node, usage_node, job = start_cost_refresh(
+                session, g.admin.tenant_id, profile_id, start, end
             )
             profile_id = profile.id
             binding_id = binding.id
             job_id = job.id
             canonical_scope_id = node.canonical_scope_id
+            usage_scope_id = usage_node.canonical_scope_id if usage_node else None
     except LookupError as exc:
         flash(str(exc), "error")
         return redirect(url_for("admin.settings_costs"))
@@ -708,7 +865,12 @@ def refresh_costs():
         profile = session.get(ProviderProfile, profile_id)
         try:
             buckets = collect_provider_costs(
-                database.secret_cipher, profile, canonical_scope_id, start, end
+                database.secret_cipher,
+                profile,
+                canonical_scope_id,
+                start,
+                end,
+                usage_scope_id=usage_scope_id,
             )
             error = None
         except CostRefreshError as exc:
@@ -827,90 +989,99 @@ def delete_account_passkey(passkey_id: str):
     return redirect(url_for("admin.account"))
 
 
-def _load_tenant_profiles() -> tuple[Tenant, dict[str, ProviderProfile]]:
+def _load_tenant_profiles() -> tuple[Tenant, tuple[ProviderProfile, ...]]:
+    """Load every active tenant profile without collapsing same-provider accounts."""
     database = _database()
     with database.sessions() as session:
         tenant = session.get(Tenant, g.admin.tenant_id)
-        profiles = {
-            profile.provider: profile
-            for profile in session.scalars(
-                select(ProviderProfile).where(ProviderProfile.tenant_id == tenant.id)
+        profiles = tuple(
+            session.scalars(
+                select(ProviderProfile)
+                .where(
+                    ProviderProfile.tenant_id == tenant.id,
+                    ProviderProfile.deleted_at.is_(None),
+                )
+                .order_by(ProviderProfile.provider, ProviderProfile.display_name)
             )
-        }
+        )
         session.expunge_all()
         return tenant, profiles
 
 
-def _save_profile(
-    provider: str,
-    settings: dict[str, object],
-    default_model: str,
-    inference_secret: str | None,
+def _set_profile_form_choices(
+    form: ProviderProfileForm, provider: str | None = None
 ) -> None:
-    database = _database()
-    with database.sessions.begin() as session:
-        upsert_provider_profile(
-            session,
-            database.secret_cipher,
-            g.admin.tenant_id,
-            provider,
-            settings,
-            default_model,
-            inference_secret or None,
-            g.admin.username,
-        )
-
-
-def _catalog_tuples(
-    session, tenant_id: str, provider: str
-) -> list[tuple[str, str | None]]:
-    profile = session.scalar(
-        select(ProviderProfile).where(
-            ProviderProfile.tenant_id == tenant_id,
-            ProviderProfile.provider == provider,
-        )
+    """Keep the submitted provider fixed on edit and render only supported choices."""
+    providers = [("azure", "Azure"), ("openai", "OpenAI"), ("openrouter", "OpenRouter")]
+    form.provider.choices = (
+        [(provider, dict(providers)[provider])]
+        if provider in dict(providers)
+        else [("", "Anbieter wählen"), *providers]
     )
-    if profile is None:
-        return []
-    rows = session.scalars(
-        select(ProviderCatalogEntry)
-        .where(ProviderCatalogEntry.profile_id == profile.id)
-        .order_by(ProviderCatalogEntry.model_id)
+
+
+def _profile_form(profile: ProviderProfile) -> ProviderProfileForm:
+    """Populate non-secret account settings; credentials are never rendered."""
+    form = ProviderProfileForm(
+        provider=profile.provider,
+        display_name=profile.display_name or "",
+        base_url=str(profile.settings.get("base_url", "")),
+        default_model=profile.default_model or "",
+        organization=str(profile.settings.get("organization", "")),
+        project=str(profile.settings.get("project", "")),
+        api_key="",
     )
-    return [(row.model_id, row.deployment_id) for row in rows]
+    _set_profile_form_choices(form, profile.provider)
+    return form
 
 
-def _model_choices(
-    selectable: list[tuple[str, str | None]],
-) -> list[tuple[str, str]]:
-    choices: list[tuple[str, str]] = []
-    for model_id, deployment_id in selectable:
-        if deployment_id and deployment_id != model_id:
-            label = f"{model_id} → {deployment_id}"
-        else:
-            label = model_id
-        choices.append((model_id, label))
-    return choices
+def _provider_settings(form: ProviderProfileForm) -> dict[str, object]:
+    """Extract only fields belonging to the chosen provider."""
+    provider = form.provider.data
+    if provider == "azure":
+        return {"base_url": validate_azure_base_url(form.base_url.data)}
+    if provider == "openai":
+        return {
+            "organization": form.organization.data or "",
+            "project": form.project.data or "",
+        }
+    if provider == "openrouter":
+        return {}
+    raise ValueError("Unsupported provider")
 
 
 def _connection_context() -> dict[str, object]:
     database = _database()
+    provider_names = ("azure", "openai", "openrouter")
     with database.sessions() as session:
         tenant = session.get(Tenant, g.admin.tenant_id)
-        profiles = {
-            profile.provider: profile
-            for profile in session.scalars(
-                select(ProviderProfile).where(ProviderProfile.tenant_id == tenant.id)
+        profiles = tuple(
+            session.scalars(
+                select(ProviderProfile)
+                .where(
+                    ProviderProfile.tenant_id == tenant.id,
+                    ProviderProfile.deleted_at.is_(None),
+                )
+                .order_by(ProviderProfile.provider, ProviderProfile.display_name)
             )
+        )
+        profiles_by_provider = {
+            provider: tuple(
+                profile for profile in profiles if profile.provider == provider
+            )
+            for provider in provider_names
         }
+        profiles_with_bindings = frozenset(
+            session.scalars(
+                select(ProviderScopeBinding.profile_id).where(
+                    ProviderScopeBinding.tenant_id == tenant.id
+                )
+            )
+        )
         catalogs: dict[str, tuple[ProviderCatalogEntry, ...]] = {}
         selectable_models: dict[str, tuple[tuple[str, str | None], ...]] = {}
-        for name in ("azure", "openai", "openrouter"):
-            profile = profiles.get(name)
-            if profile is None:
-                catalogs[name] = ()
-                selectable_models[name] = ()
-                continue
+        selectable_model_ids: dict[str, tuple[str, ...]] = {}
+        for profile in profiles:
             rows = tuple(
                 session.scalars(
                     select(ProviderCatalogEntry)
@@ -918,135 +1089,88 @@ def _connection_context() -> dict[str, object]:
                     .order_by(ProviderCatalogEntry.model_id)
                 )
             )
-            catalogs[name] = rows
-            selectable_models[name] = tuple(
+            catalogs[profile.id] = rows
+            selectable_models[profile.id] = tuple(
                 selectable_catalog_models(
-                    name, [(row.model_id, row.deployment_id) for row in rows]
+                    profile.provider,
+                    [(row.model_id, row.deployment_id) for row in rows],
                 )
             )
-        azure = profiles.get("azure")
-        openai = profiles.get("openai")
-        openrouter = profiles.get("openrouter")
-        inference_secrets = {
-            name: (
-                database.secret_cipher.decrypt(profile.inference_secret_ciphertext)
-                if profile is not None and profile.inference_secret_ciphertext
-                else None
+            selectable_model_ids[profile.id] = tuple(
+                model_id for model_id, _deployment_id in selectable_models[profile.id]
             )
-            for name, profile in (
-                ("azure", azure),
-                ("openai", openai),
-                ("openrouter", openrouter),
-            )
-        }
-        azure_form = AzureConnectionForm(
-            base_url=(azure.settings.get("base_url") if azure else "") or "",
-            api_key=inference_secrets["azure"] or "",
-            default_model=azure.default_model if azure else "",
-        )
-        azure_form.default_model.choices = _model_choices(
-            list(selectable_models["azure"])
-        ) or [("", "— Katalog aktualisieren —")]
-        openai_form = OpenAIConnectionForm(
-            api_key=inference_secrets["openai"] or "",
-            default_model=openai.default_model if openai else "",
-            organization=(openai.settings.get("organization") if openai else "") or "",
-            project=(openai.settings.get("project") if openai else "") or "",
-        )
-        openai_form.default_model.choices = _model_choices(
-            list(selectable_models["openai"])
-        ) or [("", "— Katalog aktualisieren —")]
-        openrouter_form = OpenRouterConnectionForm(
-            api_key=inference_secrets["openrouter"] or "",
-            default_model=openrouter.default_model if openrouter else "",
-        )
-        openrouter_form.default_model.choices = _model_choices(
-            list(selectable_models["openrouter"])
-        ) or [("", "— Katalog aktualisieren —")]
-        _set_api_key_labels(azure_form, openai_form, openrouter_form, inference_secrets)
-        activate_form = ActivateProviderForm()
         session.expunge_all()
         return {
             "view": ConnectionView(
                 tenant_id=tenant.id,
-                azure=azure,
-                openai=openai,
-                openrouter=openrouter,
+                profiles_by_provider=profiles_by_provider,
+                profiles_with_bindings=profiles_with_bindings,
                 catalogs=catalogs,
                 selectable_models=selectable_models,
-                active_provider=next(
+                selectable_model_ids=selectable_model_ids,
+                active_profile_id=tenant.active_profile_id,
+                active_profile_name=next(
                     (
-                        profile.provider
-                        for profile in profiles.values()
+                        profile.display_name
+                        for profile in profiles
                         if profile.id == tenant.active_profile_id
                     ),
                     None,
                 ),
-                inference_secrets=inference_secrets,
+                active_provider=next(
+                    (
+                        profile.provider
+                        for profile in profiles
+                        if profile.id == tenant.active_profile_id
+                    ),
+                    None,
+                ),
             ),
-            "azure_form": azure_form,
-            "openai_form": openai_form,
-            "openrouter_form": openrouter_form,
-            "activate_form": activate_form,
             "logout_form": LoginForm(),
         }
-
-
-def _set_api_key_labels(
-    azure_form: AzureConnectionForm,
-    openai_form: OpenAIConnectionForm,
-    openrouter_form: OpenRouterConnectionForm,
-    secrets: dict[str, str | None],
-) -> None:
-    azure_form.api_key.label.text = (
-        "Azure API-Schlüssel (optional — leer lässt den gespeicherten Wert)"
-        if secrets["azure"]
-        else "Azure API-Schlüssel *"
-    )
-    openai_form.api_key.label.text = (
-        "OpenAI API-Schlüssel (optional — leer lässt den gespeicherten Wert)"
-        if secrets["openai"]
-        else "OpenAI API-Schlüssel *"
-    )
-    openrouter_form.api_key.label.text = (
-        "OpenRouter API-Schlüssel (optional — leer lässt den gespeicherten Wert)"
-        if secrets["openrouter"]
-        else "OpenRouter API-Schlüssel *"
-    )
 
 
 def _costs_context() -> dict[str, object]:
     database = _database()
     with database.sessions() as session:
-        profiles = {
-            profile.provider: profile
-            for profile in session.scalars(
-                select(ProviderProfile).where(
-                    ProviderProfile.tenant_id == g.admin.tenant_id
+        profiles = tuple(
+            session.scalars(
+                select(ProviderProfile)
+                .where(
+                    ProviderProfile.tenant_id == g.admin.tenant_id,
+                    ProviderProfile.deleted_at.is_(None),
                 )
+                .order_by(ProviderProfile.provider, ProviderProfile.display_name)
             )
-        }
+        )
         billing_key_masks = {
-            name: (
+            profile.id: (
                 mask_secret(
                     database.secret_cipher.decrypt(profile.billing_secret_ciphertext)
                 )
-                if profile is not None and profile.billing_secret_ciphertext
+                if profile.billing_secret_ciphertext
                 else None
             )
-            for name, profile in (
-                ("openai", profiles.get("openai")),
-                ("openrouter", profiles.get("openrouter")),
-            )
+            for profile in profiles
         }
         bindings = tuple(
             session.execute(
-                select(ProviderScopeBinding, ProviderScopeNode)
+                select(ProviderProfile, ProviderScopeBinding, ProviderScopeNode)
+                .join(
+                    ProviderScopeBinding,
+                    (ProviderScopeBinding.profile_id == ProviderProfile.id)
+                    & (ProviderScopeBinding.tenant_id == ProviderProfile.tenant_id),
+                )
                 .join(
                     ProviderScopeNode,
                     ProviderScopeNode.id == ProviderScopeBinding.node_id,
                 )
-                .where(ProviderScopeBinding.tenant_id == g.admin.tenant_id)
+                .where(
+                    ProviderProfile.tenant_id == g.admin.tenant_id,
+                    ProviderProfile.deleted_at.is_(None),
+                    ProviderScopeBinding.purpose == "billing",
+                )
+                .order_by(ProviderProfile.provider, ProviderProfile.display_name)
             ).all()
         )
         jobs = tuple(
@@ -1063,11 +1187,17 @@ def _costs_context() -> dict[str, object]:
                 .order_by(CostUsageRecord.id.desc())
             )
         )
+        binding_profile_names = {
+            binding.id: profile.display_name or profile.provider
+            for profile, binding, _node in bindings
+        }
         session.expunge_all()
         return {
             "view": CostsView(
                 tenant_id=g.admin.tenant_id,
+                profiles=profiles,
                 bindings=bindings,
+                binding_profile_names=binding_profile_names,
                 jobs=jobs,
                 records=records,
                 billing_key_masks=billing_key_masks,

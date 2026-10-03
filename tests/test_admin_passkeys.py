@@ -207,7 +207,9 @@ def test_register_complete_clears_enrollment_only(admin_app, monkeypatch):
         headers={"X-CSRFToken": csrf},
     )
     assert response.status_code == 200
-    assert response.get_json()["ok"] is True
+    payload = response.get_json()
+    assert payload["ok"] is True
+    assert payload["redirect"].endswith("/admin/")
 
     database = admin_app.extensions["database"]
     with database.sessions() as session:
@@ -221,6 +223,84 @@ def test_register_complete_clears_enrollment_only(admin_app, monkeypatch):
 
     dashboard = client.get("/admin/")
     assert dashboard.status_code == 200
+
+
+def test_additional_passkey_redirects_to_account(admin_app, monkeypatch):
+    """A second passkey stays on the account page and excludes the first credential."""
+    database = admin_app.extensions["database"]
+    with database.sessions.begin() as session:
+        account = authenticate_admin(session, "ada", "correct-horse-battery")
+        account_id = account.id
+        existing = _insert_dummy_passkey(session, account_id, "Primary")
+        existing_credential_id = existing.credential_id
+        principal = create_admin_session(session, account, enrollment_only=False)
+        token = principal.token
+
+    client = admin_app.test_client()
+    client.set_cookie("admin_session", token, path="/admin")
+    account_page = client.get("/admin/account")
+    assert account_page.status_code == 200
+    html = account_page.get_data(as_text=True)
+    assert "Mehrere Passkeys sind erlaubt" in html
+    marker = 'name="csrf-token" content="'
+    start = html.index(marker) + len(marker)
+    csrf = html[start : html.index('"', start)]
+
+    begin = client.post(
+        "/admin/webauthn/register/begin",
+        json={},
+        headers={"X-CSRFToken": csrf},
+    )
+    assert begin.status_code == 200
+    begin_payload = begin.get_json()
+    exclude = begin_payload["options"]["excludeCredentials"]
+    assert len(exclude) == 1
+    assert begin_payload["options"]["hints"] == [
+        "security-key",
+        "client-device",
+        "hybrid",
+    ]
+
+    verified = SimpleNamespace(
+        credential_id=b"cred-2-additional",
+        credential_public_key=b"pubkey-2",
+        sign_count=0,
+        aaguid="00000000-0000-0000-0000-000000000000",
+        credential_backed_up=False,
+    )
+    monkeypatch.setattr(
+        "app.admin.views.complete_registration",
+        lambda *args, **kwargs: verified,
+    )
+    monkeypatch.setattr(
+        "app.admin.views.consume_challenge",
+        lambda *args, **kwargs: b"challenge-2",
+    )
+
+    complete = client.post(
+        "/admin/webauthn/register/complete",
+        json={
+            "challenge_id": begin_payload["challenge_id"],
+            "credential": {"id": "y"},
+            "label": "YubiKey",
+        },
+        headers={"X-CSRFToken": csrf},
+    )
+    assert complete.status_code == 200
+    payload = complete.get_json()
+    assert payload["ok"] is True
+    assert payload["redirect"].endswith("/admin/account")
+
+    with database.sessions() as session:
+        keys = list(
+            session.scalars(
+                select(AdminPasskey).where(AdminPasskey.account_id == account_id)
+            )
+        )
+        assert len(keys) == 2
+        labels = {key.label for key in keys}
+        assert labels == {"Primary", "YubiKey"}
+        assert existing_credential_id in {key.credential_id for key in keys}
 
 
 def test_webauthn_config_from_test_settings(admin_app):

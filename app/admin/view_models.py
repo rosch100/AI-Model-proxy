@@ -36,16 +36,17 @@ class DashboardView:
 
 @dataclass(frozen=True)
 class ConnectionView:
-    """Editable connection state for every supported provider."""
+    """Provider accounts grouped for the connection settings page."""
 
     tenant_id: str
-    azure: ProviderProfile | None
-    openai: ProviderProfile | None
-    openrouter: ProviderProfile | None
+    profiles_by_provider: dict[str, tuple[ProviderProfile, ...]]
+    profiles_with_bindings: frozenset[str]
     catalogs: dict[str, tuple[ProviderCatalogEntry, ...]]
     selectable_models: dict[str, tuple[tuple[str, str | None], ...]]
+    selectable_model_ids: dict[str, tuple[str, ...]]
+    active_profile_id: str | None
+    active_profile_name: str | None
     active_provider: str | None
-    inference_secrets: dict[str, str | None]
 
 
 @dataclass(frozen=True)
@@ -53,7 +54,11 @@ class CostsView:
     """Bound scopes, latest refresh, and recorded cost buckets."""
 
     tenant_id: str
-    bindings: tuple[tuple[ProviderScopeBinding, ProviderScopeNode], ...]
+    profiles: tuple[ProviderProfile, ...]
+    bindings: tuple[
+        tuple[ProviderProfile, ProviderScopeBinding, ProviderScopeNode], ...
+    ]
+    binding_profile_names: dict[str, str]
     jobs: tuple[CostRefreshJob, ...]
     records: tuple[CostUsageRecord, ...]
     billing_key_masks: dict[str, str | None]
@@ -71,21 +76,23 @@ def provider_state(profile: ProviderProfile | None) -> str:
 
 
 def dashboard_view(
-    tenant: Tenant, profiles: dict[str, ProviderProfile]
+    tenant: Tenant, profiles: tuple[ProviderProfile, ...]
 ) -> DashboardView:
-    """Build dashboard status rows from the persisted tenant and profiles."""
-    active = None
-    for profile in profiles.values():
-        if tenant.active_profile_id == profile.id:
-            active = profile.provider
-            break
+    """Build dashboard status rows without collapsing account identities."""
+    profiles_by_provider: dict[str, ProviderProfile] = {}
+    active_provider = None
+    for profile in profiles:
+        profiles_by_provider.setdefault(profile.provider, profile)
+        if profile.id == tenant.active_profile_id:
+            profiles_by_provider[profile.provider] = profile
+            active_provider = profile.provider
     labels = {"azure": "Azure", "openai": "OpenAI", "openrouter": "OpenRouter"}
     statuses = tuple(
         ProviderStatus(
             provider=name,
             label=labels[name],
-            state=provider_state(profiles.get(name)),
-            is_active=active == name,
+            state=provider_state(profiles_by_provider.get(name)),
+            is_active=active_provider == name,
         )
         for name in ("azure", "openai", "openrouter")
     )

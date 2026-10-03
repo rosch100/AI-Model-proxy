@@ -5,9 +5,12 @@ from __future__ import annotations
 import re
 import secrets
 
+from sqlalchemy import select
+
 from app.admin.security import ADMIN_COOKIE_NAME, mask_secret
 from app.persistence.admin_auth import authenticate_admin, create_admin_session
-from app.persistence.admin_ops import replace_catalog_entries, upsert_provider_profile
+from app.persistence.admin_ops import create_provider_profile, replace_catalog_entries
+from app.persistence.models import AuditEvent, ProviderProfile, Tenant
 from app.persistence.passkeys import insert_passkey
 from app.providers.catalog import (
     azure_deployments_from_catalog,
@@ -61,61 +64,116 @@ def _authenticated_admin_client(admin_app):
     return client
 
 
-def test_connection_page_puts_secret_in_password_field(admin_app):
-    """Stored keys fill a password input with a Klartext reveal control."""
+def test_connection_page_renders_same_provider_profiles_without_exposing_secrets(
+    admin_app,
+):
+    """Both same-provider profiles remain visible and their keys stay private."""
     database = admin_app.extensions["database"]
-    full_key = "azure-secret-key-value-xyz9"
+    secret_values = ("azure-production-secret", "azure-staging-secret")
     with database.sessions.begin() as session:
-        profile = upsert_provider_profile(
-            session,
-            database.secret_cipher,
-            "acme",
-            "azure",
-            {
-                "base_url": "https://example.openai.azure.com",
-                "model_deployments": {"gpt-6-astra": "gpt-6-astra"},
-            },
-            "gpt-6-astra",
-            full_key,
-            "ada",
-        )
-        replace_catalog_entries(
-            session,
-            profile,
-            [("gpt-6-astra", "gpt-6-astra"), ("gpt-6-luna", "gpt-6-luna")],
-            None,
-        )
+        profiles = []
+        for name, model, secret in (
+            ("Production", "gpt-6-astra", secret_values[0]),
+            ("Staging", "gpt-6-luna", secret_values[1]),
+        ):
+            profile = create_provider_profile(
+                session,
+                database.secret_cipher,
+                "acme",
+                "azure",
+                name,
+                {
+                    "base_url": "https://example.openai.azure.com",
+                    "model_deployments": {model: model},
+                },
+                model,
+                secret,
+                "ada",
+            )
+            replace_catalog_entries(session, profile, [(model, model)], None)
+            profiles.append(profile)
 
     client = _authenticated_admin_client(admin_app)
     response = client.get("/admin/settings/connection")
     body = response.get_data(as_text=True)
+
     assert response.status_code == 200
-    assert 'id="azure-api-key"' in body
-    assert 'type="password"' in body
-    assert f'value="{full_key}"' in body
-    assert 'data-reveal-secret="azure-api-key"' in body
-    assert "Klartext anzeigen" in body
-    assert "Wählbare Modelle" in body
-    azure_select = re.search(
-        r'<select(?=[^>]*id="azure-default-model")[^>]*>.*?</select>', body
+    assert "Production" in body
+    assert "Staging" in body
+    assert "gpt-6-astra" in body
+    assert "gpt-6-luna" in body
+    assert "Schlüssel gespeichert" in body
+    for secret in secret_values:
+        assert secret not in body
+    for profile in profiles:
+        assert f"/admin/settings/connection/{profile.id}/edit" in body
+
+
+def test_delete_connection_soft_deletes_only_the_tenant_profile(admin_app):
+    """Profile deletion is CSRF-protected, audited, and tenant-scoped."""
+    database = admin_app.extensions["database"]
+    with database.sessions.begin() as session:
+        session.add(
+            Tenant(
+                id="other",
+                api_key_hash="b" * 64,
+                custom_model_id="cursor-other-model",
+            )
+        )
+        own_profile = create_provider_profile(
+            session,
+            database.secret_cipher,
+            "acme",
+            "openai",
+            "Own account",
+            {},
+            "gpt-5.4",
+            "sk-own-secret",
+            "ada",
+        )
+        foreign_profile = create_provider_profile(
+            session,
+            database.secret_cipher,
+            "other",
+            "openai",
+            "Foreign account",
+            {},
+            "gpt-5.4",
+            "sk-foreign-secret",
+            "operator",
+        )
+        own_profile_id = own_profile.id
+        foreign_profile_id = foreign_profile.id
+        tenant = session.get(Tenant, "acme")
+        tenant.active_profile_id = own_profile_id
+
+    client = _authenticated_admin_client(admin_app)
+    page = client.get("/admin/settings/connection")
+    csrf = re.search(
+        r'name="csrf_token" type="hidden" value="([^"]+)"',
+        page.get_data(as_text=True),
+    ).group(1)
+    forbidden = client.post(
+        f"/admin/settings/connection/{foreign_profile_id}/delete",
+        data={"csrf_token": csrf, "profile_id": foreign_profile_id},
     )
-    assert azure_select is not None
-    assert 'name="default_model"' in azure_select.group()
-    assert re.search(
-        r'<option[^>]*value="gpt-6-astra">gpt-6-astra</option>',
-        azure_select.group(),
+    assert forbidden.status_code == 404
+
+    deleted = client.post(
+        f"/admin/settings/connection/{own_profile_id}/delete",
+        data={"csrf_token": csrf, "profile_id": own_profile_id},
     )
-    assert re.search(
-        r'<option[^>]*value="gpt-6-luna">gpt-6-luna</option>',
-        azure_select.group(),
-    )
-    assert 'for="azure-default-model"' in body
-    assert 'aria-describedby="azure-model-hint"' in azure_select.group()
-    assert re.search(r'<select(?=[^>]*id="openai-default-model")', body)
-    assert re.search(r'<select(?=[^>]*id="openrouter-default-model")', body)
-    assert len(re.findall(r'<select(?=[^>]*id="[^"]*-default-model")', body)) == 3
-    assert "Modell-Deployments" not in body
-    assert "Pflichtfelder sind mit" in body
+    assert deleted.status_code == 302
+    with database.sessions() as session:
+        own_profile = session.get(ProviderProfile, own_profile_id)
+        assert own_profile.deleted_at is not None
+        assert session.get(ProviderProfile, foreign_profile_id).deleted_at is None
+        assert session.get(Tenant, "acme").active_profile_id is None
+        event = session.scalar(
+            select(AuditEvent).where(AuditEvent.action == "profile.delete")
+        )
+        assert event.target == f"profile:{own_profile_id}"
+    database.engine.dispose()
 
 
 def test_costs_page_explains_provider_specific_credentials_and_limits(admin_app):
@@ -125,13 +183,13 @@ def test_costs_page_explains_provider_specific_credentials_and_limits(admin_app)
     body = response.get_data(as_text=True)
 
     assert response.status_code == 200
-    assert "Es gibt keinen providerübergreifenden „Billing-Key“." in body
+    assert "providerübergreifenden „Billing-Key“" in body
     assert "Admin API Key" in body
     assert "Management Key" in body
-    assert "Workspace-ID enthalten" in body
-    assert "als Filter verwendet" in body
-    assert "Azure-API-Key reicht nicht" in body
+    assert "Workspace-ID" in body
+    assert "als Filter" in body
+    assert "Cost-Management" in body
+    assert "Azure-API-Key reicht nicht" not in body
     assert "letzten 30 abgeschlossenen UTC-Tage" in body
-    assert "OpenRouter-Guthabenverbrauch und BYOK-Kosten getrennt" in body
+    assert "Guthabenverbrauch, BYOK-Kosten" in body
     assert "Prompt-, Completion- und Reasoning-Tokens" in body
-    assert "Kosten und Tokenverbrauch" in body

@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import hashlib
 import os
 import secrets
 import unicodedata
@@ -15,7 +14,7 @@ from sqlalchemy import select, text
 from sqlalchemy.exc import IntegrityError
 from werkzeug.security import generate_password_hash
 
-from app.tenants import parse_tenants
+from app.tenants import hash_api_key, parse_tenants
 
 from .persistence.database import Database
 from .persistence.models import (
@@ -62,7 +61,7 @@ def create_tenant(tenant_id: str) -> None:
     api_key = secrets.token_urlsafe(32)
     tenant = Tenant(
         id=tenant_id,
-        api_key_hash=hashlib.sha256(api_key.encode("utf-8")).hexdigest(),
+        api_key_hash=hash_api_key(api_key),
         custom_model_id=f"cursor-{secrets.token_urlsafe(18)}",
     )
     admin = AdminAccount(
@@ -103,39 +102,48 @@ def import_legacy_tenants() -> None:
 @tenant_commands.command("bind-billing-scope")
 @with_appcontext
 def bind_billing_scope() -> None:
-    """Bind tenant-exclusive provider billing and usage scopes."""
+    """Bind tenant-exclusive provider billing and usage scopes to one account."""
     tenant_id = click.prompt("Tenant ID")
-    provider = click.prompt(
-        "Provider", type=click.Choice(("azure", "openai", "openrouter"))
-    )
+    profile_id = click.prompt("Provider profile ID")
+    database = _database()
+    with database.sessions() as session:
+        profile = session.scalar(
+            select(ProviderProfile).where(
+                ProviderProfile.tenant_id == tenant_id,
+                ProviderProfile.id == profile_id,
+                ProviderProfile.deleted_at.is_(None),
+            )
+        )
+        if profile is None:
+            raise click.ClickException(
+                "Provider profile was not found for this tenant."
+            )
+        provider = profile.provider
+
+    actor_id = f"uid:{os.getuid()}"
     scope_values = _prompt_scope_values(provider)
     if not click.confirm(
         "I confirm every entered provider scope is exclusively dedicated to this tenant"
     ):
         raise click.ClickException("Exclusive scope confirmation is required.")
 
-    database = _database()
     try:
         with database.sessions.begin() as session:
             tenant = session.get(Tenant, tenant_id)
             if tenant is None:
                 raise ValueError(f"Tenant {tenant_id!r} does not exist")
             profile = session.scalar(
-                select(ProviderProfile).where(
+                select(ProviderProfile)
+                .where(
                     ProviderProfile.tenant_id == tenant_id,
-                    ProviderProfile.provider == provider,
+                    ProviderProfile.id == profile_id,
+                    ProviderProfile.deleted_at.is_(None),
                 )
+                .with_for_update()
             )
             if profile is None:
-                profile = ProviderProfile(
-                    id=str(uuid4()),
-                    tenant_id=tenant_id,
-                    provider=provider,
-                    settings={},
-                )
-                session.add(profile)
-                session.flush()
-
+                raise ValueError("Provider profile was not found for this tenant")
+            provider = profile.provider
             rebound = provider == "openrouter" and _rebind_openrouter_workspace(
                 session, tenant_id, profile.id, scope_values["billing"]
             )
@@ -180,7 +188,7 @@ def bind_billing_scope() -> None:
                 session.add(
                     AuditEvent(
                         tenant_id=tenant_id,
-                        actor_id="operator",
+                        actor_id=actor_id,
                         target=f"{provider}:billing-scope",
                         action="billing_scope.bind",
                         outcome="success",

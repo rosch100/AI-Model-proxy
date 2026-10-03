@@ -50,6 +50,10 @@ class DatabaseTenantSnapshot:
     provider_settings: Mapping[str, Any]
     inference_secret: str | None
     default_model: str | None
+    profile_id: str | None = None
+    profile_name: str | None = None
+    history_generation: int | None = None
+    profile_deleted: bool = False
 
     @property
     def azure_base_url(self) -> str | None:
@@ -88,6 +92,8 @@ class DatabaseTenantSnapshot:
 
 def hash_api_key(api_key: str) -> str:
     """Return the SHA-256 hex digest of an API key."""
+    # API keys are generated as 256-bit random bearer tokens, not passwords.
+    # codeql[py/weak-sensitive-data-hashing]
     return hashlib.sha256(api_key.encode("utf-8")).hexdigest()
 
 

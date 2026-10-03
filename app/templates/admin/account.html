@@ -7,6 +7,7 @@
   <p class="lede">Angemeldet als {{ username }}.</p>
 
   <h2>Passkeys</h2>
+  <p class="lede">Mehrere Passkeys sind erlaubt. iCloud-Geräte teilen denselben Passkey automatisch; für ein Backup einen Security Key oder ein anderes Ökosystem hinzufügen.</p>
   {% if passkeys %}
   <ul class="passkey-list">
     {% for key in passkeys %}
@@ -27,7 +28,7 @@
   {% endif %}
   <div class="stack">
     <label>
-      Neue Bezeichnung
+      Bezeichnung für neuen Passkey
       <input id="passkey-label" type="text" value="Zusatzgerät" maxlength="128" />
     </label>
     <button type="button" id="passkey-register">Weiteren Passkey hinzufügen</button>

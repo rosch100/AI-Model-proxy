@@ -15,6 +15,7 @@ from flask import Request, Response
 
 from ..common.logging import console
 from ..common.recording import record_payload
+from ..tenants import DatabaseTenantSnapshot
 
 # Local adapters
 from .request_adapter import RequestAdapter
@@ -59,7 +60,9 @@ class AzureAdapter:
         self.response_adapter = ResponseAdapter(self)
 
     # Public API
-    def forward(self, req: Request) -> Response:
+    def forward(
+        self, req: Request, snapshot: DatabaseTenantSnapshot | None = None
+    ) -> Response:
         """Forward the Flask request upstream and adapt the response back.
 
         High-level flow:
@@ -68,7 +71,7 @@ class AzureAdapter:
         2) Perform the upstream HTTP call using a short-lived requests call.
         3) ResponseAdapter converts the upstream response into a Flask Response.
         """
-        request_kwargs = self.request_adapter.adapt(req)
+        request_kwargs = self.request_adapter.adapt(req, snapshot)
 
         try:
             record_payload(request_kwargs.get("json", {}), "upstream_request")

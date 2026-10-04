@@ -785,10 +785,10 @@ def test_azure_catalog_model_uses_provider_cascade_after_rate_limit(
     ]
 
 
-def test_native_model_routes_to_own_provider_before_fallbacks(
+def test_native_model_does_not_bypass_higher_priority_provider(
     routed_app, requests_mock
 ):
-    """Prefer the provider that publishes a requested native model ID."""
+    """Keep configured provider order even when a later catalog has the model."""
     with routed_app.extensions["database"].sessions.begin() as session:
         openai_profile = session.scalar(
             select(ProviderProfile).where(ProviderProfile.provider == "openai")
@@ -800,7 +800,7 @@ def test_native_model_routes_to_own_provider_before_fallbacks(
             None,
         )
 
-    requests_mock.post(AZURE, status_code=503)
+    requests_mock.post(AZURE, status_code=429)
     requests_mock.post(
         OPENAI,
         content=successful_chat("openai-native-model"),
@@ -810,14 +810,15 @@ def test_native_model_routes_to_own_provider_before_fallbacks(
     response = post(routed_app, model="openai-native-model")
 
     assert response.status_code == 200
-    assert [request.url for request in requests_mock.request_history] == [OPENAI]
-    assert requests_mock.request_history[0].json()["model"] == "openai-native-model"
+    assert [request.url for request in requests_mock.request_history] == [AZURE, OPENAI]
+    assert requests_mock.request_history[0].json()["model"] == "azure-deployment"
+    assert requests_mock.request_history[1].json()["model"] == "openai-native-model"
 
 
-def test_native_openrouter_model_fails_over_when_its_provider_is_rate_limited(
+def test_native_openrouter_model_does_not_bypass_higher_priority_providers(
     routed_app, requests_mock
 ):
-    """An early catalog match still reaches later fallbacks after retryable errors."""
+    """A later provider's native model must not override route priority."""
     with routed_app.extensions["database"].sessions.begin() as session:
         openrouter_profile = session.scalar(
             select(ProviderProfile).where(ProviderProfile.provider == "openrouter")
@@ -829,11 +830,11 @@ def test_native_openrouter_model_fails_over_when_its_provider_is_rate_limited(
             None,
         )
 
-    requests_mock.post(OPENROUTER, status_code=429)
-    requests_mock.post(AZURE, status_code=503)
+    requests_mock.post(AZURE, status_code=429)
+    requests_mock.post(OPENAI, status_code=503)
     requests_mock.post(
-        OPENAI,
-        content=successful_chat("gpt-5.4"),
+        OPENROUTER,
+        content=successful_chat("native-openrouter-model"),
         headers={"Content-Type": "text/event-stream"},
     )
 
@@ -841,13 +842,55 @@ def test_native_openrouter_model_fails_over_when_its_provider_is_rate_limited(
 
     assert response.status_code == 200
     assert [request.url for request in requests_mock.request_history] == [
-        OPENROUTER,
         AZURE,
         OPENAI,
+        OPENROUTER,
     ]
-    assert requests_mock.request_history[0].json()["model"] == "native-openrouter-model"
-    assert requests_mock.request_history[1].json()["model"] == "azure-deployment"
-    assert requests_mock.request_history[2].json()["model"] == "gpt-5.4"
+    assert requests_mock.request_history[0].json()["model"] == "azure-deployment"
+    assert requests_mock.request_history[1].json()["model"] == "gpt-5.4"
+    assert requests_mock.request_history[2].json()["model"] == "native-openrouter-model"
+
+
+def test_native_openrouter_model_falls_back_after_higher_priority_attempts_fail(
+    routed_app, requests_mock
+):
+    """Preserve native-model selection and continue the ordered cascade on errors."""
+    activate_deepseek_profile(routed_app)
+    with routed_app.extensions["database"].sessions.begin() as session:
+        openrouter_profile = session.scalar(
+            select(ProviderProfile).where(ProviderProfile.provider == "openrouter")
+        )
+        replace_catalog_entries(
+            session,
+            openrouter_profile,
+            [("anthropic/claude-sonnet-4", None), ("native-openrouter-model", None)],
+            None,
+        )
+
+    requests_mock.post(AZURE, status_code=429)
+    requests_mock.post(OPENAI, status_code=503)
+    requests_mock.post(OPENROUTER, status_code=429)
+    requests_mock.post(
+        DEEPSEEK,
+        content=successful_chat("deepseek-v4-flash"),
+        headers={"Content-Type": "text/event-stream"},
+    )
+
+    response = post(routed_app, model="native-openrouter-model")
+
+    assert response.status_code == 200
+    assert [request.url for request in requests_mock.request_history] == [
+        AZURE,
+        OPENAI,
+        OPENROUTER,
+        DEEPSEEK,
+    ]
+    assert [request.json()["model"] for request in requests_mock.request_history] == [
+        "azure-deployment",
+        "gpt-5.4",
+        "native-openrouter-model",
+        "deepseek-v4-flash",
+    ]
 
 
 def test_azure_only_route_rejects_other_provider_catalog_model(

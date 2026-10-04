@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from datetime import datetime, timedelta, timezone
 
 from sqlalchemy import inspect, select
@@ -408,6 +409,86 @@ def test_dashboard_renders_provider_model_activity(admin_app):
     assert "gpt-6-luna" in fragment
 
 
+def test_single_recent_openrouter_failure_is_reported_without_hysteresis(
+    admin_app,
+):
+    """Show a transient OpenRouter 402 without treating it as quota exhaustion."""
+    now = datetime.now(timezone.utc)
+    tenant = Tenant(id="acme", api_key_hash="a" * 64, custom_model_id="cursor-acme")
+    profile = ProviderProfile(
+        id="openrouter-single-inflight-limit",
+        tenant_id="acme",
+        provider="openrouter",
+        display_name="In-flight limited",
+        settings={},
+        default_model="gpt-5.4",
+        route_priority=1,
+        inference_secret_ciphertext="encrypted-key",
+    )
+
+    status = dashboard_view(
+        tenant,
+        (profile,),
+        provider_attempts=(
+            ProviderAttemptEvent(
+                profile_id=profile.id,
+                outcome="failure",
+                status_code=402,
+                occurred_at=now - timedelta(seconds=2),
+                completed_at=now - timedelta(seconds=2),
+            ),
+        ),
+        now=now,
+    ).providers[0]
+
+    assert status.has_recent_failure
+    assert not status.is_overloaded
+    assert status.outcome == "success"
+    assert status.last_failure_status_code == 402
+
+
+def test_pending_attempt_does_not_hide_active_failure_hysteresis(admin_app):
+    """An in-flight attempt does not replace a still-active failure state."""
+    now = datetime.now(timezone.utc)
+    tenant = Tenant(id="acme", api_key_hash="a" * 64, custom_model_id="cursor-acme")
+    profile = ProviderProfile(
+        id="openai-failure-with-pending",
+        tenant_id="acme",
+        provider="openai",
+        display_name="Failure with pending attempt",
+        settings={},
+        default_model="gpt-5.4",
+        route_priority=1,
+        inference_secret_ciphertext="encrypted-key",
+    )
+
+    status = dashboard_view(
+        tenant,
+        (profile,),
+        provider_attempts=(
+            ProviderAttemptEvent(
+                profile_id=profile.id,
+                outcome="failure",
+                occurred_at=now - timedelta(seconds=8),
+            ),
+            ProviderAttemptEvent(
+                profile_id=profile.id,
+                outcome="failure",
+                occurred_at=now - timedelta(seconds=2),
+            ),
+            ProviderAttemptEvent(
+                profile_id=profile.id,
+                outcome="pending",
+                occurred_at=now - timedelta(seconds=1),
+            ),
+        ),
+        now=now,
+    ).providers[0]
+
+    assert status.outcome == "failure"
+    assert status.has_current_activity
+
+
 def test_provider_status_hysteresis_requires_two_failures_then_quiets(admin_app):
     """Require two recent failures and clear only after a quiet recovery window."""
     now = datetime.now(timezone.utc)
@@ -674,6 +755,17 @@ def test_dashboard_provider_status_poll_renders_hysteresis_state(admin_app):
                     occurred_at=now - timedelta(seconds=2),
                     completed_at=now - timedelta(seconds=2),
                 ),
+                ProviderAttemptEvent(
+                    tenant_id="acme",
+                    provider="openai",
+                    profile_id=profile.id,
+                    inbound_model="cursor-acme",
+                    routed_model="gpt-5.4",
+                    outcome="success",
+                    status_code=200,
+                    occurred_at=now - timedelta(seconds=1),
+                    completed_at=now - timedelta(seconds=1),
+                ),
             )
         )
 
@@ -684,7 +776,16 @@ def test_dashboard_provider_status_poll_renders_hysteresis_state(admin_app):
     assert 'data-provider-account="openai-warning-dashboard"' in body
     assert 'data-activity-outcome="failure"' in body
     assert "HTTP 429" in body
-    assert "is-warning is-active" in body
+    card = re.search(
+        r'<li class="provider-status-card[^\"]*" '
+        r'data-provider-account="openai-warning-dashboard">([\s\S]*?)</li>',
+        body,
+    )
+    assert card is not None
+    assert 'class="provider-status-indicator is-warning"' in card.group(1)
+    assert "in der konfigurierten Reihenfolge versucht" in body
+    assert "durch Circuit-Breaker gesperrte Anbieter werden übersprungen" in body
+    assert "nach wiederholbaren Upstreamfehlern wird mit dem nächsten" in body
     assert 'hx-trigger="every 5s"' in body
 
 

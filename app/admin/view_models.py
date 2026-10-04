@@ -43,6 +43,9 @@ class ProviderStatus:
     last_failure_status_code: int | None = None
     has_current_activity: bool = False
     quota_probe_at: datetime | None = None
+    is_disabled: bool = False
+    is_overloaded: bool = False
+    has_recent_failure: bool = False
 
 
 @dataclass(frozen=True)
@@ -540,18 +543,34 @@ def _provider_status(
         quota_status_at = quota_lease_until
     else:
         quota_status_at = None
+    latest_attempt_is_rate_limited = (
+        attempt_status is not None
+        and attempt_status["last_attempt_outcome"] == "failure"
+        and attempt_status["last_attempt_status_code"] == 429
+        and attempt_status["last_attempt_at"] >= now - timedelta(seconds=20)
+    )
+    has_recent_failure = (
+        attempt_status is not None
+        and attempt_status["last_attempt_outcome"] == "failure"
+        and attempt_status["last_attempt_at"] >= now - timedelta(seconds=20)
+    )
+    is_overloaded = latest_attempt_is_rate_limited or quota_status_at is not None
+    state = provider_state(profile)
     return ProviderStatus(
         provider=profile.provider,
         label=_PROVIDER_LABELS[profile.provider],
-        state=provider_state(profile),
+        state=state,
         is_active=profile.route_priority is not None,
+        is_disabled=profile.route_priority is None and state == "Eingerichtet",
+        is_overloaded=is_overloaded,
+        has_recent_failure=has_recent_failure,
         profile_id=profile.id,
         profile_name=profile.display_name,
         route_priority=profile.route_priority,
         outcome=outcome,
         last_failure_status_code=(
             None
-            if attempt_status is None or outcome != "failure"
+            if attempt_status is None
             else attempt_status["last_failure_status_code"]
         ),
         has_current_activity=has_current_activity,
@@ -636,6 +655,10 @@ def _provider_activity_status(
         "last_failure_status_code": (
             None if latest_failure is None else latest_failure.status_code
         ),
+        "last_attempt_status_code": (
+            None if last_attempt is None else last_attempt.status_code
+        ),
+        "last_attempt_outcome": None if last_attempt is None else last_attempt.outcome,
         "last_attempt_at": latest_at,
     }
 

@@ -1,6 +1,6 @@
 """Persist quota circuit state and half-open probe leases.
 
-Revision ID: 20261008_provider_circuit_breaker
+Revision ID: 20261008_provider_breaker
 Revises: 20261007_provider_attempts
 Create Date: 2026-10-04
 """
@@ -10,7 +10,7 @@ from collections.abc import Sequence
 import sqlalchemy as sa
 from alembic import op
 
-revision: str = "20261008_provider_circuit_breaker"
+revision: str = "20261008_provider_breaker"
 down_revision: str | None = "20261007_provider_attempts"
 branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None

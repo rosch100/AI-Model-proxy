@@ -20,7 +20,7 @@ from app.persistence.database import Database
 from app.persistence.models import Base, ProviderCatalogEntry, ProviderProfile, Tenant
 from app.persistence.repositories import TenantRepository, import_tenants
 from app.persistence.secrets import SecretCipher
-from app.tenants import TenantConfig
+from app.tenants import TenantConfig, hash_api_key
 
 
 def test_database_requires_postgresql_url_and_encryption_key():
@@ -227,7 +227,8 @@ def test_tenant_repository_resolves_only_the_api_key_digest():
 
         assert resolved is not None
         assert resolved.id == "acme"
-        assert resolved.api_key_hash != "cursor-key"
+        assert resolved.api_key_hash == hash_api_key("cursor-key")
+        assert resolved.api_key_hash != hashlib.sha256(b"cursor-key").hexdigest()
         assert TenantRepository(session).get_by_api_key("wrong-key") is None
     engine.dispose()
 

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 from collections.abc import Iterator
 
 import requests
@@ -12,6 +13,13 @@ from .request_adapter import CursorRequestAdapter, UnsupportedCursorShape
 from .response_adapter import adapt_responses_sse_to_chat_sse
 from .settings import CodexSettings
 from .upstream import build_upstream_headers, post_responses
+
+logger = logging.getLogger(__name__)
+
+_NOT_READY_ERROR = "Codex authentication is not ready"
+_REQUEST_REJECTED_ERROR = "The Codex request could not be accepted"
+_UPSTREAM_FAILED_ERROR = "Codex upstream request failed"
+_AUTH_FAILED_ERROR = "Codex authentication failed"
 
 
 class CodexAdapter:
@@ -25,8 +33,9 @@ class CodexAdapter:
         """Return Codex readiness based on local auth state."""
         try:
             CodexAuthStore(self.settings.codex_auth_path).validate_ready()
-        except AuthStateError as exc:
-            return jsonify({"status": "not_ready", "error": str(exc)}), 503
+        except AuthStateError:
+            logger.exception("Codex auth state is not ready")
+            return jsonify({"status": "not_ready", "error": _NOT_READY_ERROR}), 503
         return jsonify({"status": "ready"})
 
     def forward(self, req: Request, provider_path: str) -> Response:
@@ -45,8 +54,9 @@ class CodexAdapter:
                 refresh_skew_seconds=self.settings.token_refresh_skew_seconds,
             )
             auth = auth_manager.current()
-        except (UnsupportedCursorShape, AuthStateError) as exc:
-            return jsonify({"error": {"message": str(exc)}}), 400
+        except (UnsupportedCursorShape, AuthStateError):
+            logger.exception("Rejected Codex request before contacting upstream")
+            return jsonify({"error": {"message": _REQUEST_REJECTED_ERROR}}), 400
 
         headers = build_upstream_headers(
             self.settings,
@@ -78,15 +88,12 @@ class CodexAdapter:
                     adapted.body,
                     timeout=self.settings.request_timeout_seconds,
                 )
-        except requests.RequestException as exc:
-            return (
-                jsonify(
-                    {"error": {"message": f"Codex upstream request failed: {exc}"}}
-                ),
-                502,
-            )
-        except AuthStateError as exc:
-            return jsonify({"error": {"message": str(exc)}}), 400
+        except requests.RequestException:
+            logger.exception("Codex upstream request failed")
+            return jsonify({"error": {"message": _UPSTREAM_FAILED_ERROR}}), 502
+        except AuthStateError:
+            logger.exception("Codex authentication failed during an upstream request")
+            return jsonify({"error": {"message": _AUTH_FAILED_ERROR}}), 400
 
         def stream_response():
             try:

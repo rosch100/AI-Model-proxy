@@ -1,5 +1,6 @@
 """Tests for static tenant configuration parsing and startup validation."""
 
+import hashlib
 import json
 
 import pytest
@@ -9,6 +10,7 @@ from app.exceptions import ServiceConfigurationError
 from app.tenants import (
     TenantConfig,
     hash_api_key,
+    legacy_sha256_api_key_hash,
     parse_auth_mode,
     parse_tenants,
     resolve_tenant_for_api_key,
@@ -304,3 +306,26 @@ def test_create_app_accepts_tenant_mode_without_service_api_key(monkeypatch):
 
     assert app.config["AUTH_MODE"] == "tenant"
     assert app.config["TENANTS"][0].id == "acme"
+
+
+def test_hash_api_key_uses_scrypt_and_still_accepts_legacy_sha256():
+    """New digests are scrypt, while stored SHA-256 digests still authenticate."""
+    api_key = "correct-key"
+    current = hash_api_key(api_key)
+    legacy = hashlib.sha256(api_key.encode("utf-8")).hexdigest()
+
+    assert current != legacy
+    assert len(current) == 64
+    assert all(char in "0123456789abcdef" for char in current)
+    assert legacy_sha256_api_key_hash(api_key) == legacy
+
+    tenant = TenantConfig(
+        id="acme",
+        api_key_hash=legacy,
+        azure_base_url="https://acme.openai.azure.com",
+        azure_api_key="azure-secret",
+        azure_model_deployments={"gpt-5.4": "acme-gpt54"},
+    )
+
+    assert resolve_tenant_for_api_key(api_key, (tenant,)).id == "acme"
+    assert resolve_tenant_for_api_key("wrong-key", (tenant,)) is None

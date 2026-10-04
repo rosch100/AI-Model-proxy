@@ -19,7 +19,16 @@ TENANT_CONFIG_DATABASE = "database"
 VALID_AUTH_MODES = frozenset({AUTH_MODE_SINGLE, AUTH_MODE_TENANT})
 
 _PLACEHOLDER_AZURE_API_KEYS = frozenset({"change_me", "change-me"})
-_SHA256_HEX_LENGTH = 64
+_API_KEY_HASH_HEX_LENGTH = 64
+# Cost parameters for newly stored API-key digests. N=2**14 is the lowest
+# power of two that is still expensive relative to a single SHA-256.
+_SCRYPT_N = 2**14
+_SCRYPT_R = 8
+_SCRYPT_P = 1
+_SCRYPT_DKLEN = 32
+# Deterministic salt so a digest remains a lookup key. Cursor API keys are
+# 256-bit bearer tokens, not low-entropy passwords.
+_SCRYPT_SALT = b"ai-model-proxy.api-key.v1"
 
 
 @dataclass(frozen=True)
@@ -102,10 +111,46 @@ class DatabaseTenantRoutingSnapshot:
 
 
 def hash_api_key(api_key: str) -> str:
-    """Return the SHA-256 hex digest of an API key."""
-    # API keys are generated as 256-bit random bearer tokens, not passwords.
-    # codeql[py/weak-sensitive-data-hashing]
+    """Return the scrypt hex digest stored for a newly issued API key."""
+    digest = hashlib.scrypt(
+        api_key.encode("utf-8"),
+        salt=_SCRYPT_SALT,
+        n=_SCRYPT_N,
+        r=_SCRYPT_R,
+        p=_SCRYPT_P,
+        dklen=_SCRYPT_DKLEN,
+    )
+    return digest.hex()
+
+
+def legacy_sha256_api_key_hash(api_key: str) -> str:
+    """Return the historical SHA-256 hex digest of an API key.
+
+    Rows and TENANTS entries created before scrypt still store this form.
+    Verification accepts it; database lookups upgrade it to :func:`hash_api_key`
+    when the session can be written. Environment-configured tenants are not
+    rewritten because that configuration is not persisted by the process.
+    """
     return hashlib.sha256(api_key.encode("utf-8")).hexdigest()
+
+
+def api_key_lookup_digests(api_key: str) -> tuple[str, str]:
+    """Return ``(scrypt, legacy SHA-256)`` digests for one presented API key."""
+    return hash_api_key(api_key), legacy_sha256_api_key_hash(api_key)
+
+
+def _digest_matches(candidate: str, stored_hash: str) -> bool:
+    folded = stored_hash.casefold()
+    if len(candidate) != len(folded):
+        return False
+    return hmac.compare_digest(candidate, folded)
+
+
+def matching_api_key_hash(stored_hash: str, current: str, legacy: str) -> str | None:
+    """Return the scrypt digest when ``stored_hash`` matches either algorithm."""
+    if _digest_matches(current, stored_hash) or _digest_matches(legacy, stored_hash):
+        return current
+    return None
 
 
 def parse_auth_mode(raw_mode: str | None) -> str:
@@ -146,10 +191,10 @@ def resolve_tenant_for_api_key(
     api_key: str, tenants: tuple[TenantConfig, ...]
 ) -> TenantConfig | None:
     """Match an API key against tenant digests with constant-time compares."""
-    digest = hash_api_key(api_key)
+    current, legacy = api_key_lookup_digests(api_key)
     matched: TenantConfig | None = None
     for tenant in tenants:
-        if hmac.compare_digest(digest, tenant.api_key_hash):
+        if matching_api_key_hash(tenant.api_key_hash, current, legacy) is not None:
             matched = tenant
     return matched
 
@@ -182,11 +227,11 @@ def _parse_tenant_entry(entry: Any, index: int) -> TenantConfig:
 
     tenant_id = _required_nonempty_str(entry, "id", index)
     api_key_hash = _required_nonempty_str(entry, "api_key_hash", index).casefold()
-    if len(api_key_hash) != _SHA256_HEX_LENGTH or any(
+    if len(api_key_hash) != _API_KEY_HASH_HEX_LENGTH or any(
         char not in "0123456789abcdef" for char in api_key_hash
     ):
         raise ServiceConfigurationError(
-            f"TENANTS[{index}].api_key_hash must be a SHA-256 hex digest."
+            f"TENANTS[{index}].api_key_hash must be a 64-character hex digest."
         )
 
     azure_base_url = _required_nonempty_str(entry, "azure_base_url", index).rstrip("/")

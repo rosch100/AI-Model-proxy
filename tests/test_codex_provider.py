@@ -54,7 +54,9 @@ def test_codex_ready_reports_not_ready_for_missing_auth(testapp, app, tmp_path):
     response = testapp.get("/codex/ready", headers=AUTH, status=503)
 
     assert response.json["status"] == "not_ready"
-    assert "Codex Login State not found" in response.json["error"]
+    assert response.json["error"] == "Codex authentication is not ready"
+    assert str(tmp_path) not in response.text
+    assert "Traceback" not in response.text
 
 
 def test_codex_ready_allows_read_only_auth_file_when_directory_is_writable(
@@ -314,3 +316,45 @@ def test_codex_model_rewrite_changes_only_upstream_model(
 def test_codex_routes_require_shared_service_api_key(testapp, provider_path):
     """Codex provider uses the same Cursor-facing bearer secret."""
     testapp.get(provider_path, status=401)
+
+
+def test_codex_errors_hide_exception_text(testapp, app, tmp_path, monkeypatch):
+    """Client payloads stay generic when auth state or upstream calls fail."""
+    import requests
+
+    app.config["CODEX_AUTH_PATH"] = tmp_path / "missing.json"
+    app.config["ENABLE_CODEX"] = True
+
+    rejected = testapp.post_json(
+        "/codex/v1/responses",
+        {"model": "codex-test-model", "input": "hello"},
+        headers=AUTH,
+        status=400,
+    )
+
+    assert (
+        rejected.json["error"]["message"] == "The Codex request could not be accepted"
+    )
+    assert "missing.json" not in rejected.text
+    assert "Traceback" not in rejected.text
+
+    auth_file = tmp_path / "auth.json"
+    _write_auth(auth_file)
+    app.config["CODEX_AUTH_PATH"] = auth_file
+
+    def explode(*_args, **_kwargs):
+        raise requests.ConnectionError(
+            "Traceback (most recent call last): secret-upstream.internal"
+        )
+
+    monkeypatch.setattr("app.codex.adapter.post_responses", explode)
+    failed = testapp.post_json(
+        "/codex/v1/responses",
+        {"model": "codex-test-model", "input": "hello"},
+        headers=AUTH,
+        status=502,
+    )
+
+    assert failed.json["error"]["message"] == "Codex upstream request failed"
+    assert "Traceback" not in failed.text
+    assert "secret-upstream" not in failed.text

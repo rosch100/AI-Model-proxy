@@ -2,7 +2,6 @@
 
 import json
 import os
-import re
 import time
 import uuid
 from typing import Any, Dict, List
@@ -105,9 +104,64 @@ def escape_tags(text: str) -> str:
         return ""
     if not isinstance(text, str):
         return str(text)
-    return re.sub(
-        "(<[^<\n]+?)(>)", "\\1>`\n", re.sub("(<)([^>\n]+?>)", "\n`<\\2", text)
-    ).replace(">`\n\n\n`<", ">`\n\n`<")
+    fenced = _rewrite_markup_tags(
+        _rewrite_markup_tags(
+            text, blocked="\n", prefix="\n`<", keep_open=False, suffix=""
+        ),
+        blocked="<\n",
+        prefix="",
+        keep_open=True,
+        suffix=">`\n",
+    )
+    return fenced.replace(">`\n\n\n`<", ">`\n\n`<")
+
+
+def _rewrite_markup_tags(
+    text: str,
+    *,
+    blocked: str,
+    prefix: str,
+    keep_open: bool,
+    suffix: str,
+) -> str:
+    """Replace same-line ``<tag>`` spans in one forward scan.
+
+    ``blocked`` lists characters that cannot appear inside the tag. The scan
+    never restarts inside a span it has already rejected, so long ``<=`` runs
+    stay linear.
+    """
+    parts: list[str] = []
+    index = 0
+    length = len(text)
+    while index < length:
+        if text[index] != "<":
+            parts.append(text[index])
+            index += 1
+            continue
+        end = index + 1
+        while end < length and text[end] != ">" and text[end] not in blocked:
+            end += 1
+        if end < length and text[end] == ">" and end >= index + 2:
+            parts.append(prefix)
+            if keep_open:
+                parts.append(text[index:end])
+            else:
+                parts.append(text[index + 1 : end + 1])
+            parts.append(suffix)
+            index = end + 1
+            continue
+        if end < length and text[end] == ">":
+            parts.append("<")
+            index += 1
+            continue
+        # No closing bracket before a blocked character or the end of the text.
+        # Nothing in this span can match, so emit it and resume at the blocker.
+        if end >= length:
+            parts.append(text[index:])
+            break
+        parts.append(text[index:end])
+        index = end
+    return "".join(parts)
 
 
 def _content_to_string(content: Any) -> str:

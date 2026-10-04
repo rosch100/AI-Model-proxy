@@ -5,7 +5,7 @@ See: http://webtest.readthedocs.org/
 
 from flask import request
 
-from app.common.logging import log_inbound_model, redact_headers
+from app.common.logging import escape_tags, log_inbound_model, redact_headers
 
 from .replay_base import ReplyBase
 
@@ -120,3 +120,18 @@ class TestLogCompletionDisabled(ReplyBase):
         live_update_mock = mocker.patch("rich.live.Live.update")
         super().test(testapp, requests_mock)
         live_update_mock.assert_not_called()
+
+
+def test_escape_tags_keeps_markup_visible_without_polynomial_backtracking():
+    """Tag fencing stays the same for real log lines and finishes on a hostile string."""
+    import time
+
+    assert escape_tags("<tool>") == "\n`<tool>`\n"
+    assert escape_tags("<foo>\n<bar>") == "\n`<foo>`\n\n`<bar>`\n"
+    assert escape_tags("plain") == "plain"
+    assert escape_tags("<<foo>") == "\n`<<foo>`\n"
+
+    hostile = "<" + "<=" * 8000
+    started = time.perf_counter()
+    assert escape_tags(hostile) == hostile
+    assert time.perf_counter() - started < 0.5

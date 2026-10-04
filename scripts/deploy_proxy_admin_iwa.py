@@ -391,7 +391,7 @@ def _server_name_matches_proxy(name: str) -> bool:
             flags = re.IGNORECASE
             pattern = pattern[1:]
         try:
-            return re.search(pattern, PROXY_HOSTNAME, flags) is not None
+            return re.search(pattern, PROXY_HOSTNAME, flags | re.IGNORECASE) is not None
         except re.error:
             return True
 
@@ -502,27 +502,21 @@ def _default_server_indexes(
 ) -> frozenset[int]:
     listeners = [_listen_directives(server[2]) for server in servers]
     explicit_defaults = [
-        (endpoint, options)
+        endpoint
         for entries in listeners
-        for endpoint, is_default, options in entries
+        for endpoint, is_default, _ in entries
         if is_default
     ]
     defaults = set()
     for index, entries in enumerate(listeners):
-        for endpoint, is_default, options in entries:
-            current_listener = (endpoint, options)
+        for endpoint, is_default, _ in entries:
             has_explicit_default = any(
-                _listeners_overlap(
-                    (default_endpoint, default_options), current_listener
-                )
-                for default_endpoint, default_options in explicit_defaults
+                default_endpoint == endpoint for default_endpoint in explicit_defaults
             )
             has_prior_server = any(
-                _listeners_overlap(
-                    (previous_endpoint, previous_options), current_listener
-                )
+                previous_endpoint == endpoint
                 for previous_entries in listeners[:index]
-                for previous_endpoint, _, previous_options in previous_entries
+                for previous_endpoint, _, _ in previous_entries
             )
             if is_default or (not has_explicit_default and not has_prior_server):
                 defaults.add(index)

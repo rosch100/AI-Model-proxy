@@ -367,6 +367,7 @@ class ProxyAdminIwaDeploymentTests(unittest.TestCase):
             "*.altanis.de",
             ".altanis.de",
             r"~^proxy\.altanis\.de$",
+            r"~^PROXY\.ALTANIS\.DE$",
             r"\~^proxy\.altanis\.de$",
         )
         for server_name in competing_names:
@@ -494,6 +495,27 @@ class ProxyAdminIwaDeploymentTests(unittest.TestCase):
             active_config = (
                 f"# configuration file {site_path}:\n{NGINX_TLS_SITE}"
                 f"# configuration file {other_path}:\n{quic_default}"
+            )
+            with self.assertRaises(DeploymentError):
+                _validate_unique_active_proxy_server(active_config, site_path)
+
+    def test_specific_address_listener_is_not_covered_by_managed_wildcard(self):
+        """Reject a separate address-specific HTTP server after managed wildcard."""
+        specific_server = (
+            "server { listen 192.168.20.11:443 ssl; "
+            "server_name unrelated.example; "
+            "location / { proxy_pass http://127.0.0.1:9999; } }"
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            site_path = Path(directory) / "sites-available" / "proxy.altanis.de"
+            other_path = Path(directory) / "conf.d" / "specific.conf"
+            site_path.parent.mkdir()
+            other_path.parent.mkdir()
+            site_path.write_text(NGINX_TLS_SITE, encoding="utf-8")
+            other_path.write_text(specific_server, encoding="utf-8")
+            active_config = (
+                f"# configuration file {site_path}:\n{NGINX_TLS_SITE}"
+                f"# configuration file {other_path}:\n{specific_server}"
             )
             with self.assertRaises(DeploymentError):
                 _validate_unique_active_proxy_server(active_config, site_path)

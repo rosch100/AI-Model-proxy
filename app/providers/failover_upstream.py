@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import math
 import time
 from collections.abc import Iterator
 from concurrent.futures import Future, ThreadPoolExecutor
@@ -17,18 +18,30 @@ from urllib3.exceptions import MaxRetryError, NewConnectionError
 
 from app.common.sse import SSEDecoder, SSEEvent
 from app.persistence.inference_activity import (
+    complete_provider_attempt,
     parse_provider_usage,
     record_inference_activity,
+)
+from app.providers.error_classification import (
+    UpstreamErrorClassification,
+    classify_upstream_error,
 )
 
 MAX_PREFLIGHT_BYTES = 65536
 MAX_PREFLIGHT_EVENTS = 32
 MAX_PREFLIGHT_SECONDS = 5.0
 ROUTED_READ_TIMEOUT_SECONDS = 30.0
+MAX_HTTP_ERROR_BODY_BYTES = 64 * 1024
 RETRYABLE_STATUSES = frozenset({408, 429, *range(500, 600)})
 _ERROR_CODE_STATUSES = {
     "rate_limit_exceeded": 429,
+    "requests_rate_limit_exceeded": 429,
+    "tokens_rate_limit_exceeded": 429,
     "insufficient_quota": 429,
+    "credit_balance_exhausted": 429,
+    "organization_spend_limit_exceeded": 429,
+    "project_spend_limit_exceeded": 429,
+    "organization_usage_limit_exceeded": 429,
     "quota_exceeded": 429,
     "server_error": 500,
     "internal_error": 500,
@@ -40,6 +53,8 @@ _ERROR_CODE_STATUSES = {
     "permission_error": 403,
     "invalid_request_error": 400,
     "model_not_found": 404,
+    "openrouter_key_limit": 402,
+    "openrouter_in_flight_budget": 402,
 }
 _END_OF_STREAM = object()
 
@@ -93,11 +108,17 @@ class UpstreamError(Exception):
     code: str
     message: str
     retryable: bool
+    classification: UpstreamErrorClassification = field(
+        default_factory=lambda: UpstreamErrorClassification("unknown")
+    )
 
     def response(self) -> Response:
-        """Return a JSON error before any SSE headers have been committed."""
+        """Return a safe JSON error before any SSE headers have been committed."""
         response = jsonify({"error": {"code": self.code, "message": self.message}})
         response.status_code = self.status
+        retry_after = self.classification.retry_after_seconds
+        if retry_after is not None:
+            response.headers["Retry-After"] = str(max(1, math.ceil(retry_after)))
         return response
 
 
@@ -149,8 +170,21 @@ def transport_failure(exc: requests.RequestException) -> UpstreamError:
     )
 
 
-def _error_failure(error: dict[str, Any], status: int | None = None) -> UpstreamError:
+def _error_failure(
+    error: dict[str, Any],
+    status: int | None = None,
+    *,
+    provider: str | None = None,
+    headers: Any = None,
+    settings: Any = None,
+) -> UpstreamError:
     raw_code = str(error.get("code") or error.get("type") or "upstream_error")
+    metadata = error.get("metadata")
+    limit_source = metadata.get("limit_source") if isinstance(metadata, dict) else None
+    recognized_openrouter_limit = provider == "openrouter" and limit_source in {
+        "openrouter_key_limit",
+        "openrouter_in_flight_budget",
+    }
     code = raw_code if raw_code in _ERROR_CODE_STATUSES else "upstream_error"
     if status is None:
         raw_status = (
@@ -164,23 +198,39 @@ def _error_failure(error: dict[str, Any], status: int | None = None) -> Upstream
             and 400 <= int(raw_status) < 600
         ):
             status = int(raw_status)
+        elif recognized_openrouter_limit:
+            status = 402
         else:
             status = _ERROR_CODE_STATUSES.get(code, 502)
             # Unknown structured errors are terminal, not guessed to be transient.
             if code not in _ERROR_CODE_STATUSES:
                 return UpstreamError(
-                    status, code, "Provider returned a streaming error.", False
+                    status,
+                    "upstream_error",
+                    "Provider returned a streaming error.",
+                    False,
                 )
-    # Never reflect upstream bodies/URLs/credentials into a client error.
+    classification = classify_upstream_error(
+        provider or "unknown", status, error, headers, settings
+    )
     return UpstreamError(
         status,
         code,
         f"Provider returned an error (HTTP {status}).",
-        status in RETRYABLE_STATUSES,
+        status in RETRYABLE_STATUSES
+        or classification.category in {"quota_exhausted", "transient"},
+        classification,
     )
 
 
-def _event_failure(event: SSEEvent, data: Any) -> UpstreamError | None:
+def _event_failure(
+    event: SSEEvent,
+    data: Any,
+    *,
+    provider: str | None = None,
+    headers: Any = None,
+    settings: Any = None,
+) -> UpstreamError | None:
     if not isinstance(data, dict):
         return None
     error = data.get("error")
@@ -195,16 +245,33 @@ def _event_failure(event: SSEEvent, data: Any) -> UpstreamError | None:
         return None
     has_details = any(
         error.get(key) for key in ("code", "message", "status", "status_code")
-    )
+    ) or isinstance(error.get("metadata"), dict)
     if not has_details and error.get("type") not in _ERROR_CODE_STATUSES:
         return None
-    return _error_failure(error)
+    return _error_failure(
+        error,
+        provider=provider,
+        headers=headers,
+        settings=settings,
+    )
 
 
-def sanitize_error_event(event: SSEEvent) -> SSEEvent:
+def sanitize_error_event(
+    event: SSEEvent,
+    *,
+    provider: str | None = None,
+    headers: Any = None,
+    settings: Any = None,
+) -> SSEEvent:
     """Retain the event shape but remove untrusted provider error details."""
     data = event.json
-    failure = _event_failure(event, data)
+    failure = _event_failure(
+        event,
+        data,
+        provider=provider,
+        headers=headers,
+        settings=settings,
+    )
     if failure is None:
         return event
     safe_error = {"code": failure.code, "message": failure.message}
@@ -262,13 +329,46 @@ def _has_output(event: SSEEvent, data: Any) -> bool:
     return bool(name or data)
 
 
-def prepare_upstream(upstream: Any) -> PreparedUpstream:
+def _structured_http_error(upstream: Any) -> dict[str, Any]:
+    """Read only a bounded JSON error object; ignore oversized or invalid bodies."""
+    body = bytearray()
+    try:
+        for chunk in upstream.iter_content(chunk_size=4096):
+            if not chunk:
+                continue
+            remaining = MAX_HTTP_ERROR_BODY_BYTES + 1 - len(body)
+            body.extend(chunk[:remaining])
+            if len(body) > MAX_HTTP_ERROR_BODY_BYTES:
+                return {}
+    except requests.RequestException:
+        return {}
+    try:
+        payload = json.loads(body)
+    except (ValueError, UnicodeError):
+        return {}
+    if not isinstance(payload, dict):
+        return {}
+    error = payload.get("error", payload)
+    return error if isinstance(error, dict) else {}
+
+
+def prepare_upstream(
+    upstream: Any,
+    *,
+    provider: str | None = None,
+    settings: Any = None,
+) -> PreparedUpstream:
     """Inspect a bounded SSE prefix synchronously before Flask returns headers."""
     if upstream.status_code != 200:
-        # HTTP status is sufficient. Reading the body could erase that status on
-        # timeout and keep failover blocked on an arbitrarily large error payload.
         try:
-            raise _error_failure({}, upstream.status_code)
+            failure = _error_failure(
+                _structured_http_error(upstream),
+                upstream.status_code,
+                provider=provider,
+                headers=upstream.headers,
+                settings=settings,
+            )
+            raise failure
         finally:
             upstream.close()
     iterator = iter(upstream.iter_content(chunk_size=1024))
@@ -303,7 +403,13 @@ def prepare_upstream(upstream: Any) -> PreparedUpstream:
                         "Provider sent invalid SSE JSON.",
                         False,
                     ) from exc
-                failure = _event_failure(event, data)
+                failure = _event_failure(
+                    event,
+                    data,
+                    provider=provider,
+                    headers=upstream.headers,
+                    settings=settings,
+                )
                 if failure is not None:
                     raise failure
                 if _has_output(event, data) or events >= MAX_PREFLIGHT_EVENTS:
@@ -332,10 +438,17 @@ def chat_stream(
     activity_profile_id: str | None = None,
     inbound_model: object = None,
     routed_model: object = None,
+    attempt_id: int | None = None,
+    provider: str | None = None,
+    settings: Any = None,
+    circuit_attempt: Any = None,
 ) -> Iterator[bytes]:
     """Restore logical model identity while preserving choices and tool-call IDs."""
     decoder = SSEDecoder()
     usage = None
+    completed_successfully = False
+    status_code = None
+    outcome = "failure"
     try:
         for chunk in upstream.iter_content():
             # Clear the recording buffer: this decoder is not a traffic recorder.
@@ -344,16 +457,36 @@ def chat_stream(
                 if not event.data:
                     continue
                 if event.data == "[DONE]":
+                    completed_successfully = status_code is None
+                    outcome = "success" if completed_successfully else "failure"
                     yield b"data: [DONE]\n\n"
                     continue
                 try:
-                    data = sanitize_error_event(event).json
+                    original_data = event.json
+                    failure = _event_failure(
+                        event,
+                        original_data,
+                        provider=provider,
+                        headers=upstream.headers,
+                        settings=settings,
+                    )
+                    data = sanitize_error_event(
+                        event,
+                        provider=provider,
+                        headers=upstream.headers,
+                        settings=settings,
+                    ).json
                 except ValueError:
+                    status_code = 502
                     yield (
                         b'data: {"error":{"code":"invalid_upstream_event",'
                         b'"message":"Provider sent invalid SSE JSON."}}\n\n'
                     )
                     return
+                if failure is not None:
+                    status_code = failure.status
+                    if circuit_attempt is not None:
+                        circuit_attempt.failed(failure.classification)
                 if isinstance(data, dict):
                     parsed_usage = parse_provider_usage(data.get("usage"))
                     if parsed_usage is not None:
@@ -366,12 +499,24 @@ def chat_stream(
                     + "\n\n"
                 ).encode("utf-8")
     except requests.RequestException:
+        outcome = "failure"
         yield (
             b'data: {"error":{"code":"stream_interrupted",'
             b'"message":"Provider stream interrupted; not replayed."}}\n\n'
         )
+    except GeneratorExit:
+        outcome = "aborted"
+        raise
     finally:
-        if activity_tenant_id is not None:
+        if attempt_id is not None:
+            complete_provider_attempt(
+                attempt_id,
+                outcome=outcome,
+                status_code=200 if completed_successfully else status_code,
+            )
+        if circuit_attempt is not None:
+            circuit_attempt.release()
+        if activity_tenant_id is not None and completed_successfully:
             record_inference_activity(
                 tenant_id=activity_tenant_id,
                 provider=activity_provider,

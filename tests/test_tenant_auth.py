@@ -344,10 +344,12 @@ def test_database_openai_provider_forwards_to_openai_compatible(monkeypatch):
 
     seen: dict[str, object] = {}
 
-    def fake_forward(req, snapshot, *, routed=False):
-        assert routed
+    def fake_forward(
+        req, snapshot, *, target_model, attempt_id=None, circuit_attempt=None
+    ):
         seen["provider"] = snapshot.provider
         seen["default_model"] = snapshot.default_model
+        seen["target_model"] = target_model
         return Response("openai-ok", status=200, mimetype="text/plain")
 
     monkeypatch.setattr("app.providers.routing.forward_openai_compatible", fake_forward)
@@ -359,7 +361,11 @@ def test_database_openai_provider_forwards_to_openai_compatible(monkeypatch):
     )
     assert response.status_code == 200
     assert response.get_data(as_text=True) == "openai-ok"
-    assert seen == {"provider": "openai", "default_model": "gpt-5.4"}
+    assert seen == {
+        "provider": "openai",
+        "default_model": "gpt-5.4",
+        "target_model": "gpt-5.4",
+    }
 
     models = app.test_client().get(
         "/v1/models", headers={"Authorization": f"Bearer {api_key}"}

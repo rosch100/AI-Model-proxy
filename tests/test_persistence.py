@@ -133,11 +133,63 @@ def test_azure_billing_secret_cleanup_migration_is_explicit(monkeypatch):
     ) in generated_sql
 
 
+def test_provider_circuit_migration_is_postgresql_only_and_has_atomic_identity(
+    monkeypatch,
+):
+    """The migration creates durable unique scope keys, leases, and bounded lookup."""
+    project_root = Path(__file__).resolve().parents[1]
+    monkeypatch.setenv(
+        "DATABASE_URL", "postgresql+psycopg://user:password@localhost/proxy"
+    )
+    output = StringIO()
+    config = Config(str(project_root / "alembic.ini"), output_buffer=output)
+    config.set_main_option("script_location", str(project_root / "migrations"))
+
+    migration_context = MigrationContext.configure(
+        dialect_name="postgresql",
+        opts={"as_sql": True, "output_buffer": output},
+    )
+    migration = (
+        ScriptDirectory.from_config(config)
+        .get_revision("20261008_provider_circuit_breaker")
+        .module
+    )
+    with Operations.context(migration_context):
+        migration.upgrade()
+
+    generated_sql = output.getvalue()
+    assert "CREATE TABLE provider_circuit_states" in generated_sql
+    assert "uq_provider_circuit_scope" in generated_sql
+    assert "ck_provider_circuit_lease_pair" in generated_sql
+    assert "ix_provider_circuit_tenant_probe" in generated_sql
+    assert "scope_fingerprint" in generated_sql
+    assert "scope_id" not in generated_sql
+
+
 def test_persistence_schema_creates_on_sqlite_for_portable_constraint_checks():
     """Persistence metadata is consistent for unit-level schema checks."""
     engine = create_engine("sqlite:///:memory:")
     Base.metadata.create_all(engine)
     engine.dispose()
+
+
+def test_provider_circuit_schema_never_persists_raw_scope_or_error_material():
+    """Breaker state stores only a stable fingerprint and safe failure category."""
+    from app.persistence.models import ProviderCircuitState
+
+    columns = set(ProviderCircuitState.__table__.columns.keys())
+    assert {
+        "tenant_id",
+        "provider",
+        "scope_type",
+        "scope_fingerprint",
+        "failure_category",
+        "failure_count",
+        "probe_at",
+        "lease_token",
+        "lease_until",
+    }.issubset(columns)
+    assert not {"scope_id", "api_key", "error_message", "prompt", "response"} & columns
 
 
 def test_persistence_schema_defines_tenant_and_provider_tables():
@@ -148,6 +200,7 @@ def test_persistence_schema_defines_tenant_and_provider_tables():
         "provider_profiles",
         "provider_scope_nodes",
         "provider_scope_bindings",
+        "provider_circuit_states",
         "cost_refresh_jobs",
         "cost_refresh_events",
         "cost_usage_records",
@@ -380,12 +433,13 @@ def test_environment_import_uses_the_active_azure_profile_without_mutating_peers
         )
         session.add_all((active_profile, peer_profile))
         session.flush()
-        active_profile.route_priority = 1
+        active_profile.route_priority = 2
+        peer_profile.route_priority = 1
         session.flush()
 
         assert import_tenants((source,), session, cipher) == 0
-        assert active_profile.route_priority == 1
-        assert peer_profile.route_priority is None
+        assert active_profile.route_priority == 2
+        assert peer_profile.route_priority == 1
         assert active_profile.display_name == "Production"
         assert peer_profile.settings == {"base_url": "https://staging.openai.azure.com"}
         assert peer_profile.default_model == "gpt-5.5"
@@ -415,7 +469,7 @@ def test_environment_import_rejects_ambiguous_active_azure_profile():
             )
             session.add(tenant)
             session.flush()
-            session.add_all(
+            profiles = [
                 ProviderProfile(
                     id=profile_id,
                     tenant_id="acme",
@@ -429,7 +483,11 @@ def test_environment_import_rejects_ambiguous_active_azure_profile():
                     inference_secret_ciphertext=cipher.encrypt(source.azure_api_key),
                 )
                 for profile_id in ("azure-one", "azure-two")
-            )
+            ]
+            session.add_all(profiles)
+            session.flush()
+            profiles[0].route_priority = 1
+            profiles[1].route_priority = 2
         with pytest.raises(ValueError, match="ambiguous active Azure profile"):
             with session.begin():
                 import_tenants((source,), session, cipher)

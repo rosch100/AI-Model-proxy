@@ -15,6 +15,7 @@ from flask import Request, Response
 
 from ..common.logging import console
 from ..common.recording import record_payload
+from ..providers.circuit_breaker import ProviderCircuitAttempt
 from ..providers.failover_upstream import (
     ROUTED_READ_TIMEOUT_SECONDS,
     prepare_upstream,
@@ -69,6 +70,7 @@ class AzureAdapter:
         self.activity_provider: str | None = None
         self.activity_profile_id: str | None = None
         self.activity_routed_model: str | None = None
+        self.activity_settings: dict[str, Any] = {}
 
     # Public API
     def forward(
@@ -97,18 +99,41 @@ class AzureAdapter:
         return self.response_adapter.adapt(resp, request_context)
 
     def forward_attempt(
-        self, req: Request, snapshot: DatabaseTenantSnapshot
+        self,
+        req: Request,
+        snapshot: DatabaseTenantSnapshot,
+        *,
+        target_model: str | None = None,
+        attempt_id: int | None = None,
+        circuit_attempt: ProviderCircuitAttempt | None = None,
     ) -> Response:
         """Make one routed attempt; do not wait or replay within this provider."""
-        request_kwargs = self.request_adapter.adapt(req, snapshot)
+        request_kwargs = self.request_adapter.adapt(
+            req, snapshot, target_model=target_model
+        )
         request_kwargs["timeout"] = (10.0, ROUTED_READ_TIMEOUT_SECONDS)
         try:
             upstream = requests.request(**request_kwargs)
         except requests.RequestException as exc:
             raise transport_failure(exc) from exc
-        prepared = prepare_upstream(upstream)
+        prepared = prepare_upstream(
+            upstream,
+            provider="azure",
+            settings=snapshot.provider_settings,
+        )
+        if circuit_attempt is not None:
+            circuit_attempt.preflight_succeeded()
+        self.activity_provider = snapshot.provider
+        self.activity_tenant_id = snapshot.id
+        self.activity_profile_id = snapshot.profile_id
+        self.activity_routed_model = target_model
+        self.activity_settings = dict(snapshot.provider_settings)
         # No AzureRequestContext: HTTP/SSE retries belong to the outer router.
-        response = self.response_adapter.adapt(prepared)
+        response = self.response_adapter.adapt(
+            prepared,
+            activity_attempt_id=attempt_id,
+            circuit_attempt=circuit_attempt,
+        )
         response.call_on_close(prepared.close)
         return response
 

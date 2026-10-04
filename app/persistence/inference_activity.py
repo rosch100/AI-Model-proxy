@@ -3,16 +3,19 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 from flask import current_app
+from sqlalchemy import delete, select, update
 from sqlalchemy.exc import SQLAlchemyError
 
 from app.persistence.database import Database
-from app.persistence.models import InferenceActivityEvent
+from app.persistence.models import InferenceActivityEvent, ProviderAttemptEvent
 
 ACTIVITY_WINDOW_MINUTES = 15
 ACTIVITY_LOOKBACK_HOURS = 24
+PROVIDER_ATTEMPT_RETENTION = timedelta(hours=24)
+_PROVIDER_ATTEMPT_PRUNE_BATCH_SIZE = 1000
 ACTIVITY_LOOKBACK_OPTIONS = (
     (1, "Letzte Stunde"),
     (6, "Letzte 6 Stunden"),
@@ -79,6 +82,100 @@ def parse_provider_usage(usage: object) -> ParsedTokenUsage | None:
         reasoning_tokens=reasoning_tokens,
         total_tokens=total_tokens,
     )
+
+
+def start_provider_attempt(
+    *,
+    tenant_id: str | None,
+    provider: str | None,
+    profile_id: str | None,
+    inbound_model: object,
+    routed_model: object,
+    occurred_at: datetime | None = None,
+) -> int | None:
+    """Persist a pending routed provider attempt and return its identity."""
+    if (
+        tenant_id is None
+        or provider not in {"azure", "openai", "openrouter"}
+        or profile_id is None
+        or not isinstance(inbound_model, str)
+        or not inbound_model
+        or not isinstance(routed_model, str)
+        or not routed_model
+    ):
+        return None
+    database = current_app.extensions.get("database")
+    if not isinstance(database, Database):
+        return
+    moment = occurred_at or datetime.now(timezone.utc)
+    if moment.tzinfo is None:
+        raise ValueError("Provider attempt timestamps must be timezone-aware")
+    try:
+        with database.sessions.begin() as session:
+            expired_ids = session.scalars(
+                select(ProviderAttemptEvent.id)
+                .where(
+                    ProviderAttemptEvent.occurred_at
+                    < moment - PROVIDER_ATTEMPT_RETENTION
+                )
+                .order_by(ProviderAttemptEvent.occurred_at)
+                .limit(_PROVIDER_ATTEMPT_PRUNE_BATCH_SIZE)
+            ).all()
+            if expired_ids:
+                session.execute(
+                    delete(ProviderAttemptEvent).where(
+                        ProviderAttemptEvent.id.in_(expired_ids)
+                    )
+                )
+            attempt = ProviderAttemptEvent(
+                tenant_id=tenant_id,
+                provider=provider,
+                profile_id=profile_id,
+                inbound_model=inbound_model,
+                routed_model=routed_model,
+                outcome="pending",
+                occurred_at=moment,
+            )
+            session.add(attempt)
+            session.flush()
+            return attempt.id
+    except SQLAlchemyError:
+        current_app.logger.exception("Failed to start provider attempt")
+        return None
+
+
+def complete_provider_attempt(
+    attempt_id: int | None,
+    *,
+    outcome: str,
+    status_code: int | None,
+    completed_at: datetime | None = None,
+) -> None:
+    """Finish a pending provider attempt with its observed terminal outcome."""
+    if attempt_id is None or outcome not in {"success", "failure", "aborted"}:
+        return
+    database = current_app.extensions.get("database")
+    if not isinstance(database, Database):
+        return
+    moment = completed_at or datetime.now(timezone.utc)
+    if moment.tzinfo is None:
+        raise ValueError("Provider attempt timestamps must be timezone-aware")
+    try:
+        with database.sessions.begin() as session:
+            session.execute(
+                update(ProviderAttemptEvent)
+                .where(
+                    ProviderAttemptEvent.id == attempt_id,
+                    ProviderAttemptEvent.outcome == "pending",
+                )
+                .values(
+                    outcome=outcome,
+                    status_code=status_code,
+                    completed_at=moment,
+                )
+            )
+    except SQLAlchemyError:
+        current_app.logger.exception("Failed to complete provider attempt")
 
 
 def record_inference_activity(

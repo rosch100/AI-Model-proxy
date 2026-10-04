@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Iterable, Sequence
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
@@ -15,25 +15,34 @@ from app.persistence.models import (
     CostRefreshJob,
     CostUsageRecord,
     InferenceActivityEvent,
+    ProviderAttemptEvent,
     ProviderCatalogEntry,
     ProviderProfile,
     ProviderScopeBinding,
     ProviderScopeNode,
     Tenant,
 )
+from app.persistence.provider_circuit_breaker import CircuitSnapshot
 
 
 @dataclass(frozen=True)
 class ProviderStatus:
-    """Dashboard status for one configured or missing provider."""
+    """Dashboard status for one provider profile or a missing provider."""
 
     provider: str
     label: str
     state: str
     is_active: bool
+    profile_id: str | None = None
+    profile_name: str | None = None
+    route_priority: int | None = None
     recency: str | None = None
     last_request_label: str | None = None
     last_request_at: datetime | None = None
+    outcome: str | None = None
+    last_failure_status_code: int | None = None
+    has_current_activity: bool = False
+    quota_probe_at: datetime | None = None
 
 
 @dataclass(frozen=True)
@@ -289,30 +298,19 @@ def dashboard_view(
     now: datetime | None = None,
     request_events: Sequence[InferenceActivityEvent] | None = None,
     request_period_hours: int = ACTIVITY_LOOKBACK_HOURS,
+    provider_attempts: Sequence[ProviderAttemptEvent] = (),
+    circuit_scopes_by_profile: Mapping[str, Sequence[CircuitSnapshot]] | None = None,
+    include_activity_board: bool = True,
 ) -> DashboardView:
     """Build provider status and latest-snapshot cost summaries for a tenant."""
-    profiles_by_provider: dict[str, ProviderProfile] = {}
-    active_providers: set[str] = set()
     visible_profiles = sorted(
         (profile for profile in profiles if profile.deleted_at is None),
         key=lambda profile: (
+            profile.provider,
             profile.route_priority is None,
             profile.route_priority or 0,
             profile.id,
         ),
-    )
-    for profile in visible_profiles:
-        profiles_by_provider.setdefault(profile.provider, profile)
-        if profile.route_priority is not None:
-            active_providers.add(profile.provider)
-    statuses = tuple(
-        ProviderStatus(
-            provider=name,
-            label=_PROVIDER_LABELS[name],
-            state=provider_state(profiles_by_provider.get(name)),
-            is_active=name in active_providers,
-        )
-        for name in ("azure", "openai", "openrouter")
     )
 
     billing_bindings = tuple(
@@ -389,42 +387,68 @@ def dashboard_view(
         account.has_billing_scope and account.last_successful_at is not None
         for account in cost_accounts
     )
-    activity = activity_board(
-        activity_events,
-        custom_model_id=tenant.custom_model_id,
-        now=now,
-        request_events=request_events,
-        request_period_hours=request_period_hours,
-    )
-    latest_activity = {
-        group.provider: max(group.rows, key=lambda row: row.last_request_at)
-        for group in activity.providers
-        if group.rows
-    }
-    statuses = tuple(
-        ProviderStatus(
-            provider=status.provider,
-            label=status.label,
-            state=status.state,
-            is_active=status.is_active,
-            recency=(
-                latest_activity[status.provider].recency
-                if status.provider in latest_activity
-                else None
-            ),
-            last_request_label=(
-                latest_activity[status.provider].last_request_label
-                if status.provider in latest_activity
-                else None
-            ),
-            last_request_at=(
-                latest_activity[status.provider].last_request_at
-                if status.provider in latest_activity
-                else None
-            ),
+    activity = (
+        activity_board(
+            activity_events,
+            custom_model_id=tenant.custom_model_id,
+            now=now,
+            request_events=request_events,
+            request_period_hours=request_period_hours,
         )
-        for status in statuses
+        if include_activity_board
+        else None
     )
+    latest_activity_by_profile = {
+        event.profile_id: event
+        for event in sorted(
+            activity_events, key=lambda event: _aware_utc(event.occurred_at)
+        )
+        if event.profile_id is not None
+    }
+    attempts_by_profile: dict[str, list[ProviderAttemptEvent]] = {}
+    for attempt in provider_attempts:
+        attempts_by_profile.setdefault(attempt.profile_id, []).append(attempt)
+    now_utc = _aware_utc(
+        activity.generated_at
+        if activity is not None
+        else now or datetime.now(timezone.utc)
+    )
+    attempt_statuses = {
+        profile_id: _provider_activity_status(
+            attempts,
+            now=now_utc,
+            fallback_activity=latest_activity_by_profile.get(profile_id),
+        )
+        for profile_id, attempts in attempts_by_profile.items()
+    }
+    circuit_scopes_by_profile = circuit_scopes_by_profile or {}
+    profile_statuses = tuple(
+        _provider_status(
+            profile,
+            activity=latest_activity_by_profile.get(profile.id),
+            attempt_status=attempt_statuses.get(profile.id),
+            now=now_utc,
+            activity_window_minutes=(
+                activity.window_minutes
+                if activity is not None
+                else ACTIVITY_WINDOW_MINUTES
+            ),
+            circuit_snapshots=circuit_scopes_by_profile.get(profile.id, ()),
+        )
+        for profile in visible_profiles
+    )
+    configured_providers = {profile.provider for profile in visible_profiles}
+    missing_provider_statuses = tuple(
+        ProviderStatus(
+            provider=provider,
+            label=_PROVIDER_LABELS[provider],
+            state="Nicht eingerichtet",
+            is_active=False,
+        )
+        for provider in _PROVIDER_LABELS
+        if provider not in configured_providers
+    )
+    statuses = profile_statuses + missing_provider_statuses
     return DashboardView(
         tenant_id=tenant.id,
         custom_model_id=tenant.custom_model_id,
@@ -435,6 +459,164 @@ def dashboard_view(
         cost_accounts=tuple(cost_accounts),
         activity=activity,
     )
+
+
+def _provider_status(
+    profile: ProviderProfile,
+    *,
+    activity: InferenceActivityEvent | None,
+    attempt_status: dict[str, object] | None,
+    now: datetime,
+    activity_window_minutes: int,
+    circuit_snapshots: Sequence[CircuitSnapshot],
+) -> ProviderStatus:
+    """Build a profile card from inference recency and its hysteresis state."""
+    outcome = None if attempt_status is None else attempt_status["outcome"]
+    has_current_activity = (
+        False
+        if attempt_status is None
+        else bool(attempt_status["has_current_activity"])
+    )
+    activity_at = _aware_utc(activity.occurred_at) if activity else None
+    attempt_at = None if attempt_status is None else attempt_status["last_attempt_at"]
+    last_request_at = max(
+        (moment for moment in (activity_at, attempt_at) if moment is not None),
+        default=None,
+    )
+    has_current_activity = has_current_activity or bool(
+        activity_at and activity_at >= now - timedelta(seconds=20)
+    )
+    has_recent_status = bool(
+        (attempt_status is not None and attempt_status["last_attempt_at"] is not None)
+        or (
+            activity_at
+            and activity_at >= now - timedelta(minutes=activity_window_minutes)
+        )
+    )
+    if outcome is None and has_recent_status:
+        outcome = "success"
+    if (
+        attempt_status is not None
+        and attempt_status["has_pending_attempt"]
+        and outcome != "failure"
+    ):
+        outcome = "pending"
+    quota_probe_at = max(
+        (_aware_utc(snapshot.probe_at) for snapshot in circuit_snapshots),
+        default=None,
+    )
+    quota_lease_until = max(
+        (
+            _aware_utc(snapshot.lease_until)
+            for snapshot in circuit_snapshots
+            if snapshot.lease_until is not None
+        ),
+        default=None,
+    )
+    if quota_probe_at is not None and quota_probe_at > now:
+        quota_status_at = quota_probe_at
+    elif quota_lease_until is not None and quota_lease_until > now:
+        quota_status_at = quota_lease_until
+    else:
+        quota_status_at = None
+    return ProviderStatus(
+        provider=profile.provider,
+        label=_PROVIDER_LABELS[profile.provider],
+        state=provider_state(profile),
+        is_active=profile.route_priority is not None,
+        profile_id=profile.id,
+        profile_name=profile.display_name,
+        route_priority=profile.route_priority,
+        outcome=outcome,
+        last_failure_status_code=(
+            None
+            if attempt_status is None or outcome != "failure"
+            else attempt_status["last_failure_status_code"]
+        ),
+        has_current_activity=has_current_activity,
+        quota_probe_at=quota_status_at,
+        recency=(
+            "live"
+            if has_current_activity
+            else (
+                _recency_class(
+                    last_request_at,
+                    now - timedelta(minutes=activity_window_minutes),
+                    now,
+                )
+                if last_request_at is not None
+                else None
+            )
+        ),
+        last_request_label=(
+            format_relative_time(last_request_at, now) if last_request_at else None
+        ),
+        last_request_at=last_request_at,
+    )
+
+
+def _provider_activity_status(
+    attempts: Sequence[ProviderAttemptEvent],
+    *,
+    now: datetime,
+    fallback_activity: InferenceActivityEvent | None,
+) -> dict[str, object]:
+    """Apply two-failure activation and 20-second quiet recovery hysteresis."""
+    ordered = sorted(
+        attempts,
+        key=lambda attempt: _aware_utc(attempt.completed_at or attempt.occurred_at),
+    )
+    last_attempt = ordered[-1] if ordered else None
+    latest_at = (
+        _aware_utc(last_attempt.completed_at or last_attempt.occurred_at)
+        if last_attempt is not None
+        else None
+    )
+    cutoff = now - timedelta(seconds=20)
+    has_current_activity = any(
+        attempt.outcome == "pending"
+        or _aware_utc(attempt.completed_at or attempt.occurred_at) >= cutoff
+        for attempt in ordered
+    )
+    previous_failure_at: datetime | None = None
+    error_until: datetime | None = None
+    for attempt in ordered:
+        attempt_at = _aware_utc(attempt.completed_at or attempt.occurred_at)
+        if attempt.outcome == "success":
+            previous_failure_at = None
+        elif attempt.outcome == "failure":
+            consecutive_failure = (
+                previous_failure_at is not None
+                and attempt_at - previous_failure_at <= timedelta(seconds=20)
+            )
+            if consecutive_failure or (
+                error_until is not None and attempt_at < error_until
+            ):
+                error_until = attempt_at + timedelta(seconds=20)
+            previous_failure_at = attempt_at
+    if error_until is not None and now < error_until:
+        outcome = "failure"
+    elif last_attempt is not None or (
+        fallback_activity is not None
+        and _aware_utc(fallback_activity.occurred_at)
+        >= now - timedelta(minutes=ACTIVITY_WINDOW_MINUTES)
+    ):
+        outcome = "success"
+    else:
+        outcome = None
+    latest_failure = next(
+        (attempt for attempt in reversed(ordered) if attempt.outcome == "failure"),
+        None,
+    )
+    return {
+        "outcome": outcome,
+        "has_current_activity": has_current_activity,
+        "has_pending_attempt": any(attempt.outcome == "pending" for attempt in ordered),
+        "last_failure_status_code": (
+            None if latest_failure is None else latest_failure.status_code
+        ),
+        "last_attempt_at": latest_at,
+    }
 
 
 def _aware_utc(moment: datetime) -> datetime:

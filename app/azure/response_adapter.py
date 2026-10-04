@@ -22,10 +22,16 @@ from ..common.logging import console, create_message_panel
 from ..common.sse import chunks_to_sse, sse_to_events
 from ..exceptions import ClientClosedConnection
 from ..persistence.inference_activity import (
+    complete_provider_attempt,
     parse_provider_usage,
     record_inference_activity,
 )
-from ..providers.failover_upstream import PreparedUpstream, sanitize_error_event
+from ..providers.circuit_breaker import ProviderCircuitAttempt
+from ..providers.failover_upstream import (
+    PreparedUpstream,
+    _event_failure,
+    sanitize_error_event,
+)
 from ..reasoning_display import (
     parse_reasoning_display_mode,
     reasoning_content_delta,
@@ -80,6 +86,10 @@ class _ResponseStreamState:
     completion_msg: Dict[str, Any]
     events: int = 0
     has_emitted_output: bool = False
+    completed_successfully: bool = False
+    status_code: int | None = None
+    aborted: bool = False
+    quota_failure: bool = False
 
 
 class ResponseAdapter:
@@ -718,6 +728,7 @@ class ResponseAdapter:
         """Adapt events, restarting the upstream stream only before output."""
         while True:
             if state.upstream_resp.status_code != 200:
+                state.status_code = state.upstream_resp.status_code
                 error_chunk = self._failed(
                     {
                         "response": {
@@ -738,14 +749,48 @@ class ResponseAdapter:
             for event in sse_to_events(
                 state.upstream_resp.iter_content(chunk_size=128)
             ):
-                if isinstance(state.upstream_resp, PreparedUpstream):
-                    event = sanitize_error_event(event)
+                original_event = event
+                classified_failure = _event_failure(
+                    original_event,
+                    original_event.json,
+                    provider=self.adapter.activity_provider or "azure",
+                    headers=getattr(state.upstream_resp, "headers", {}),
+                    settings=getattr(self.adapter, "activity_settings", {}),
+                )
+                if classified_failure is not None:
+                    if isinstance(state.upstream_resp, PreparedUpstream):
+                        event = sanitize_error_event(original_event)
+                    if self._circuit_attempt is not None:
+                        self._circuit_attempt.failed(classified_failure.classification)
                 if event.event in {
                     "response.completed",
                     "response.failed",
                     "response.incomplete",
                 }:
                     terminal_event_seen = True
+                    state.completed_successfully = event.event == "response.completed"
+                    if event.event != "response.completed":
+                        failure_data = original_event.json
+                        failure_response = (
+                            failure_data.get("response")
+                            if isinstance(failure_data, dict)
+                            else None
+                        )
+                        failure = (
+                            failure_response.get("error")
+                            if isinstance(failure_response, dict)
+                            else None
+                        )
+                        state.status_code = (
+                            classified_failure.status
+                            if classified_failure is not None
+                            else (
+                                int(failure["status"])
+                                if isinstance(failure, dict)
+                                and str(failure.get("status", "")).isdigit()
+                                else None
+                            )
+                        )
                 absorbed_precursor = self._absorb_empty_error_precursor(
                     event, state, request_context
                 )
@@ -981,21 +1026,49 @@ class ResponseAdapter:
             live.update(create_message_panel(state.completion_msg, 1, 1))
 
     def _adapt_stream(
-        self, upstream_resp: Any, request_context: Any
+        self,
+        upstream_resp: Any,
+        request_context: Any,
+        activity_attempt_id: int | None = None,
+        circuit_attempt: ProviderCircuitAttempt | None = None,
     ) -> Iterable[Dict[str, Any]]:
         """Manage per-stream state, logging, and upstream response cleanup."""
         state = _ResponseStreamState(
             upstream_resp=upstream_resp,
             completion_msg={"role": "assistant", "content": "", "tool_calls": []},
         )
+        self._circuit_attempt = circuit_attempt
         try:
             with Live(None, console=console, refresh_per_second=2) as live:
                 yield from self._stream_upstream_events(state, request_context, live)
                 yield from self._finish_stream(state, live)
+        except GeneratorExit:
+            state.aborted = True
+            raise
         finally:
+            complete_provider_attempt(
+                activity_attempt_id,
+                outcome=(
+                    "aborted"
+                    if state.aborted
+                    else "success" if state.completed_successfully else "failure"
+                ),
+                status_code=(
+                    200
+                    if state.completed_successfully and not state.aborted
+                    else state.status_code
+                ),
+            )
             state.upstream_resp.close()
 
-    def adapt(self, upstream_resp: Any, request_context: Any = None) -> Response:
+    def adapt(
+        self,
+        upstream_resp: Any,
+        request_context: Any = None,
+        *,
+        activity_attempt_id: int | None = None,
+        circuit_attempt: ProviderCircuitAttempt | None = None,
+    ) -> Response:
         """Adapt an upstream Azure streaming response into SSE for Flask."""
 
         @stream_with_context
@@ -1013,7 +1086,12 @@ class ResponseAdapter:
 
             try:
                 yield from chunks_to_sse(
-                    self._adapt_stream(upstream_resp, request_context)
+                    self._adapt_stream(
+                        upstream_resp,
+                        request_context,
+                        activity_attempt_id,
+                        circuit_attempt,
+                    )
                 )
             except requests.RequestException:
                 if not isinstance(upstream_resp, PreparedUpstream):

@@ -92,6 +92,7 @@ def test_forwarding_applies_luna_tool_reasoning_compatibility_only_when_needed(
         response = forward_openai_compatible(
             request,
             _snapshot(provider, model),
+            target_model=model,
         )
         response.get_data()
 
@@ -100,3 +101,35 @@ def test_forwarding_applies_luna_tool_reasoning_compatibility_only_when_needed(
     assert sent_payload["reasoning_effort"] == expected_effort
     assert sent_payload["tools"] == tools
     assert sent_payload["stream_options"]["include_usage"] is True
+
+
+@pytest.mark.parametrize("provider", ["openai", "openrouter"])
+@pytest.mark.parametrize("inbound_model", ["cursor-model", "gpt-6-luna"])
+def test_routed_provider_uses_its_configured_default_model(
+    app, requests_mock, provider, inbound_model
+):
+    """A routed provider always uses its configured model, never caller identity."""
+    origin = (
+        "https://api.openai.com/v1"
+        if provider == "openai"
+        else "https://openrouter.ai/api/v1"
+    )
+    requests_mock.post(
+        f"{origin}/chat/completions",
+        text="data: [DONE]\\n\\n",
+        headers={"Content-Type": "text/event-stream"},
+    )
+    with app.test_request_context(
+        "/v1/chat/completions",
+        json={"model": inbound_model, "messages": []},
+    ):
+        response = forward_openai_compatible(
+            request,
+            _snapshot(provider, "provider-default-model"),
+            target_model="provider-default-model",
+        )
+        response.get_data()
+
+    assert json.loads(requests_mock.last_request.text)["model"] == (
+        "provider-default-model"
+    )

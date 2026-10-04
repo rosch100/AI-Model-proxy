@@ -1,0 +1,27 @@
+<section
+  id="dashboard-provider-status"
+  class="dashboard-section provider-status-section"
+  aria-labelledby="providers-title"
+  hx-get="{{ url_for('admin.dashboard_provider_status') }}"
+  hx-trigger="every 5s"
+  hx-swap="outerHTML"
+>
+  <div class="section-heading">
+    <div>
+      <h2 id="providers-title">Anbieterstatus</h2>
+      <p class="section-caption">Hier siehst du, welche Anbieter Anfragen bearbeiten und wann zuletzt eine Anfrage einging. Der Status aktualisiert sich alle fünf Sekunden.</p>
+    </div>
+  </div>
+  <ul class="provider-status-grid">
+    {% for provider in view.providers %}
+      <li class="provider-status-card{% if provider.recency %} is-{{ provider.recency }}{% endif %}{% if provider.outcome == 'failure' %} is-warning{% endif %}"{% if provider.profile_id %} data-provider-account="{{ provider.profile_id }}"{% endif %}>
+        <span class="provider-status-indicator{% if provider.outcome == 'failure' %} is-warning{% elif provider.outcome == 'success' %} is-success{% elif provider.outcome == 'pending' %} is-pending{% elif provider.state == 'Einrichtung prüfen' %} needs-attention{% endif %}{% if provider.has_current_activity %} is-active{% endif %}"{% if provider.outcome %} data-activity-outcome="{{ provider.outcome }}"{% endif %} role="img" aria-label="{% if provider.outcome == 'failure' %}Mehrere aktuelle Providerfehler{% elif provider.outcome == 'success' %}Keine anhaltenden Providerfehler{% elif provider.outcome == 'pending' %}Provideranfrage läuft{% else %}Keine aktuelle Provideraktivität{% endif %}"></span>
+        <div>
+          <strong>{{ provider.label }}{% if provider.profile_name %} · {{ provider.profile_name }}{% endif %}</strong>
+          {% if provider.quota_probe_at %}<span class="provider-quota-status" aria-label="Quota-Limit – pausiert bis {{ provider.quota_probe_at.isoformat() }}">Quota-Limit – pausiert bis <time datetime="{{ provider.quota_probe_at.isoformat() }}" data-local-time>{{ provider.quota_probe_at.isoformat() }}</time></span>{% endif %}
+          <span>{{ provider.state }}{% if provider.is_active %} · Position {{ provider.route_priority }} · für Anfragen ausgewählt{% endif %}{% if provider.outcome == 'failure' and provider.last_failure_status_code %} · letzter Fehler HTTP {{ provider.last_failure_status_code }}{% endif %}{% if provider.last_request_label %} · letzte Anfrage {{ provider.last_request_label }}{% if provider.last_request_at %} (<time datetime="{{ provider.last_request_at.isoformat() }}" data-local-time>{{ provider.last_request_at.isoformat() }}</time>){% endif %}{% else %} · in den letzten 24 Stunden gab es keine Anfragen{% endif %}</span>
+        </div>
+      </li>
+    {% endfor %}
+  </ul>
+</section>

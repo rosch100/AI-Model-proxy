@@ -95,6 +95,73 @@ def test_http_error_retains_classification(status, retryable):
     response.close.assert_called_once()
 
 
+def test_openrouter_inflight_sse_metadata_is_retryable_transient():
+    """Recognize structured OpenRouter in-flight metadata without message text."""
+    response = upstream(
+        [
+            event(
+                {
+                    "error": {
+                        "type": "provider_error",
+                        "message": "do not use prose",
+                        "metadata": {"limit_source": "openrouter_in_flight_budget"},
+                    }
+                },
+                "error",
+            )
+        ]
+    )
+
+    with pytest.raises(failover_upstream.UpstreamError) as caught:
+        failover_upstream.prepare_upstream(response, provider="openrouter")
+
+    assert caught.value.classification.category == "transient"
+    assert caught.value.retryable
+
+
+def test_quota_http_failure_is_reported_by_route_owner():
+    """Preflight raises structured HTTP errors without mutating the breaker."""
+    response = upstream(
+        [json.dumps({"error": {"code": "insufficient_quota"}}).encode()], 429
+    )
+    with pytest.raises(failover_upstream.UpstreamError) as caught:
+        failover_upstream.prepare_upstream(response, provider="openai")
+
+    assert caught.value.classification.category == "quota_exhausted"
+
+
+def test_upstream_error_response_exposes_only_safe_retry_after_header(app):
+    """Return structured retry guidance without provider error metadata."""
+    response = upstream(
+        [
+            json.dumps(
+                {
+                    "error": {
+                        "code": "insufficient_quota",
+                        "message": "private provider message",
+                        "metadata": {"secret": "private-provider-metadata"},
+                    }
+                }
+            ).encode()
+        ],
+        status=429,
+    )
+    response.headers["Retry-After"] = "12"
+    with pytest.raises(failover_upstream.UpstreamError) as caught:
+        failover_upstream.prepare_upstream(
+            response,
+            provider="openai",
+            settings={},
+        )
+
+    client_response = caught.value.response()
+
+    assert caught.value.classification.retry_after_seconds == 12
+    assert client_response.headers["Retry-After"] == "12"
+    assert b"private provider message" not in client_response.get_data()
+    assert b"private-provider-metadata" not in client_response.get_data()
+
+
 def test_auth_sse_error_is_terminal():
     """Treat an SSE authentication failure as nonretryable."""
     response = upstream([event({"error": {"code": 401, "message": "invalid token"}})])

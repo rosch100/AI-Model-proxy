@@ -384,6 +384,7 @@ def test_routing_snapshot_uses_one_statement_ordered_catalog_and_immutable_profi
     assert isinstance(snapshot.profiles, tuple)
     assert [p.profile_id for p in snapshot.profiles] == ids
     assert snapshot.profiles[1].azure_model_deployments == {"gpt-5.4": "deployment-a"}
+    assert snapshot.profiles[1].catalog_model_ids == ("gpt-5.4",)
     assert snapshot.profiles[1].default_model == "gpt-5.4"
     assert "secret-One" not in repr(snapshot)
     assert "secret-Two" not in repr(snapshot)

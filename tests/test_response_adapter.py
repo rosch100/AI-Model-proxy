@@ -5,6 +5,8 @@ import json
 import pytest
 
 from app.azure.adapter import AzureAdapter
+from app.persistence.inference_activity import start_provider_attempt
+from app.persistence.models import ProviderAttemptEvent, ProviderProfile
 
 
 class _FakeUpstreamResponse:
@@ -205,6 +207,78 @@ def test_response_adapter_emits_usage_chunk(app):
         },
     }
     assert upstream.closed is True
+
+
+@pytest.mark.parametrize(
+    ("event_name", "payload", "expected_outcome", "expected_status"),
+    (
+        (
+            "response.completed",
+            {"type": "response.completed", "response": {"usage": {}}},
+            "success",
+            200,
+        ),
+        (
+            "response.failed",
+            {
+                "type": "response.failed",
+                "response": {"error": {"status": 429, "code": "rate_limited"}},
+            },
+            "failure",
+            429,
+        ),
+        (
+            "response.failed",
+            {
+                "type": "response.failed",
+                "response": {"error": {"code": "rate_limit_exceeded"}},
+            },
+            "failure",
+            429,
+        ),
+    ),
+)
+def test_provider_stream_records_terminal_status(
+    admin_app, event_name, payload, expected_outcome, expected_status
+):
+    """Record success status without overwriting upstream failure status."""
+    database = admin_app.extensions["database"]
+    profile_id = f"azure-terminal-stream-{expected_outcome}"
+    with database.sessions.begin() as session:
+        session.add(
+            ProviderProfile(
+                id=profile_id,
+                tenant_id="acme",
+                provider="azure",
+                display_name="Azure terminal stream",
+                settings={},
+                default_model="gpt-5.4",
+                inference_secret_ciphertext="encrypted-key",
+            )
+        )
+
+    with admin_app.app_context():
+        attempt_id = start_provider_attempt(
+            tenant_id="acme",
+            provider="azure",
+            profile_id=profile_id,
+            inbound_model="cursor-acme",
+            routed_model="gpt-5.4",
+        )
+        adapter = AzureAdapter()
+        adapter.inbound_model = "gpt-5.4"
+        adapter.include_usage = False
+        response = adapter.response_adapter.adapt(
+            _FakeUpstreamResponse([_sse(event_name, payload)]),
+            activity_attempt_id=attempt_id,
+        )
+        _messages_from_response(response)
+
+    with database.sessions() as session:
+        attempt = session.get(ProviderAttemptEvent, attempt_id)
+
+    assert attempt.outcome == expected_outcome
+    assert attempt.status_code == expected_status
 
 
 def test_response_adapter_emits_reasoning_content_separately(app):

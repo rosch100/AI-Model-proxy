@@ -638,21 +638,62 @@ code {
   background: #a7b1aa;
 }
 
-.provider-status-indicator.is-ready {
-  background: #2d7a50;
+.provider-status-indicator.is-ready,
+.provider-status-indicator.is-success {
+  --indicator-color: #1f9d55;
+  background: var(--indicator-color);
 }
 
-.provider-status-indicator.is-live {
-  background: #1f9d55;
-  box-shadow: 0 0 0 4px color-mix(in srgb, #1f9d55 28%, transparent);
+.provider-status-indicator.is-warning {
+  --indicator-color: #e28a18;
+  background: var(--indicator-color);
+}
+
+.provider-status-indicator.is-pending {
+  --indicator-color: #5383ad;
+  background: var(--indicator-color);
+}
+
+.provider-status-indicator.is-active {
+  animation: provider-status-fade 1.6s ease-in-out infinite;
 }
 
 .provider-status-card.is-live {
   border-color: color-mix(in srgb, #1f9d55 35%, var(--line));
 }
 
+.provider-status-card.is-live.is-warning {
+  border-color: color-mix(in srgb, #e28a18 45%, var(--line));
+}
+
 .provider-status-indicator.needs-attention {
   background: var(--amber);
+}
+
+@keyframes provider-status-fade {
+  0%,
+  100% {
+    opacity: 0.35;
+    box-shadow: 0 0 0 0 transparent;
+  }
+  50% {
+    opacity: 1;
+    box-shadow: 0 0 0 4px color-mix(in srgb, var(--indicator-color) 28%, transparent);
+  }
+}
+
+.provider-status-indicator.is-success.is-active {
+  color: #1f9d55;
+}
+
+.provider-status-indicator.is-warning.is-active {
+  color: #e28a18;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .provider-status-indicator.is-active {
+    animation: none;
+  }
 }
 
 .dashboard-model-id {

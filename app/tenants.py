@@ -54,6 +54,7 @@ class DatabaseTenantSnapshot:
     profile_name: str | None = None
     history_generation: int | None = None
     profile_deleted: bool = False
+    catalog_model_ids: tuple[str, ...] = ()
 
     @property
     def azure_base_url(self) -> str | None:

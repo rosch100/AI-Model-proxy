@@ -36,7 +36,7 @@ def validate_routed_profile(
         or not profile.default_model.strip()
     ):
         raise ValueError(f"The {profile.display_name} account is incomplete")
-    if profile.provider not in {"azure", "openai", "openrouter"}:
+    if profile.provider not in {"azure", "openai", "openrouter", "deepseek"}:
         raise ValueError("Unsupported provider")
     selectable = dict(selectable_catalog_models(profile.provider, entries))
     if profile.default_model not in selectable:

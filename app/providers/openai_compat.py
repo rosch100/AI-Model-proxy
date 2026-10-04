@@ -1,4 +1,4 @@
-"""OpenAI-compatible streaming forwarder for OpenAI and OpenRouter."""
+"""OpenAI-compatible streaming forwarder for tenant Chat Completions providers."""
 
 from __future__ import annotations
 
@@ -24,6 +24,8 @@ def openai_compatible_base_url(provider: str) -> str:
         return "https://api.openai.com/v1"
     if provider == "openrouter":
         return "https://openrouter.ai/api/v1"
+    if provider == "deepseek":
+        return "https://api.deepseek.com"
     raise ServiceConfigurationError(
         f"Unsupported OpenAI-compatible provider {provider!r}"
     )
@@ -32,7 +34,7 @@ def openai_compatible_base_url(provider: str) -> str:
 def forward_openai_compatible(
     req: Request, snapshot: DatabaseTenantSnapshot, *, routed: bool = False
 ) -> Response:
-    """Forward a Cursor request to OpenAI or OpenRouter Chat Completions."""
+    """Forward a Cursor request to an OpenAI-compatible Chat Completions API."""
     if snapshot.profile_id is None:
         raise ServiceConfigurationError(
             "No active provider profile is configured for this tenant."
@@ -69,12 +71,13 @@ def forward_openai_compatible(
         "Authorization": f"Bearer {snapshot.inference_secret}",
         "Content-Type": "application/json",
     }
-    organization = snapshot.provider_settings.get("organization")
-    if isinstance(organization, str) and organization:
-        headers["OpenAI-Organization"] = organization
-    project = snapshot.provider_settings.get("project")
-    if isinstance(project, str) and project:
-        headers["OpenAI-Project"] = project
+    if snapshot.provider == "openai":
+        organization = snapshot.provider_settings.get("organization")
+        if isinstance(organization, str) and organization:
+            headers["OpenAI-Organization"] = organization
+        project = snapshot.provider_settings.get("project")
+        if isinstance(project, str) and project:
+            headers["OpenAI-Project"] = project
     try:
         upstream = requests.post(
             f"{origin}/chat/completions",

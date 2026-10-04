@@ -92,7 +92,12 @@ def record_inference_activity(
     occurred_at: datetime | None = None,
 ) -> None:
     """Store one completed inference. Skip single-mode and invalid identities."""
-    if tenant_id is None or provider not in {"azure", "openai", "openrouter"}:
+    if tenant_id is None or provider not in {
+        "azure",
+        "openai",
+        "openrouter",
+        "deepseek",
+    }:
         return
     if not isinstance(inbound_model, str) or not inbound_model:
         return

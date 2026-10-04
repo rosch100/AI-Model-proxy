@@ -100,6 +100,154 @@ def test_catalog_refresh_rejects_empty_openrouter_catalog(requests_mock):
         refresh_provider_catalog("openrouter", {}, "sk-or-secret")
 
 
+def test_deepseek_profile_can_be_created_without_provider_specific_settings(
+    admin_app,
+):
+    """Persist DeepSeek profiles with their model target and encrypted key."""
+    database = admin_app.extensions["database"]
+    with database.sessions.begin() as session:
+        profile = create_provider_profile(
+            session,
+            database.secret_cipher,
+            "acme",
+            "deepseek",
+            "Production",
+            {},
+            "deepseek-v4-flash",
+            "deepseek-key",
+            "ada",
+        )
+        profile_id = profile.id
+
+    with database.sessions() as session:
+        profile = session.get(ProviderProfile, profile_id)
+        assert profile.provider == "deepseek"
+        assert profile.default_model == "deepseek-v4-flash"
+        assert database.secret_cipher.decrypt(profile.inference_secret_ciphertext) == (
+            "deepseek-key"
+        )
+
+
+def test_deepseek_admin_profile_creation_and_catalog_refresh(admin_app, requests_mock):
+    """Create a tenant DeepSeek account, then load its model catalog."""
+    database = admin_app.extensions["database"]
+    with database.sessions.begin() as session:
+        account = authenticate_admin(session, "ada", "correct-horse-battery")
+        insert_passkey(
+            session,
+            account_id=account.id,
+            credential_id=secrets.token_bytes(32),
+            public_key=secrets.token_bytes(64),
+            sign_count=0,
+            user_handle=secrets.token_bytes(32),
+            label="Primary",
+            aaguid=None,
+            backed_up=False,
+        )
+        principal = create_admin_session(session, account, enrollment_only=False)
+
+    client = admin_app.test_client()
+    client.set_cookie(ADMIN_COOKIE_NAME, principal.token, path="/admin")
+    create_page = client.get("/admin/settings/connection/create?provider=deepseek")
+    create_body = create_page.get_data(as_text=True)
+    assert create_page.status_code == 200
+    assert 'data-provider-fields="deepseek"' in create_body
+    csrf = re.search(
+        r'name="csrf_token" type="hidden" value="([^"]+)"', create_body
+    ).group(1)
+    saved = client.post(
+        "/admin/settings/connection/create",
+        data={
+            "csrf_token": csrf,
+            "provider": "deepseek",
+            "display_name": "Production",
+            "default_model": "",
+            "api_key": "deepseek-inference-key",
+        },
+    )
+    assert saved.status_code == 302
+    with database.sessions() as session:
+        profile = session.scalar(
+            select(ProviderProfile).where(
+                ProviderProfile.tenant_id == "acme",
+                ProviderProfile.provider == "deepseek",
+            )
+        )
+        profile_id = profile.id
+        assert profile.settings == {}
+        assert database.secret_cipher.decrypt(profile.inference_secret_ciphertext) == (
+            "deepseek-inference-key"
+        )
+
+    request = requests_mock.get(
+        "https://api.deepseek.com/models",
+        json={"data": [{"id": "deepseek-v4-flash"}, {"id": "deepseek-v4-pro"}]},
+    )
+    refreshed = client.post(
+        f"/admin/settings/connection/{profile_id}/catalog",
+        data={"csrf_token": csrf},
+    )
+    assert refreshed.status_code == 302
+    assert request.last_request.headers["Authorization"] == (
+        "Bearer deepseek-inference-key"
+    )
+    with database.sessions() as session:
+        profile = session.get(ProviderProfile, profile_id)
+        assert profile.default_model == "deepseek-v4-flash"
+    page = client.get("/admin/settings/connection")
+    assert "DeepSeek" in page.get_data(as_text=True)
+    assert "deepseek-v4-flash" in page.get_data(as_text=True)
+
+
+def test_catalog_refresh_parses_deepseek_models(requests_mock):
+    """Refresh the DeepSeek catalog using its OpenAI-compatible models endpoint."""
+    request = requests_mock.get(
+        "https://api.deepseek.com/models",
+        json={"data": [{"id": "deepseek-v4-flash"}, {"id": "deepseek-v4-pro"}]},
+    )
+
+    entries = refresh_provider_catalog("deepseek", {}, "deepseek-test")
+
+    assert entries == [("deepseek-v4-flash", None), ("deepseek-v4-pro", None)]
+    assert request.last_request.headers["Authorization"] == "Bearer deepseek-test"
+
+
+def test_catalog_refresh_rejects_empty_deepseek_catalog(requests_mock):
+    """An empty DeepSeek catalog is not a successful refresh."""
+    requests_mock.get("https://api.deepseek.com/models", json={"data": []})
+
+    with pytest.raises(
+        CatalogRefreshError, match="DeepSeek catalog contains no models"
+    ):
+        refresh_provider_catalog("deepseek", {}, "deepseek-test")
+
+
+def test_catalog_refresh_rejects_invalid_deepseek_payload(requests_mock):
+    """Invalid DeepSeek JSON cannot silently remove the profile catalog."""
+    requests_mock.get("https://api.deepseek.com/models", text="not-json")
+
+    with pytest.raises(
+        CatalogRefreshError, match="DeepSeek catalog payload is invalid"
+    ):
+        refresh_provider_catalog("deepseek", {}, "deepseek-test")
+
+
+def test_catalog_refresh_surfaces_deepseek_http_errors(requests_mock):
+    """A non-success DeepSeek model-list response is reported explicitly."""
+    requests_mock.get("https://api.deepseek.com/models", status_code=403)
+
+    with pytest.raises(CatalogRefreshError, match="DeepSeek catalog HTTP 403"):
+        refresh_provider_catalog("deepseek", {}, "deepseek-test")
+
+
+def test_catalog_refresh_surfaces_deepseek_transport_errors(requests_mock):
+    """The DeepSeek model-list transport errors become safe provider errors."""
+    requests_mock.get("https://api.deepseek.com/models", exc=requests.ConnectTimeout)
+
+    with pytest.raises(CatalogRefreshError, match="DeepSeek catalog request failed"):
+        refresh_provider_catalog("deepseek", {}, "deepseek-test")
+
+
 def test_catalog_refresh_parses_openrouter_models(requests_mock):
     """Refresh the OpenRouter catalog from its versioned models endpoint."""
     requests_mock.get(

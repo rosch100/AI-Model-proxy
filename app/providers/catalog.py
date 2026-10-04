@@ -1,4 +1,4 @@
-"""Catalog refresh against Azure, OpenAI, and OpenRouter HTTP APIs."""
+"""Catalog refresh against supported inference-provider HTTP APIs."""
 
 from __future__ import annotations
 
@@ -28,6 +28,8 @@ def refresh_provider_catalog(
         return _refresh_openai(inference_secret)
     if provider == "openrouter":
         return _refresh_openrouter(inference_secret)
+    if provider == "deepseek":
+        return _refresh_deepseek(inference_secret)
     raise CatalogRefreshError(f"Unsupported provider {provider!r}")
 
 
@@ -109,6 +111,37 @@ def _refresh_openai(api_key: str) -> list[tuple[str, str | None]]:
         for item in data
         if isinstance(item, dict) and isinstance(item.get("id"), str)
     ]
+
+
+def _refresh_deepseek(api_key: str) -> list[tuple[str, str | None]]:
+    """Load DeepSeek models from its OpenAI-compatible model-list endpoint."""
+    try:
+        response = requests.get(
+            "https://api.deepseek.com/models",
+            headers={"Authorization": f"Bearer {api_key}"},
+            timeout=30,
+        )
+    except requests.RequestException as exc:
+        raise CatalogRefreshError("DeepSeek catalog request failed.") from exc
+    if response.status_code >= 400:
+        raise CatalogRefreshError(f"DeepSeek catalog HTTP {response.status_code}")
+    try:
+        payload = response.json()
+    except (requests.exceptions.JSONDecodeError, ValueError) as exc:
+        raise CatalogRefreshError("DeepSeek catalog payload is invalid.") from exc
+    data = payload.get("data") if isinstance(payload, dict) else None
+    if not isinstance(data, list):
+        raise CatalogRefreshError("DeepSeek catalog payload is invalid.")
+    models = [
+        item["id"]
+        for item in data
+        if isinstance(item, dict)
+        and isinstance(item.get("id"), str)
+        and item["id"].strip()
+    ]
+    if not models:
+        raise CatalogRefreshError("DeepSeek catalog contains no models.")
+    return [(model_id, None) for model_id in models]
 
 
 def _refresh_openrouter(api_key: str) -> list[tuple[str, str | None]]:

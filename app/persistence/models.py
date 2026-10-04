@@ -93,7 +93,7 @@ class ProviderProfile(Base):
             name="ck_profile_route_priority_positive",
         ),
         CheckConstraint(
-            "provider IN ('azure', 'openai', 'openrouter')",
+            "provider IN ('azure', 'openai', 'openrouter', 'deepseek')",
             name="ck_profile_provider",
         ),
         CheckConstraint(
@@ -519,7 +519,7 @@ class InferenceActivityEvent(Base):
     __tablename__ = "inference_activity_events"
     __table_args__ = (
         CheckConstraint(
-            "provider IN ('azure', 'openai', 'openrouter')",
+            "provider IN ('azure', 'openai', 'openrouter', 'deepseek')",
             name="ck_inference_activity_provider",
         ),
         CheckConstraint(

@@ -3,7 +3,7 @@
 {% block title %}Verbindung · Altanis Proxy{% endblock %}
 {% block content %}
 <section>
-  {% set labels = {"azure": "Azure", "openai": "OpenAI", "openrouter": "OpenRouter"} %}
+  {% set labels = {"azure": "Azure", "openai": "OpenAI", "openrouter": "OpenRouter", "deepseek": "DeepSeek"} %}
   <h1>Provider-Accounts</h1>
   <p class="lede">Mehrere Accounts können gemeinsam eine priorisierte Failover-Reihenfolge bilden. Neue Accounts bleiben inaktiv, bis sie ausdrücklich hinzugefügt werden.</p>
   <h2>Failover-Reihenfolge</h2>
@@ -39,7 +39,7 @@
   {% endif %}
   <p><a href="{{ url_for('admin.create_connection_form') }}">Neuer Account</a></p>
 
-  {% for provider in ["azure", "openai", "openrouter"] %}
+  {% for provider in ["azure", "openai", "openrouter", "deepseek"] %}
     <h2>{{ labels[provider] }}</h2>
     {% if view.profiles_by_provider[provider] %}
       <ul class="provider-accounts">

@@ -14,10 +14,18 @@ from alembic.operations import Operations
 from alembic.script import ScriptDirectory
 from cryptography.exceptions import InvalidTag
 from sqlalchemy import create_engine, event, select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.persistence.database import Database
-from app.persistence.models import Base, ProviderCatalogEntry, ProviderProfile, Tenant
+from app.persistence.models import (
+    Base,
+    InferenceActivityEvent,
+    ProviderCatalogEntry,
+    ProviderProfile,
+    ProviderScopeNode,
+    Tenant,
+)
 from app.persistence.repositories import TenantRepository, import_tenants
 from app.persistence.secrets import SecretCipher
 from app.tenants import TenantConfig
@@ -107,6 +115,35 @@ def test_openrouter_workspace_migration_updates_postgresql_binding_validator(
     assert "JOIN cost_refresh_jobs j ON j.binding_id = b.id" in generated_sql
 
 
+def test_deepseek_migration_changes_only_profile_and_activity_provider_checks(
+    monkeypatch,
+):
+    """Upgrade SQL enables DeepSeek inference but leaves billing-scope checks alone."""
+    project_root = Path(__file__).resolve().parents[1]
+    monkeypatch.setenv(
+        "DATABASE_URL", "postgresql+psycopg://user:password@localhost/proxy"
+    )
+    output = StringIO()
+    config = Config(str(project_root / "alembic.ini"), output_buffer=output)
+    config.set_main_option("script_location", str(project_root / "migrations"))
+
+    script = ScriptDirectory.from_config(config)
+    migration = script.get_revision("20261007_deepseek_provider").module
+    migration_context = MigrationContext.configure(
+        dialect_name="postgresql",
+        opts={"as_sql": True, "output_buffer": output},
+    )
+    with Operations.context(migration_context):
+        migration.upgrade()
+
+    generated_sql = output.getvalue()
+    assert "ck_profile_provider" in generated_sql
+    assert "ck_inference_activity_provider" in generated_sql
+    assert "'deepseek'" in generated_sql
+    assert "ck_scope_provider" not in generated_sql
+    assert "provider_scope_nodes" not in generated_sql
+
+
 def test_azure_billing_secret_cleanup_migration_is_explicit(monkeypatch):
     """The Azure identity migration permanently clears obsolete tenant secrets."""
     project_root = Path(__file__).resolve().parents[1]
@@ -131,6 +168,71 @@ def test_azure_billing_secret_cleanup_migration_is_explicit(monkeypatch):
         "UPDATE provider_profiles SET billing_secret_ciphertext = NULL "
         "WHERE provider = 'azure' AND billing_secret_ciphertext IS NOT NULL"
     ) in generated_sql
+
+
+def test_deepseek_profiles_and_activity_are_accepted_but_unknown_provider_is_rejected():
+    """The inference allowlists include DeepSeek and reject unregistered vendors."""
+    engine = create_engine("sqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    with Session(engine) as session:
+        session.add(
+            Tenant(
+                id="acme",
+                api_key_hash=hashlib.sha256(b"cursor-key").hexdigest(),
+                custom_model_id="cursor-acme-model",
+            )
+        )
+        session.flush()
+        session.add(
+            ProviderProfile(
+                id="deepseek-profile",
+                tenant_id="acme",
+                provider="deepseek",
+                settings={},
+            )
+        )
+        session.add(
+            InferenceActivityEvent(
+                tenant_id="acme",
+                provider="deepseek",
+                inbound_model="cursor-acme-model",
+            )
+        )
+        session.commit()
+        session.add(
+            ProviderProfile(
+                id="unsupported-profile",
+                tenant_id="acme",
+                provider="unsupported",
+                settings={},
+            )
+        )
+        with pytest.raises(IntegrityError):
+            session.flush()
+        session.rollback()
+    engine.dispose()
+
+
+def test_provider_profile_activity_and_scope_provider_constraints_are_separate():
+    """Only inference profile and activity checks accept DeepSeek."""
+    profile_provider_check = next(
+        constraint
+        for constraint in ProviderProfile.__table__.constraints
+        if constraint.name == "ck_profile_provider"
+    )
+    scope_provider_check = next(
+        constraint
+        for constraint in ProviderScopeNode.__table__.constraints
+        if constraint.name == "ck_scope_provider"
+    )
+    activity_provider_check = next(
+        constraint
+        for constraint in InferenceActivityEvent.__table__.constraints
+        if constraint.name == "ck_inference_activity_provider"
+    )
+    assert "'deepseek'" in str(profile_provider_check.sqltext)
+    assert "'deepseek'" not in str(scope_provider_check.sqltext)
+    assert "'deepseek'" in str(activity_provider_check.sqltext)
 
 
 def test_persistence_schema_creates_on_sqlite_for_portable_constraint_checks():

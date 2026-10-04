@@ -183,7 +183,12 @@ class CostsView:
     azure_scope_bound_profile_ids: frozenset[str]
 
 
-_PROVIDER_LABELS = {"azure": "Azure", "openai": "OpenAI", "openrouter": "OpenRouter"}
+_PROVIDER_LABELS = {
+    "azure": "Azure",
+    "openai": "OpenAI",
+    "openrouter": "OpenRouter",
+    "deepseek": "DeepSeek",
+}
 _ACTIVITY_REQUEST_LIST_LIMIT = 50
 _COST_METRIC_LABELS = {"cost": "Providerkosten", "byok_inference_cost": "BYOK-Kosten"}
 _USAGE_METRIC_LABELS = {
@@ -297,7 +302,7 @@ def dashboard_view(
             state=provider_state(profiles_by_provider.get(name)),
             is_active=name in active_providers,
         )
-        for name in ("azure", "openai", "openrouter")
+        for name in ("azure", "openai", "openrouter", "deepseek")
     )
 
     billing_bindings = tuple(
@@ -586,7 +591,7 @@ def activity_board(
     request_rows.sort(key=lambda row: row.occurred_at)
 
     grouped: dict[str, list[ModelActivityRow]] = {
-        name: [] for name in ("azure", "openai", "openrouter")
+        name: [] for name in ("azure", "openai", "openrouter", "deepseek")
     }
     for provider, model, bucket, tokens_per_request in prepared:
         weight = tokens_per_request or 0.0

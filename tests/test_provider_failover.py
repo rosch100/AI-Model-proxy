@@ -5,18 +5,20 @@ import json
 import pytest
 import requests
 from flask import Response
+from sqlalchemy import select
 
 from app.persistence.admin_ops import (
     activate_provider_profile,
     create_provider_profile,
     replace_catalog_entries,
 )
-from app.persistence.models import Tenant
+from app.persistence.models import InferenceActivityEvent, Tenant
 
 AUTH = {"Authorization": "Bearer cursor-key"}
 AZURE = "https://test-resource.openai.azure.com/openai/v1/responses"
 OPENAI = "https://api.openai.com/v1/chat/completions"
 OPENROUTER = "https://openrouter.ai/api/v1/chat/completions"
+DEEPSEEK = "https://api.deepseek.com/chat/completions"
 
 
 def event(data, name=None):
@@ -28,7 +30,7 @@ def event(data, name=None):
 
 @pytest.fixture
 def routed_app(admin_app):
-    """Configure a tenant route through Azure, OpenAI, and OpenRouter."""
+    """Configure a tenant route through Azure, OpenAI, OpenRouter, and DeepSeek."""
     admin_app.config.update(
         AUTH_MODE="tenant", TENANT_CONFIG_SOURCE="database", ENABLE_AZURE=True
     )
@@ -46,6 +48,7 @@ def routed_app(admin_app):
             ),
             ("openai", "gpt-5.4", {}),
             ("openrouter", "anthropic/claude-sonnet-4", {}),
+            ("deepseek", "deepseek-v4-flash", {}),
         ]:
             profile = create_provider_profile(
                 session,
@@ -119,7 +122,11 @@ def test_third_provider_uses_its_own_model(routed_app, requests_mock):
     response = post(routed_app)
     assert response.status_code == 200
     assert b"success" in response.data
-    assert [r.url for r in requests_mock.request_history] == [AZURE, OPENAI, OPENROUTER]
+    assert [r.url for r in requests_mock.request_history] == [
+        AZURE,
+        OPENAI,
+        OPENROUTER,
+    ]
     assert (
         requests_mock.request_history[-1].json()["model"] == "anthropic/claude-sonnet-4"
     )
@@ -180,9 +187,157 @@ def test_exhausted_route_returns_last_status(routed_app, requests_mock):
     requests_mock.post(AZURE, status_code=503)
     requests_mock.post(OPENAI, status_code=429)
     requests_mock.post(OPENROUTER, status_code=500)
+    requests_mock.post(DEEPSEEK, status_code=402)
     response = post(routed_app)
-    assert response.status_code == 500
-    assert requests_mock.call_count == 3
+    assert response.status_code == 402
+    assert requests_mock.call_count == 4
+
+
+def test_deepseek_http_402_never_fails_over_and_does_not_leak_credentials(
+    routed_app, requests_mock
+):
+    """The DeepSeek 402 stops before a later tenant-owned profile."""
+    database = routed_app.extensions["database"]
+    with database.sessions.begin() as session:
+        tenant = session.get(Tenant, "acme")
+        fallback = create_provider_profile(
+            session,
+            database.secret_cipher,
+            "acme",
+            "openai",
+            "openai-fallback",
+            {},
+            "gpt-5.4",
+            "openai-fallback-secret",
+            "ada",
+        )
+        replace_catalog_entries(session, fallback, [("gpt-5.4", None)], None)
+        activate_provider_profile(session, tenant, fallback.id, "ada")
+
+    requests_mock.post(AZURE, status_code=503)
+    requests_mock.post(
+        OPENAI,
+        status_code=503,
+        additional_matcher=lambda request: request.headers["Authorization"]
+        == "Bearer openai-secret",
+    )
+    requests_mock.post(OPENROUTER, status_code=503)
+    requests_mock.post(DEEPSEEK, status_code=402, text="deepseek-secret")
+    requests_mock.post(
+        OPENAI,
+        content=successful_chat("gpt-5.4"),
+        additional_matcher=lambda request: request.headers["Authorization"]
+        == "Bearer openai-fallback-secret",
+    )
+
+    response = post(routed_app)
+
+    assert response.status_code == 402
+    assert [request.url for request in requests_mock.request_history] == [
+        AZURE,
+        OPENAI,
+        OPENROUTER,
+        DEEPSEEK,
+    ]
+    assert (
+        requests_mock.last_request.headers["Authorization"] == "Bearer deepseek-secret"
+    )
+    assert b"deepseek-secret" not in response.data
+
+
+def test_deepseek_http_429_uses_the_next_profile(routed_app, requests_mock):
+    """Retry DeepSeek throttling and preserve the next profile's credential."""
+    requests_mock.post(AZURE, status_code=503)
+    requests_mock.post(OPENAI, status_code=503)
+    requests_mock.post(OPENROUTER, status_code=503)
+    requests_mock.post(DEEPSEEK, status_code=429)
+    requests_mock.post(
+        OPENAI,
+        content=successful_chat("gpt-5.4"),
+        additional_matcher=lambda request: request.headers["Authorization"]
+        == "Bearer openai-fallback-secret",
+    )
+    database = routed_app.extensions["database"]
+    with database.sessions.begin() as session:
+        tenant = session.get(Tenant, "acme")
+        fallback = create_provider_profile(
+            session,
+            database.secret_cipher,
+            "acme",
+            "openai",
+            "openai-fallback",
+            {},
+            "gpt-5.4",
+            "openai-fallback-secret",
+            "ada",
+        )
+        replace_catalog_entries(session, fallback, [("gpt-5.4", None)], None)
+        activate_provider_profile(session, tenant, fallback.id, "ada")
+
+    response = post(routed_app)
+
+    assert response.status_code == 200
+    assert [request.url for request in requests_mock.request_history] == [
+        AZURE,
+        OPENAI,
+        OPENROUTER,
+        DEEPSEEK,
+        OPENAI,
+    ]
+    assert requests_mock.last_request.headers["Authorization"] == (
+        "Bearer openai-fallback-secret"
+    )
+
+
+def test_deepseek_chat_completion_records_final_usage_before_done(
+    routed_app, requests_mock
+):
+    """A DeepSeek final usage chunk is saved in its own tenant activity row."""
+    requests_mock.post(AZURE, status_code=503)
+    requests_mock.post(OPENAI, status_code=503)
+    requests_mock.post(OPENROUTER, status_code=503)
+    stream = (
+        event(
+            {
+                "model": "deepseek-v4-flash",
+                "choices": [{"delta": {"content": "hello"}, "finish_reason": None}],
+            }
+        )
+        + event(
+            {
+                "model": "deepseek-v4-flash",
+                "choices": [],
+                "usage": {
+                    "prompt_tokens": 17,
+                    "completion_tokens": 5,
+                    "total_tokens": 22,
+                },
+            }
+        )
+        + b"data: [DONE]\n\n"
+    )
+    requests_mock.post(
+        DEEPSEEK,
+        content=stream,
+        headers={"Content-Type": "text/event-stream"},
+    )
+
+    response = post(routed_app)
+
+    assert response.status_code == 200
+    assert response.data.endswith(b"data: [DONE]\n\n")
+    assert b'"model":"cursor-acme-model"' in response.data
+    database = routed_app.extensions["database"]
+    with database.sessions() as session:
+        activity = session.scalar(
+            select(InferenceActivityEvent).where(
+                InferenceActivityEvent.provider == "deepseek"
+            )
+        )
+    assert activity is not None
+    assert activity.input_tokens == 17
+    assert activity.output_tokens == 5
+    assert activity.total_tokens == 22
 
 
 def test_connect_timeout_is_retryable_but_read_timeout_is_not(

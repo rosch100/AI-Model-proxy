@@ -76,6 +76,43 @@
     <p>Für Azure-Kostendaten zuerst einen Azure-Account unter <a href="{{ url_for('admin.settings_connection') }}">Verbindung</a> anlegen.</p>
   {% endif %}
 
+  <h2>DeepSeek Live-Kontostand</h2>
+  <p>DeepSeek stellt hier keinen historischen Billing-Export bereit. Der Live-Kontostand wird nur auf ausdrücklichen Abruf angezeigt; die Proxy-Token-Activity ist im Dashboard verfügbar und wird nicht in Kosten umgerechnet.</p>
+  <p><a href="https://platform.deepseek.com/usage" rel="noreferrer">DeepSeek Usage- und Account-Portal</a></p>
+  {% set deepseek_profiles = view.profiles|selectattr("provider", "equalto", "deepseek")|list %}
+  {% if deepseek_profiles %}
+    {% for profile in deepseek_profiles %}
+      <article class="cost-account">
+        <h3>{{ profile.display_name }} (DeepSeek)</h3>
+        {% if not profile.inference_secret_ciphertext %}
+          <p class="error-text">Für dieses Profil ist kein Inference-Key gespeichert.</p>
+        {% else %}
+          <form method="post" action="{{ url_for('admin.fetch_deepseek_profile_balance', profile_id=profile.id) }}">
+            <input type="hidden" name="csrf_token" value="{{ csrf_token() }}" />
+            <button type="submit">Live-Kontostand abrufen</button>
+          </form>
+        {% endif %}
+        {% if deepseek_balance_profile_id == profile.id and deepseek_balance %}
+          <h4>Live-Kontostand (jetzt abgerufen)</h4>
+          <p>API verfügbar: {{ "Ja" if deepseek_balance.is_available else "Nein" }}</p>
+          {% if deepseek_balance.balance_infos %}
+            <ul>
+              {% for balance in deepseek_balance.balance_infos %}
+                <li>{{ balance.total_balance }} {{ balance.currency }} gesamt · {{ balance.granted_balance }} {{ balance.currency }} gewährt · {{ balance.topped_up_balance }} {{ balance.currency }} aufgeladen</li>
+              {% endfor %}
+            </ul>
+          {% else %}
+            <p>DeepSeek hat keine Guthabenwährungen zurückgegeben.</p>
+          {% endif %}
+        {% elif deepseek_balance_profile_id == profile.id and deepseek_balance_error %}
+          <p class="error-text">{{ deepseek_balance_error }}</p>
+        {% endif %}
+      </article>
+    {% endfor %}
+  {% else %}
+    <p>Für DeepSeek-Balance zuerst ein DeepSeek-Profil unter <a href="{{ url_for('admin.settings_connection') }}">Verbindung</a> anlegen.</p>
+  {% endif %}
+
   <h2>Gebundene Scopes</h2>
   {% if view.bindings %}
     <ul>

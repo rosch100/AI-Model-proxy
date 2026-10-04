@@ -26,6 +26,9 @@
     {% if not profile or profile.provider == "openrouter" %}
       <div data-provider-fields="openrouter"{% if not profile and form.provider.data != "openrouter" %} hidden{% endif %}><p class="hint">OpenRouter verwendet die Standard-API-Adresse.</p></div>
     {% endif %}
+    {% if not profile or profile.provider == "deepseek" %}
+      <div data-provider-fields="deepseek"{% if not profile and form.provider.data != "deepseek" %} hidden{% endif %}><p class="hint">DeepSeek verwendet die Standard-API-Adresse.</p></div>
+    {% endif %}
     {% if not profile %}
       <p class="hint">Nach dem Anlegen können Sie den Anbieter-Katalog laden. Das erste verfügbare Modell wird automatisch als Standardmodell gesetzt; anschließend kann es hier geändert werden.</p>
     {% elif form.default_model.choices|length <= 1 %}

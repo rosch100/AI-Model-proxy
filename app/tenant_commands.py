@@ -122,6 +122,10 @@ def bind_billing_scope() -> None:
                 "Provider profile was not found for this tenant."
             )
         provider = profile.provider
+        if provider not in {"azure", "openai", "openrouter"}:
+            raise click.ClickException(
+                f"Billing scopes are not supported for {provider!r}."
+            )
 
     actor_id = f"uid:{os.getuid()}"
     scope_values = _prompt_scope_values(provider)

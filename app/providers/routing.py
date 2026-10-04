@@ -73,7 +73,7 @@ def forward_tenant_route(
         try:
             if profile.provider == "azure":
                 return AzureAdapter().forward_attempt(req, profile)
-            if profile.provider in {"openai", "openrouter"}:
+            if profile.provider in {"openai", "openrouter", "deepseek"}:
                 return forward_openai_compatible(req, profile, routed=True)
             raise ServiceConfigurationError(
                 f"Unsupported provider {profile.provider!r}."

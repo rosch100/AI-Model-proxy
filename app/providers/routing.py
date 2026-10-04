@@ -71,6 +71,7 @@ _PROVIDER_FORWARDERS: dict[str, ProviderForwarder] = {
     "azure": _forward_azure,
     "openai": _forward_openai_compatible,
     "openrouter": _forward_openai_compatible,
+    "deepseek": _forward_openai_compatible,
 }
 
 

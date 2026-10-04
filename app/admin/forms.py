@@ -99,6 +99,7 @@ class ProviderProfileForm(FlaskForm):
             ("azure", "Azure"),
             ("openai", "OpenAI"),
             ("openrouter", "OpenRouter"),
+            ("deepseek", "DeepSeek"),
         ],
         validators=[DataRequired()],
     )

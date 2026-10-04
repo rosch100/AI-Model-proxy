@@ -182,7 +182,7 @@ def create_provider_profile(
     actor_id: str,
 ) -> ProviderProfile:
     """Create an inactive, tenant-owned account with encrypted credentials."""
-    if provider not in {"azure", "openai", "openrouter"}:
+    if provider not in {"azure", "openai", "openrouter", "deepseek"}:
         raise ValueError("Unsupported provider")
     if session.get(Tenant, tenant_id) is None:
         raise LookupError("Tenant was not found")

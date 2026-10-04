@@ -204,7 +204,12 @@ class CostsView:
     azure_scope_bound_profile_ids: frozenset[str]
 
 
-_PROVIDER_LABELS = {"azure": "Azure", "openai": "OpenAI", "openrouter": "OpenRouter"}
+_PROVIDER_LABELS = {
+    "azure": "Azure",
+    "openai": "OpenAI",
+    "openrouter": "OpenRouter",
+    "deepseek": "DeepSeek",
+}
 _ACTIVITY_REQUEST_LIST_LIMIT = 50
 _COST_METRIC_LABELS = {
     "cost": "Anbieterkosten",
@@ -312,7 +317,6 @@ def dashboard_view(
             profile.id,
         ),
     )
-
     billing_bindings = tuple(
         (profile, binding, node)
         for profile, binding, node in bindings
@@ -830,7 +834,7 @@ def activity_board(
         prepared.append((provider, model, bucket, tokens_per_request))
 
     grouped: dict[str, list[ModelActivityRow]] = {
-        name: [] for name in ("azure", "openai", "openrouter")
+        name: [] for name in ("azure", "openai", "openrouter", "deepseek")
     }
     for provider, model, bucket, tokens_per_request in prepared:
         weight = tokens_per_request or 0.0

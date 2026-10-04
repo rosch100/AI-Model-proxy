@@ -107,8 +107,8 @@ class TestConfig:
         monkeypatch.setattr(
             environs.Env,
             "read_env",
-            lambda *args, **kwargs: orig_read_env(
-                ".env.example", override=True, **kwargs
+            lambda self, *args, **kwargs: orig_read_env(
+                self, ".env.example", override=True, **kwargs
             ),
         )
 

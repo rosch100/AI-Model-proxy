@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import fnmatch
 import ipaddress
 import os
 import re
@@ -255,6 +256,15 @@ def _nginx_statements(
             index += 1
             continue
         if character == "\\":
+            if index + 1 < len(config) and config[index + 1] in ("\n", "\r"):
+                index += 2
+                if (
+                    config[index - 1] == "\r"
+                    and index < len(config)
+                    and config[index] == "\n"
+                ):
+                    index += 1
+                continue
             if statement_offset is None:
                 statement_offset = index
             argument.append(character)
@@ -308,7 +318,8 @@ def _location_declarations(
     statements: Sequence[tuple[int, int, tuple[str, ...], bool]],
 ) -> list[tuple[int, str | None, str, tuple[str, ...]]]:
     declarations = []
-    for _, offset, arguments, is_block in statements:
+    for _, offset, raw_arguments, is_block in statements:
+        arguments = tuple(_unescape_nginx_argument(value) for value in raw_arguments)
         if arguments[0] != "location":
             continue
         if not is_block or len(arguments) not in (2, 3):
@@ -329,12 +340,248 @@ def _unquote_nginx_argument(value: str) -> str:
     return value
 
 
+def _unescape_nginx_argument(value: str) -> str:
+    return re.sub(r"\\(.)", r"\1", value)
+
+
+def _is_non_http_server(
+    statements: Sequence[tuple[int, int, tuple[str, ...], bool]],
+) -> bool:
+    non_http_directives = {
+        "auth_http",
+        "imap_auth",
+        "pop3_auth",
+        "protocol",
+        "smtp_auth",
+    }
+    for depth, _, arguments, is_block in statements:
+        if depth != 0 or is_block:
+            continue
+        directive = _unescape_nginx_argument(arguments[0])
+        if directive in non_http_directives:
+            return True
+        if directive == "proxy_pass" and len(arguments) == 2:
+            target = _unescape_nginx_argument(arguments[1])
+            if not target.startswith(("http://", "https://")):
+                return True
+    return False
+
+
+def _server_names(
+    statements: Sequence[tuple[int, int, tuple[str, ...], bool]],
+) -> tuple[str, ...]:
+    return tuple(
+        name
+        for depth, _, arguments, is_block in statements
+        if depth == 0
+        and not is_block
+        and _unescape_nginx_argument(arguments[0]) == "server_name"
+        for name in arguments[1:]
+    )
+
+
+def _server_name_matches_proxy(name: str) -> bool:
+    is_escaped_regex_marker = name.startswith(r"\~")
+    has_regex_marker = name.startswith("~") or is_escaped_regex_marker
+    if has_regex_marker:
+        marker_length = 2 if is_escaped_regex_marker else 1
+        pattern = name[marker_length:]
+        flags = 0
+        if pattern.startswith("*"):
+            flags = re.IGNORECASE
+            pattern = pattern[1:]
+        try:
+            return re.search(pattern, PROXY_HOSTNAME, flags) is not None
+        except re.error:
+            return True
+
+    normalized = _unescape_nginx_argument(name).casefold()
+    hostname = PROXY_HOSTNAME.casefold()
+    if normalized.startswith("."):
+        return hostname == normalized[1:] or hostname.endswith(normalized)
+    return normalized == hostname or fnmatch.fnmatchcase(hostname, normalized)
+
+
+def _has_exact_proxy_server_name(names: Sequence[str]) -> bool:
+    return any(
+        not name.startswith("~")
+        and not name.startswith(r"\~")
+        and _unescape_nginx_argument(name).casefold() == PROXY_HOSTNAME.casefold()
+        for name in names
+    )
+
+
+def _listen_directives(
+    statements: Sequence[tuple[int, int, tuple[str, ...], bool]],
+) -> tuple[tuple[tuple[str, str, str], bool, tuple[str, ...]], ...]:
+    directives = []
+    for depth, _, arguments, is_block in statements:
+        if depth != 0 or is_block or _unescape_nginx_argument(arguments[0]) != "listen":
+            continue
+        if len(arguments) < 2:
+            raise ValueError("Could not safely parse an Nginx listen directive.")
+        address = _unescape_nginx_argument(arguments[1])
+        options = tuple(_unescape_nginx_argument(option) for option in arguments[2:])
+        transport = (
+            "udp" if any(option in ("quic", "udp") for option in options) else "tcp"
+        )
+        if address.startswith("unix:"):
+            endpoint = (address, "", transport)
+        elif address.isdecimal():
+            endpoint = ("*", address, transport)
+        elif address.startswith("[") and "]" in address:
+            closing = address.index("]")
+            try:
+                host = f"[{ipaddress.IPv6Address(address[1:closing]).compressed}]"
+            except ipaddress.AddressValueError as exc:
+                raise ValueError(
+                    "Could not safely parse an Nginx IPv6 listen address."
+                ) from exc
+            suffix = address[closing + 1 :]
+            port = suffix[1:] if suffix.startswith(":") else "80"
+            endpoint = (host, port, transport)
+        elif ":" in address:
+            host, port = address.rsplit(":", maxsplit=1)
+            endpoint = ("*" if host in ("*", "0.0.0.0") else host, port, transport)
+        else:
+            endpoint = (address, "80", transport)
+        if endpoint[1] and (
+            not endpoint[1].isdecimal() or not 1 <= int(endpoint[1]) <= 65535
+        ):
+            raise ValueError("Could not safely parse an Nginx listen endpoint.")
+        is_default = "default_server" in options
+        directives.append((endpoint, is_default, options))
+    return tuple(directives or ((("*", "80", "tcp"), False, ()),))
+
+
+def _listen_endpoints(
+    statements: Sequence[tuple[int, int, tuple[str, ...], bool]],
+) -> frozenset[tuple[str, str, str]]:
+    return frozenset(endpoint for endpoint, _, _ in _listen_directives(statements))
+
+
+def _endpoint_covers(
+    listener: tuple[str, str, str],
+    endpoint: tuple[str, str, str],
+    listener_options: Sequence[str] = (),
+) -> bool:
+    listener_address, listener_port, listener_transport = listener
+    endpoint_address, endpoint_port, endpoint_transport = endpoint
+    if listener_port != endpoint_port or listener_transport != endpoint_transport:
+        return False
+    if listener_address in ("*", "0.0.0.0"):
+        return not endpoint_address.startswith(("[", "unix:"))
+    if listener_address == "[::]":
+        return endpoint_address.startswith("[") or (
+            "ipv6only=off" in listener_options
+            and not endpoint_address.startswith("unix:")
+        )
+    return listener_address == endpoint_address
+
+
+def _listeners_overlap(
+    left: tuple[tuple[str, str, str], tuple[str, ...]],
+    right: tuple[tuple[str, str, str], tuple[str, ...]],
+) -> bool:
+    left_endpoint, left_options = left
+    right_endpoint, right_options = right
+    return _endpoint_covers(left_endpoint, right_endpoint, left_options) or (
+        _endpoint_covers(right_endpoint, left_endpoint, right_options)
+    )
+
+
+def _default_server_indexes(
+    servers: Sequence[
+        tuple[
+            Path,
+            tuple[str, ...],
+            Sequence[tuple[int, int, tuple[str, ...], bool]],
+            bool,
+        ]
+    ],
+) -> frozenset[int]:
+    listeners = [_listen_directives(server[2]) for server in servers]
+    explicit_defaults = [
+        (endpoint, options)
+        for entries in listeners
+        for endpoint, is_default, options in entries
+        if is_default
+    ]
+    defaults = set()
+    for index, entries in enumerate(listeners):
+        for endpoint, is_default, options in entries:
+            current_listener = (endpoint, options)
+            has_explicit_default = any(
+                _listeners_overlap(
+                    (default_endpoint, default_options), current_listener
+                )
+                for default_endpoint, default_options in explicit_defaults
+            )
+            has_prior_server = any(
+                _listeners_overlap(
+                    (previous_endpoint, previous_options), current_listener
+                )
+                for previous_entries in listeners[:index]
+                for previous_endpoint, _, previous_options in previous_entries
+            )
+            if is_default or (not has_explicit_default and not has_prior_server):
+                defaults.add(index)
+    return frozenset(defaults)
+
+
+def _is_safe_http_redirect_server(
+    statements: Sequence[tuple[int, int, tuple[str, ...], bool]],
+) -> bool:
+    listeners = _listen_endpoints(statements)
+    if not listeners or any(port != "80" for _, port, _ in listeners):
+        return False
+    for endpoint, _, options in _listen_directives(statements):
+        if endpoint[2] != "tcp" or set(options) - {"default_server", "ipv6only=on"}:
+            return False
+    allowed_directives = {"listen", "server_name", "if", "return"}
+    allowed_redirects = {
+        (status, f"https://{PROXY_HOSTNAME}$request_uri") for status in ("301", "308")
+    }
+    redirect_positions = []
+    fallback_positions = []
+    condition_count = 0
+    for position, (depth, _, arguments, is_block) in enumerate(statements):
+        directive = _unescape_nginx_argument(arguments[0])
+        if directive not in allowed_directives:
+            return False
+        if directive == "if":
+            condition = tuple(
+                _unescape_nginx_argument(value) for value in arguments[1:]
+            )
+            if (
+                depth != 0
+                or not is_block
+                or condition != ("($host", "=", f"{PROXY_HOSTNAME})")
+            ):
+                return False
+            condition_count += 1
+        if directive == "return":
+            if is_block or len(arguments) not in (2, 3):
+                return False
+            values = tuple(_unescape_nginx_argument(value) for value in arguments[1:])
+            if values == ("404",) and depth == 0:
+                fallback_positions.append(position)
+            elif depth == 1 and values in allowed_redirects:
+                redirect_positions.append(position)
+            else:
+                return False
+    return (
+        condition_count == 1
+        and len(redirect_positions) == 1
+        and len(fallback_positions) == 1
+        and redirect_positions[0] < fallback_positions[0]
+    )
+
+
 def _validate_no_unprotected_admin_routes(server_body: str) -> None:
-    if "\\" in server_body:
-        raise ValueError("Nginx escape sequences prevent proving admin isolation.")
     for depth, _, arguments, is_block in _nginx_statements(server_body):
-        directive = arguments[0]
-        values = arguments[1:]
+        directive = _unescape_nginx_argument(arguments[0])
+        values = tuple(_unescape_nginx_argument(value) for value in arguments[1:])
         if directive == "location" and depth > 0:
             raise ValueError("Nested Nginx locations prevent proving admin isolation.")
         if directive == "location" and not is_block:
@@ -368,8 +615,11 @@ def _proxies_to_flask(
     return any(
         not is_block
         and len(arguments) == 2
-        and arguments[0] == "proxy_pass"
-        and re.match(r"^http://127\.0\.0\.1:5000(?:$|[/?#])", arguments[1])
+        and _unescape_nginx_argument(arguments[0]) == "proxy_pass"
+        and re.match(
+            r"^http://127\.0\.0\.1:5000(?:$|[/?#])",
+            _unescape_nginx_argument(arguments[1]),
+        )
         for _, _, arguments, is_block in statements
     )
 
@@ -380,7 +630,8 @@ def _validate_unique_active_proxy_server(config: str, site_path: Path) -> None:
     expected_content = site_path.read_text(encoding="utf-8").strip("\n")
     if sections[0].strip():
         raise DeploymentError("Could not safely parse nginx -T configuration output.")
-    matching_sources = []
+    active_servers = []
+    non_http_servers = []
     managed_sections = []
     for index in range(1, len(sections), 2):
         source_path = Path(sections[index])
@@ -398,7 +649,8 @@ def _validate_unique_active_proxy_server(config: str, site_path: Path) -> None:
         if source_path.resolve() == site_path.resolve():
             managed_sections.append(section.strip("\n"))
         for _, offset, arguments, is_block in _nginx_statements(section):
-            if arguments[0] != "server" or not is_block:
+            directive = _unescape_nginx_argument(arguments[0])
+            if directive != "server" or not is_block:
                 continue
             if arguments != ("server",):
                 raise ValueError("Could not safely parse an Nginx server declaration.")
@@ -406,18 +658,79 @@ def _validate_unique_active_proxy_server(config: str, site_path: Path) -> None:
             end = _nginx_block_end(section, opening)
             body = section[opening + 1 : end - 1]
             statements = _nginx_statements(body)
-            server_names = (
-                name
-                for depth, _, statement, is_block_statement in statements
-                if depth == 0
-                and not is_block_statement
-                and statement[0] == "server_name"
-                for name in statement[1:]
+            if _is_non_http_server(statements):
+                non_http_servers.append(statements)
+                continue
+            server_names = _server_names(statements)
+            is_flask_server = _proxies_to_flask(statements)
+            active_servers.append(
+                (
+                    source_path.resolve(),
+                    server_names,
+                    statements,
+                    is_flask_server,
+                )
             )
+
+    managed_servers = [
+        entry
+        for entry in active_servers
+        if entry[0] == site_path.resolve()
+        and entry[3]
+        and _has_exact_proxy_server_name(entry[1])
+    ]
+    if len(managed_servers) != 1:
+        raise DeploymentError(
+            "Expected exactly one managed Flask server with the exact "
+            f"server_name {PROXY_HOSTNAME}."
+        )
+
+    managed_listeners = tuple(
+        (endpoint, options)
+        for endpoint, _, options in _listen_directives(managed_servers[0][2])
+    )
+    managed_endpoints = frozenset(endpoint for endpoint, _ in managed_listeners)
+    for statements in non_http_servers:
+        for endpoint, _, options in _listen_directives(statements):
             if any(
-                name.casefold() == PROXY_HOSTNAME.casefold() for name in server_names
-            ) and _proxies_to_flask(statements):
-                matching_sources.append(source_path.resolve())
+                _listeners_overlap((endpoint, options), managed_listener)
+                for managed_listener in managed_listeners
+            ):
+                raise DeploymentError(
+                    "A non-HTTP Nginx server shares a listener with the managed proxy."
+                )
+
+    default_servers = _default_server_indexes(active_servers)
+    matching_sources = []
+    for index, (source_path, server_names, statements, is_flask_server) in enumerate(
+        active_servers
+    ):
+        matches_proxy = any(_server_name_matches_proxy(name) for name in server_names)
+        is_managed_server = (
+            source_path == site_path.resolve()
+            and is_flask_server
+            and _has_exact_proxy_server_name(server_names)
+        )
+        is_http_redirect = _has_exact_proxy_server_name(
+            server_names
+        ) and _is_safe_http_redirect_server(statements)
+        if is_managed_server:
+            matching_sources.append(source_path)
+            continue
+        if matches_proxy and not is_http_redirect:
+            raise DeploymentError(
+                "A competing Nginx server block can serve "
+                f"{PROXY_HOSTNAME} outside the managed site {site_path}."
+            )
+        if index in default_servers and not is_http_redirect:
+            has_managed_listener = _listen_endpoints(statements).issubset(
+                managed_endpoints
+            )
+            if not has_managed_listener:
+                raise DeploymentError(
+                    "A default Nginx server can intercept requests for "
+                    f"{PROXY_HOSTNAME} outside the managed site {site_path}."
+                )
 
     if (
         matching_sources != [site_path.resolve()]
@@ -434,34 +747,38 @@ def insert_admin_locations(site_config: str) -> str:
     """Insert protected admin locations into the matching Nginx server block."""
     server_blocks = []
     for _, offset, arguments, is_block in _nginx_statements(site_config):
-        if arguments[0] != "server" or not is_block:
+        directive = _unescape_nginx_argument(arguments[0])
+        if directive != "server" or not is_block:
             continue
         if arguments != ("server",):
             raise ValueError("Could not safely parse an Nginx server declaration.")
         opening = site_config.find("{", offset)
         end = _nginx_block_end(site_config, opening)
-        body = site_config[opening + 1 : end - 1]
-        if "\\" in body:
-            raise ValueError(
-                "Nginx escape sequences prevent safely identifying server blocks."
-            )
         server_blocks.append((offset, opening, end))
 
     matching_blocks = []
     for _, opening, end in server_blocks:
         body = site_config[opening + 1 : end - 1]
         statements = _nginx_statements(body)
-        server_names = (
-            name
-            for depth, _, arguments, is_block in statements
-            if depth == 0 and not is_block and arguments[0] == "server_name"
-            for name in arguments[1:]
-        )
-        if any(
-            name.casefold() == PROXY_HOSTNAME.casefold() for name in server_names
-        ) and _proxies_to_flask(statements):
-            _validate_no_unprotected_admin_routes(body)
-            matching_blocks.append((opening, body, statements))
+        server_names = _server_names(statements)
+        matches_proxy = any(_server_name_matches_proxy(name) for name in server_names)
+        if matches_proxy:
+            if _proxies_to_flask(statements):
+                if not _has_exact_proxy_server_name(server_names):
+                    raise ValueError(
+                        "The managed Flask proxy server must declare the exact "
+                        f"server_name {PROXY_HOSTNAME}."
+                    )
+                _validate_no_unprotected_admin_routes(body)
+                matching_blocks.append((opening, body, statements))
+            elif not (
+                _has_exact_proxy_server_name(server_names)
+                and _is_safe_http_redirect_server(statements)
+            ):
+                raise ValueError(
+                    "A competing proxy.altanis.de server block prevents proving "
+                    "admin isolation."
+                )
     if len(matching_blocks) != 1:
         raise ValueError(
             "Expected exactly one Flask proxy server block for proxy.altanis.de."

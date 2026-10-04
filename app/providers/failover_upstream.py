@@ -53,6 +53,7 @@ _ERROR_CODE_STATUSES = {
     "permission_error": 403,
     "invalid_request_error": 400,
     "model_not_found": 404,
+    "payment_required": 402,
     "openrouter_key_limit": 402,
     "openrouter_in_flight_budget": 402,
 }
@@ -218,6 +219,7 @@ def _error_failure(
         code,
         f"Provider returned an error (HTTP {status}).",
         status in RETRYABLE_STATUSES
+        or status == 402
         or classification.category in {"quota_exhausted", "transient"},
         classification,
     )

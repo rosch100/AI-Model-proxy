@@ -574,10 +574,10 @@ def test_exhausted_route_returns_last_status(routed_app, requests_mock):
     assert requests_mock.call_count == 4
 
 
-def test_deepseek_http_402_never_fails_over_and_does_not_leak_credentials(
+def test_deepseek_http_402_uses_next_profile_without_leaking_credentials(
     routed_app, requests_mock
 ):
-    """The DeepSeek 402 stops before a later tenant-owned profile."""
+    """Fail over after a DeepSeek 402 without leaking its credentials."""
     activate_deepseek_profile(routed_app)
     database = routed_app.extensions["database"]
     with database.sessions.begin() as session:
@@ -614,17 +614,90 @@ def test_deepseek_http_402_never_fails_over_and_does_not_leak_credentials(
 
     response = post(routed_app)
 
-    assert response.status_code == 402
+    assert response.status_code == 200
+    assert [request.url for request in requests_mock.request_history] == [
+        AZURE,
+        OPENAI,
+        OPENROUTER,
+        DEEPSEEK,
+        OPENAI,
+    ]
+    assert (
+        requests_mock.last_request.headers["Authorization"]
+        == "Bearer openai-fallback-secret"
+    )
+    assert b"deepseek-secret" not in response.data
+
+
+def test_openrouter_http_402_uses_next_provider(routed_app, requests_mock):
+    """An OpenRouter payment error cascades to DeepSeek before client output."""
+    activate_deepseek_profile(routed_app)
+    requests_mock.post(AZURE, status_code=429)
+    requests_mock.post(OPENAI, status_code=429)
+    requests_mock.post(OPENROUTER, status_code=402, text="openrouter-secret")
+    requests_mock.post(
+        DEEPSEEK,
+        content=successful_chat("deepseek-v4-flash"),
+        additional_matcher=lambda request: request.headers["Authorization"]
+        == "Bearer deepseek-secret",
+    )
+
+    response = post(routed_app)
+
+    assert response.status_code == 200
     assert [request.url for request in requests_mock.request_history] == [
         AZURE,
         OPENAI,
         OPENROUTER,
         DEEPSEEK,
     ]
-    assert (
-        requests_mock.last_request.headers["Authorization"] == "Bearer deepseek-secret"
+    assert b"openrouter-secret" not in response.data
+    with routed_app.extensions["database"].sessions() as session:
+        assert session.scalar(select(ProviderCircuitState)) is None
+
+
+def test_openrouter_key_limit_fails_over_and_pauses_provider(routed_app, requests_mock):
+    """Fail over on a key limit and skip that profile on the next request."""
+    activate_deepseek_profile(routed_app)
+    database = routed_app.extensions["database"]
+    with database.sessions.begin() as session:
+        profiles = tuple(
+            session.scalars(
+                select(ProviderProfile).where(ProviderProfile.tenant_id == "acme")
+            )
+        )
+        openrouter = next(
+            profile for profile in profiles if profile.provider == "openrouter"
+        )
+        deepseek = next(
+            profile for profile in profiles if profile.provider == "deepseek"
+        )
+        for profile in profiles:
+            profile.route_priority = None
+        session.flush()
+        openrouter.route_priority = 1
+        deepseek.route_priority = 2
+
+    requests_mock.post(
+        OPENROUTER,
+        status_code=402,
+        json={"error": {"metadata": {"limit_source": "openrouter_key_limit"}}},
     )
-    assert b"deepseek-secret" not in response.data
+    requests_mock.post(DEEPSEEK, content=successful_chat("deepseek-v4-flash"))
+
+    first = post(routed_app)
+    second = post(routed_app)
+
+    assert first.status_code == second.status_code == 200
+    assert [request.url for request in requests_mock.request_history] == [
+        OPENROUTER,
+        DEEPSEEK,
+        DEEPSEEK,
+    ]
+    with database.sessions() as session:
+        state = session.scalar(select(ProviderCircuitState))
+    assert state.provider == "openrouter"
+    assert state.failure_category == "quota_exhausted"
 
 
 def test_deepseek_http_429_uses_the_next_profile(routed_app, requests_mock):

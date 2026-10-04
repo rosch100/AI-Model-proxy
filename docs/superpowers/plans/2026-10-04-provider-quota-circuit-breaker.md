@@ -33,7 +33,7 @@
 **Interfaces:** `classify_upstream_error(provider, status, error, headers, settings, *, now=None)` liefert Kategorie, gegebenenfalls gemeldeten Scope-Typ und Retry-After-Dauer; `UpstreamError` trägt optional dieses Ergebnis durch Preflight/Fallback.
 
 - [x] Teste OpenAI-Quota-Codes `insufficient_quota`, `credit_balance_exhausted`, `organization_spend_limit_exceeded`, `project_spend_limit_exceeded`, `organization_usage_limit_exceeded`; bestätige, dass nur explizit zuordenbare Org-/Projektfehler einen Shared Scope liefern.
-- [ ] Teste OpenAI `rate_limit_exceeded`, Azure 429/`rate_limit_exceeded`, OpenRouter `openrouter_in_flight_budget`, OpenRouter `openrouter_key_limit` sowie mehrdeutigen 402-Fehler.
+- [x] Teste OpenAI `rate_limit_exceeded`, Azure 429/`rate_limit_exceeded`, OpenRouter `openrouter_in_flight_budget`, OpenRouter `openrouter_key_limit` sowie mehrdeutigen 402-Fehler.
 - [ ] Teste Retry-After als Sekunden und HTTP-Datum, ungültige/negative/überlange Werte, Zeitobergrenze und dass Retry-After den Backoff nicht verkürzt.
 - [ ] Führe `pytest tests/test_provider_error_classification.py -q` aus und bestätige erwartete RED-Fehler.
 - [ ] Implementiere die Klassifikation nur anhand Status, strukturiertem Code/Metadata, Headern und konfigurierten Scope-IDs; verwende keine Fehlernachrichten.

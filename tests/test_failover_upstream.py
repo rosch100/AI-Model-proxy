@@ -76,6 +76,7 @@ def test_late_error_is_not_used_for_failover():
         (401, False),
         (403, False),
         (404, False),
+        (402, True),
         (408, True),
         (429, True),
         (500, True),
@@ -93,6 +94,18 @@ def test_http_error_retains_classification(status, retryable):
     assert caught.value.status == status
     assert caught.value.retryable is retryable
     response.close.assert_called_once()
+
+
+def test_payment_required_sse_error_is_retryable_without_opening_quota_breaker():
+    """Allow a payment error to cascade while keeping ambiguous quota terminal."""
+    response = upstream([event({"error": {"code": "payment_required"}})])
+
+    with pytest.raises(failover_upstream.UpstreamError) as caught:
+        failover_upstream.prepare_upstream(response, provider="openrouter")
+
+    assert caught.value.status == 402
+    assert caught.value.retryable
+    assert caught.value.classification.category == "terminal"
 
 
 def test_openrouter_inflight_sse_metadata_is_retryable_transient():

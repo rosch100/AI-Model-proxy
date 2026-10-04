@@ -173,6 +173,10 @@ existing account and passkey authentication remains enabled as a second layer.
   it using the approved secret-transfer mechanism; never commit it or print its
   contents. On the proxy host, install it at `/etc/nginx/proxy-admin.keytab`
   with owner `root`, group `www-data` and mode `0640`.
+- The service account's Active Directory `userPrincipalName` must match the
+  configured `--service-principal` (`HTTP/proxy.altanis.de@ALTANIS.DE`). The
+  installer's keytab check passes this identity to `kinit -k`; registering the
+  SPN alone does not satisfy this account identity prerequisite.
 - The host can reach AD KDC `192.168.253.5` on TCP and UDP port 88 through its
   private IONOS interface. The generated persistent host route uses router
   `192.168.20.31`; the router must permit and SNAT only this proxy-to-KDC
@@ -183,13 +187,17 @@ existing account and passkey authentication remains enabled as a second layer.
 
 ### Review and deploy
 
-1. On a trusted development machine, render the router's least-privilege nftables
-   rules and review them against the router's existing table and chain
-   definitions:
+1. On the router, inspect the existing nftables table and chain definitions:
 
    ```bash
    nft -a list chain inet wireguard_filter forward
    nft -a list chain ip wireguard_nat4 postrouting
+   ```
+
+   On a trusted development machine, render the router's least-privilege rules
+   using the reviewed handles from the router output:
+
+   ```bash
    python3 scripts/deploy_proxy_admin_iwa.py --render-router-rules \
      --router-kerberos-address <VERIFIED_ROUTER_ADDRESS> \
      --forward-chain-handle <REVIEWED_FORWARD_RULE_HANDLE> \

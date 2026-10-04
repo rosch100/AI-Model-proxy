@@ -42,6 +42,22 @@ NGINX_SITE = """server {
 }
 """
 
+NGINX_TLS_SITE = NGINX_SITE.replace(
+    "    server_name proxy.altanis.de;",
+    "    listen 443 ssl;\n"
+    "    server_name proxy.altanis.de;\n"
+    "    include /etc/letsencrypt/options-ssl-nginx.conf;",
+)
+NGINX_REDIRECT_SITE = """server {
+    listen 80;
+    server_name proxy.altanis.de;
+    if ($host = proxy.altanis.de) {
+        return 301 https://$host$request_uri;
+    }
+    return 404;
+}
+"""
+
 
 class ProxyAdminIwaDeploymentTests(unittest.TestCase):
     """Validate ingress parsing, deployment safety, and rollback behavior."""
@@ -189,6 +205,44 @@ class ProxyAdminIwaDeploymentTests(unittest.TestCase):
             with self.subTest(config=config), self.assertRaises(ValueError):
                 insert_admin_locations(config)
 
+    def test_tls_proxy_with_optional_redirect_server(self):
+        """Protect TLS ingress and preserve the separate HTTP redirect block."""
+        for original in (
+            NGINX_TLS_SITE,
+            NGINX_REDIRECT_SITE + NGINX_TLS_SITE,
+            NGINX_TLS_SITE + NGINX_REDIRECT_SITE,
+        ):
+            with (
+                self.subTest(original=original),
+                tempfile.TemporaryDirectory() as directory,
+            ):
+                configured = insert_admin_locations(original)
+                include = "    include /etc/nginx/snippets/proxy-altanis-admin-iwa-locations.conf;\n"
+                self.assertEqual(configured.count(include), 1)
+                self.assertEqual(configured.replace(include, ""), original)
+                self.assertEqual(insert_admin_locations(configured), configured)
+                site_path = Path(directory) / "proxy.altanis.de"
+                for content in (original, configured):
+                    site_path.write_text(content, encoding="utf-8")
+                    _validate_unique_active_proxy_server(
+                        f"# configuration file {site_path}:\n{content}", site_path
+                    )
+
+    def test_only_exact_letsencrypt_options_include_is_allowed(self):
+        """Keep external route includes and wildcard TLS includes rejected."""
+        for path in (
+            "/etc/letsencrypt/*.conf",
+            "/etc/letsencrypt/options-ssl-nginx.conf.extra",
+            "/etc/nginx/snippets/admin-routes.conf",
+            "/etc/letsencrypt/options-ssl-nginx.conf /tmp/routes.conf",
+        ):
+            with self.subTest(path=path), self.assertRaises(ValueError):
+                insert_admin_locations(
+                    NGINX_TLS_SITE.replace(
+                        "/etc/letsencrypt/options-ssl-nginx.conf", path
+                    )
+                )
+
     def test_multiline_admin_location_is_rejected(self):
         """Fail closed when an admin location declaration is multiline."""
         multiline_admin = NGINX_SITE.replace(
@@ -244,7 +298,9 @@ class ProxyAdminIwaDeploymentTests(unittest.TestCase):
                 f"# configuration file {site_path}:\n{NGINX_SITE}"
             )
             _validate_unique_active_proxy_server(active_config, site_path)
-            duplicate_content = "server { server_name PROXY.ALTANIS.DE; }\n"
+            duplicate_content = NGINX_SITE.replace(
+                "proxy.altanis.de", "PROXY.ALTANIS.DE"
+            )
             duplicate_path = Path(directory) / "conf.d" / "duplicate.conf"
             duplicate_path.write_text(duplicate_content, encoding="utf-8")
             duplicate_active_config = (
@@ -281,7 +337,8 @@ class ProxyAdminIwaDeploymentTests(unittest.TestCase):
     def test_inline_duplicate_proxy_server_block_is_rejected(self):
         """Reject a second matching host block even in compact syntax."""
         duplicate_server = NGINX_SITE.rstrip() + (
-            " server { server_name proxy.altanis.de; location / { } }"
+            " server { server_name proxy.altanis.de; location / { "
+            "proxy_pass http://127.0.0.1:5000; } }"
         )
         with self.assertRaises(ValueError):
             insert_admin_locations(duplicate_server)

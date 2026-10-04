@@ -117,6 +117,20 @@ class ActivityRequestRow:
 
 
 @dataclass(frozen=True)
+class FailedProviderAttemptRow:
+    """One failed upstream attempt, separate from completed user requests."""
+
+    provider_label: str
+    profile_name: str | None
+    requested_model: str
+    routed_model: str
+    occurred_at: datetime
+    time_label: str
+    status_code: int | None
+    outcome_label: str
+
+
+@dataclass(frozen=True)
 class ActivityWindowSummary:
     """Request and reported-token totals for one rolling time window."""
 
@@ -143,6 +157,7 @@ class ActivityBoard:
     last_request_label: str | None
     providers: tuple[ProviderActivityGroup, ...]
     request_period_hours: int
+    failed_attempts: tuple[FailedProviderAttemptRow, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -306,6 +321,7 @@ def dashboard_view(
     provider_attempts: Sequence[ProviderAttemptEvent] = (),
     circuit_scopes_by_profile: Mapping[str, Sequence[CircuitSnapshot]] | None = None,
     include_activity_board: bool = True,
+    failed_attempts: Sequence[tuple[ProviderAttemptEvent, str | None]] = (),
 ) -> DashboardView:
     """Build provider status and latest-snapshot cost summaries for a tenant."""
     visible_profiles = sorted(
@@ -398,6 +414,7 @@ def dashboard_view(
             now=now,
             request_events=request_events,
             request_period_hours=request_period_hours,
+            failed_attempts=failed_attempts,
         )
         if include_activity_board
         else None
@@ -724,6 +741,32 @@ def _activity_request_row(event: InferenceActivityEvent) -> ActivityRequestRow:
     )
 
 
+def _failed_provider_attempt_row(
+    attempt: ProviderAttemptEvent, profile_name: str | None
+) -> FailedProviderAttemptRow:
+    """Prepare a failed upstream attempt without treating it as a user request."""
+    occurred_at = _aware_utc(attempt.completed_at or attempt.occurred_at)
+    return FailedProviderAttemptRow(
+        provider_label=_PROVIDER_LABELS[attempt.provider],
+        profile_name=profile_name,
+        requested_model=attempt.inbound_model,
+        routed_model=attempt.routed_model,
+        occurred_at=occurred_at,
+        time_label=occurred_at.isoformat(),
+        status_code=attempt.status_code,
+        outcome_label=_provider_attempt_outcome_label(attempt.status_code),
+    )
+
+
+def _provider_attempt_outcome_label(status_code: int | None) -> str:
+    """Render a concise, accurate label without guessing provider error details."""
+    if status_code == 429:
+        return "Rate-Limit oder Überlastung · HTTP 429"
+    if status_code is None:
+        return "Provider-Versuch fehlgeschlagen · kein HTTP-Status aufgezeichnet"
+    return f"Provider-Versuch fehlgeschlagen · HTTP {status_code}"
+
+
 def activity_board(
     events: Sequence[InferenceActivityEvent],
     *,
@@ -733,6 +776,7 @@ def activity_board(
     request_events: Sequence[InferenceActivityEvent] | None = None,
     request_period_hours: int = ACTIVITY_LOOKBACK_HOURS,
     lookback_hours: int = ACTIVITY_LOOKBACK_HOURS,
+    failed_attempts: Sequence[tuple[ProviderAttemptEvent, str | None]] = (),
 ) -> ActivityBoard:
     """Prepare recent request rows and provider recency for the overview."""
     clock = now or datetime.now(timezone.utc)
@@ -885,6 +929,14 @@ def activity_board(
             if last_request_at is None or row.last_request_at > last_request_at:
                 last_request_at = row.last_request_at
 
+    prepared_failures = tuple(
+        _failed_provider_attempt_row(attempt, profile_name)
+        for attempt, profile_name in sorted(
+            failed_attempts,
+            key=lambda item: _aware_utc(item[0].completed_at or item[0].occurred_at),
+            reverse=True,
+        )[:_ACTIVITY_REQUEST_LIST_LIMIT]
+    )
     total_tokens_per_request = (
         total_tokens / total_requests_with_usage if total_requests_with_usage else None
     )
@@ -909,4 +961,5 @@ def activity_board(
         ),
         providers=tuple(providers),
         request_period_hours=request_period_hours,
+        failed_attempts=prepared_failures,
     )

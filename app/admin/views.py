@@ -585,6 +585,33 @@ def _provider_attempt_events(session, tenant_id: str):
     return tuple(session.scalars(statement))
 
 
+def _failed_provider_attempts(
+    session, tenant_id: str, lookback_hours: int
+) -> tuple[tuple[ProviderAttemptEvent, str | None], ...]:
+    """Load recent failed upstream attempts with safe profile display names."""
+    cutoff = datetime.now(timezone.utc) - timedelta(hours=lookback_hours)
+    statement = (
+        select(ProviderAttemptEvent, ProviderProfile.display_name)
+        .join(ProviderProfile, ProviderProfile.id == ProviderAttemptEvent.profile_id)
+        .where(
+            ProviderAttemptEvent.tenant_id == tenant_id,
+            ProviderAttemptEvent.outcome == "failure",
+            func.coalesce(
+                ProviderAttemptEvent.completed_at, ProviderAttemptEvent.occurred_at
+            )
+            >= cutoff,
+        )
+        .order_by(
+            func.coalesce(
+                ProviderAttemptEvent.completed_at, ProviderAttemptEvent.occurred_at
+            ).desc(),
+            ProviderAttemptEvent.id.desc(),
+        )
+        .limit(50)
+    )
+    return tuple(session.execute(statement).all())
+
+
 def _activity_events(
     session, tenant_id: str, lookback_hours: int, *, limit: int | None = None
 ):
@@ -720,6 +747,7 @@ def dashboard():
         request_events = _activity_events(
             session, tenant.id, activity_hours, limit=1000
         )
+        failed_attempts = _failed_provider_attempts(session, tenant.id, activity_hours)
         provider_attempts = _provider_attempt_events(session, tenant.id)
         view = dashboard_view(
             tenant,
@@ -734,6 +762,7 @@ def dashboard():
             request_events=request_events,
             request_period_hours=activity_hours,
             provider_attempts=provider_attempts,
+            failed_attempts=failed_attempts,
         )
         session.expunge_all()
     return render_template(
@@ -790,11 +819,13 @@ def dashboard_activity():
         request_events = _activity_events(
             session, tenant.id, activity_hours, limit=1000
         )
+        failed_attempts = _failed_provider_attempts(session, tenant.id, activity_hours)
         activity = activity_board(
             activity_events,
             custom_model_id=tenant.custom_model_id,
             request_events=request_events,
             request_period_hours=activity_hours,
+            failed_attempts=failed_attempts,
         )
         session.expunge_all()
     return render_template(

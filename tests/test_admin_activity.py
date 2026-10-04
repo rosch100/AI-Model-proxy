@@ -227,6 +227,39 @@ def test_activity_board_limits_request_list_to_most_recent_entries():
     assert board.requests[-1].occurred_at == now - timedelta(minutes=49)
 
 
+def test_activity_board_lists_provider_failures_as_attempts_not_requests():
+    """Expose failed upstream attempts separately from completed user requests."""
+    now = datetime(2026, 10, 3, 16, 20, tzinfo=timezone.utc)
+    attempt = ProviderAttemptEvent(
+        id=1,
+        tenant_id="acme",
+        provider="openrouter",
+        profile_id="openrouter-main",
+        inbound_model="gpt-6-luna",
+        routed_model="openai/gpt-6-luna",
+        outcome="failure",
+        status_code=402,
+        occurred_at=now - timedelta(minutes=2),
+        completed_at=now - timedelta(minutes=1),
+    )
+
+    board = activity_board(
+        (),
+        custom_model_id="cursor-acme-model",
+        now=now,
+        failed_attempts=((attempt, "Altanis Proxy"),),
+    )
+
+    assert board.requests == ()
+    assert len(board.failed_attempts) == 1
+    assert board.failed_attempts[0].requested_model == "gpt-6-luna"
+    assert board.failed_attempts[0].provider_label == "OpenRouter"
+    assert board.failed_attempts[0].profile_name == "Altanis Proxy"
+    assert board.failed_attempts[0].routed_model == "openai/gpt-6-luna"
+    assert board.failed_attempts[0].status_code == 402
+    assert board.failed_attempts[0].occurred_at == now - timedelta(minutes=1)
+
+
 def test_dashboard_renders_activity_empty_state(admin_app):
     """An idle tenant still sees the current requests section."""
     body = _authenticated_client(admin_app).get("/admin/").get_data(as_text=True)
@@ -238,6 +271,47 @@ def test_dashboard_renders_activity_empty_state(admin_app):
     assert "Letzte Stunde" in body
     assert "Für 0 von 0 Anfragen liegen Tokenangaben vor" in body
     assert "Tokens insgesamt" in body
+
+
+def test_dashboard_lists_failed_provider_attempts_separately(admin_app):
+    """Render failed upstream attempts without counting them as user requests."""
+    database = admin_app.extensions["database"]
+    occurred_at = datetime.now(timezone.utc) - timedelta(seconds=10)
+    with database.sessions.begin() as session:
+        profile = ProviderProfile(
+            id="openrouter-failed-attempt-dashboard",
+            tenant_id="acme",
+            provider="openrouter",
+            display_name="Altanis Proxy",
+            settings={},
+            default_model="openai/gpt-6-luna",
+            route_priority=3,
+            inference_secret_ciphertext="encrypted-key",
+        )
+        session.add(profile)
+        session.flush()
+        session.add(
+            ProviderAttemptEvent(
+                tenant_id="acme",
+                provider="openrouter",
+                profile_id=profile.id,
+                inbound_model="gpt-6-luna",
+                routed_model="openai/gpt-6-luna",
+                outcome="failure",
+                status_code=402,
+                occurred_at=occurred_at,
+                completed_at=occurred_at + timedelta(seconds=1),
+            )
+        )
+
+    body = _authenticated_client(admin_app).get("/admin/").get_data(as_text=True)
+
+    assert "Fehlgeschlagene Provider-Versuche" in body
+    assert "OpenRouter · Altanis Proxy" in body
+    assert "Angefragt: gpt-6-luna" in body
+    assert "An Provider gesendet: <code>openai/gpt-6-luna</code>" in body
+    assert "Provider-Versuch fehlgeschlagen · HTTP 402" in body
+    assert "Keine Anfragen im gewählten Zeitraum" in body
 
 
 def test_dashboard_rejects_unsupported_activity_period(admin_app):

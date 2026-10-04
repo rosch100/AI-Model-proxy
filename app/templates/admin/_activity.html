@@ -42,6 +42,45 @@
     </dl>
   {% endif %}
 
+  {% if activity.failed_attempts %}
+    <div class="activity-request-list failed-provider-attempts">
+      <div class="activity-request-list-heading">
+        <h3>Fehlgeschlagene Provider-Versuche</h3>
+        <span>Einzelne Upstream-Versuche · können zu einer später erfolgreichen Anfrage gehören</span>
+      </div>
+      <div class="activity-table-scroll">
+        <table class="activity-table">
+          <thead>
+            <tr>
+              <th scope="col">Zeit</th>
+              <th scope="col">Anbieter und Modell</th>
+              <th scope="col">Ergebnis</th>
+            </tr>
+          </thead>
+          <tbody>
+            {% for row in activity.failed_attempts %}
+              <tr>
+                <td class="activity-time-cell">
+                  <time datetime="{{ row.occurred_at.isoformat() }}" data-local-time aria-describedby="activity-time-hint">{{ row.time_label }}</time>
+                </td>
+                <td class="activity-model-cell">
+                  <strong>{{ row.provider_label }}{% if row.profile_name %} · {{ row.profile_name }}{% endif %}</strong>
+                  <span class="activity-provider-label">Angefragt: {{ row.requested_model }}</span>
+                  {% if row.routed_model != row.requested_model %}
+                    <span class="activity-inbound">An Provider gesendet: <code>{{ row.routed_model }}</code></span>
+                  {% endif %}
+                </td>
+                <td class="activity-token-cell">
+                  <strong>{{ row.outcome_label }}</strong>
+                </td>
+              </tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  {% endif %}
+
   {% if activity.requests %}
     <div class="activity-request-list">
       <div class="activity-request-list-heading">

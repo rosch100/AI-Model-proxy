@@ -344,8 +344,10 @@ def _validate_no_unprotected_admin_routes(server_body: str) -> None:
                 f"Nginx {directive} directives prevent proving admin isolation."
             )
         if directive == "include":
-            include_path = " ".join(values)
-            if include_path != str(NGINX_LOCATION_CONFIG):
+            if values not in (
+                (str(NGINX_LOCATION_CONFIG),),
+                ("/etc/letsencrypt/options-ssl-nginx.conf",),
+            ):
                 raise ValueError(
                     "External Nginx includes prevent proving admin route isolation."
                 )
@@ -359,8 +361,21 @@ def _validate_no_unprotected_admin_routes(server_body: str) -> None:
                 )
 
 
+def _proxies_to_flask(
+    statements: Sequence[tuple[int, int, tuple[str, ...], bool]],
+) -> bool:
+    """Identify the Flask upstream, including URI suffixes for later validation."""
+    return any(
+        not is_block
+        and len(arguments) == 2
+        and arguments[0] == "proxy_pass"
+        and re.match(r"^http://127\.0\.0\.1:5000(?:$|[/?#])", arguments[1])
+        for _, _, arguments, is_block in statements
+    )
+
+
 def _validate_unique_active_proxy_server(config: str, site_path: Path) -> None:
-    """Require one active proxy host block from the exact managed file content."""
+    """Require one active Flask proxy block from the exact managed file content."""
     sections = re.split(r"(?m)^# configuration file (.+):\s*$", config)
     expected_content = site_path.read_text(encoding="utf-8").strip("\n")
     if sections[0].strip():
@@ -390,9 +405,10 @@ def _validate_unique_active_proxy_server(config: str, site_path: Path) -> None:
             opening = section.find("{", offset)
             end = _nginx_block_end(section, opening)
             body = section[opening + 1 : end - 1]
+            statements = _nginx_statements(body)
             server_names = (
                 name
-                for depth, _, statement, is_block_statement in _nginx_statements(body)
+                for depth, _, statement, is_block_statement in statements
                 if depth == 0
                 and not is_block_statement
                 and statement[0] == "server_name"
@@ -400,7 +416,7 @@ def _validate_unique_active_proxy_server(config: str, site_path: Path) -> None:
             )
             if any(
                 name.casefold() == PROXY_HOSTNAME.casefold() for name in server_names
-            ):
+            ) and _proxies_to_flask(statements):
                 matching_sources.append(source_path.resolve())
 
     if (
@@ -409,7 +425,7 @@ def _validate_unique_active_proxy_server(config: str, site_path: Path) -> None:
         or managed_sections[0].strip() != expected_content
     ):
         raise DeploymentError(
-            "Expected exactly one active proxy.altanis.de server block "
+            "Expected exactly one active proxy.altanis.de Flask proxy server block "
             f"from the unmodified {site_path} configuration."
         )
 
@@ -441,11 +457,13 @@ def insert_admin_locations(site_config: str) -> str:
             if depth == 0 and not is_block and arguments[0] == "server_name"
             for name in arguments[1:]
         )
-        if PROXY_HOSTNAME in server_names:
+        if any(
+            name.casefold() == PROXY_HOSTNAME.casefold() for name in server_names
+        ) and _proxies_to_flask(statements):
             _validate_no_unprotected_admin_routes(body)
             matching_blocks.append((opening, body, statements))
     if len(matching_blocks) != 1:
-        raise ValueError("Expected exactly one server block for proxy.altanis.de.")
+        raise ValueError("Expected exactly one Flask proxy server block for proxy.altanis.de.")
 
     opening, body, statements = matching_blocks[0]
     catch_all = []
@@ -473,7 +491,9 @@ def insert_admin_locations(site_config: str) -> str:
     existing_includes = [
         (offset, arguments)
         for depth, offset, arguments, is_block in statements
-        if depth == 0 and not is_block and arguments[0] == "include"
+        if depth == 0
+        and not is_block
+        and arguments == ("include", str(NGINX_LOCATION_CONFIG))
     ]
     marker = "proxy-altanis-admin-iwa-locations.conf"
     if len(existing_includes) > 1 or (
@@ -789,6 +809,7 @@ def _require_host_identity() -> None:
 
 
 def _verify_keytab(path: Path, principal: str) -> None:
+    """Check credentials using a principal matching the AD account userPrincipalName."""
     with tempfile.TemporaryDirectory(
         prefix="proxy-admin-iwa-", dir="/run"
     ) as cache_dir:

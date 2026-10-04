@@ -17,14 +17,14 @@ Ein providerneutraler Klassifikationsvertrag liefert eine Kategorie und optional
 
 - `quota_exhausted`: eindeutiges, strukturiertes und dauerhaftes Budget-/Quota-Signal; öffnet den langlebigen Breaker.
 - `transient`: vorübergehendes Rate-Limit, In-flight-Budget oder Kapazitätsfehler; öffnet keinen langlebigen Quota-Breaker und folgt der bestehenden kurzen Retry-/Failover-Policy.
-- `terminal` und `unknown`: bestehende Fehler- und Failover-Regeln bleiben erhalten. Unbekannte oder mehrdeutige Fehler werden niemals als Quota-Erschöpfung geraten.
+- `terminal` und `unknown`: Die Fehler bleiben terminal/unknown für Breaker- und Klassifikationszwecke; bei einem HTTP-Status 402 darf die laufende Anfrage vor sichtbarer Ausgabe trotzdem zum nächsten konfigurierten Providerprofil kaskadieren. Ein 402 allein öffnet keinen Breaker. Andere terminale Fehler bleiben ohne Failover.
 
 Provideradapter ordnen ausschließlich dokumentierte, strukturierte Fehlercodes/-felder zu. Freitext/Fehlermeldungen dienen nicht zur Klassifikation. HTTP-Status allein reicht nicht aus. Dieselbe Klassifikation gilt für HTTP-Fehler und strukturierte SSE-Fehler. Fehlerdetails und Credentials werden weder persistiert noch in den Clientfehler gespiegelt.
 
 ### Providerregeln
 
 - **OpenAI:** Exakte Budgetcodes wie `credit_balance_exhausted`, `organization_spend_limit_exceeded`, `project_spend_limit_exceeded` und `organization_usage_limit_exceeded` gelten als `quota_exhausted`. Das historische strukturierte `insufficient_quota` gilt ebenfalls als Quota-Signal. Normales Request-/Token-Rate-Limit ist transient.
-- **OpenRouter:** Nur ein expliziter Key-Limit-Marker wie `error.metadata.limit_source=openrouter_key_limit` gilt als `quota_exhausted`. `openrouter_in_flight_budget` ist transient und verwendet einen gültigen `Retry-After`-Hinweis. Ein allgemeiner Credit-/402-Fehler ohne eindeutigen Key-Limit-Marker bleibt mehrdeutig und öffnet keinen Breaker.
+- **OpenRouter:** Nur ein expliziter Key-Limit-Marker wie `error.metadata.limit_source=openrouter_key_limit` gilt als `quota_exhausted`. `openrouter_in_flight_budget` ist transient und verwendet einen gültigen `Retry-After`-Hinweis. Ein allgemeiner Credit-/402-Fehler ohne eindeutigen Key-Limit-Marker bleibt mehrdeutig und öffnet keinen Breaker; vor sichtbarer Ausgabe kaskadiert die Anfrage zum nächsten konfigurierten Profil.
 - **Azure:** Allgemeine 429-, `rate_limit_exceeded`-, TPM/RPM- und Kapazitätsfehler sind transient; sie öffnen keine langlebige Quota-Sperre. Nur ein künftig belegbares, explizites Budgetsignal darf als `quota_exhausted` ergänzt werden.
 - **Zukünftige Provider:** Sie integrieren sich über denselben Klassifikationsvertrag. Ohne explizite dokumentierte Quota-Regel wird ein Fehler nicht als langlebige Quota-Sperre behandelt.
 
@@ -52,7 +52,7 @@ Die echte Half-open-Nutzeranfrage schließt den Breaker bei bestandenem begrenzt
 
 Ein geblockter Provider wird vor jedem Upstreamaufruf übersprungen. Nicht gesperrte Kandidaten und bestehendes Failover-Verhalten bleiben unverändert. Falls alle Kandidaten gesperrt oder gerade exklusiv probe-belegt sind, antwortet der Proxy ohne Upstreamaufruf mit einem secretfreien `503` und `Retry-After` bis zum frühesten sinnvollen erneuten Prüfzeitpunkt. Gibt es parallel noch einen freien Kandidaten, wird dieser normal versucht; kein gesperrter Provider wird dabei vor seiner Probezeit aufgerufen.
 
-Gewöhnliche transiente 429-/503-Fehler bleiben konzeptionell getrennt von der langlebigen Quota-Sperre und folgen der bestehenden kurzen Retry-/Failover-Policy. Bekannte transiente Fälle, darunter OpenRouter-In-Flight-Budget mit 402 plus Retry-After, müssen die providerseitige Wartezeit respektieren, ohne als dauerhafte Quota-Sperre behandelt zu werden.
+Gewöhnliche transiente 429-/503-Fehler bleiben konzeptionell getrennt von der langlebigen Quota-Sperre und folgen der bestehenden kurzen Retry-/Failover-Policy. HTTP-/SSE-402-Fehler, darunter OpenRouter-In-Flight-Budget mit Retry-After, kaskadieren vor sichtbarer Ausgabe zum nächsten Profil, ohne als dauerhafte Quota-Sperre behandelt zu werden. Ein Retry-After-Hinweis wird sicher an den Client weitergegeben, falls die Kaskade erschöpft ist.
 
 ### Dashboard
 

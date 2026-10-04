@@ -463,7 +463,9 @@ def insert_admin_locations(site_config: str) -> str:
             _validate_no_unprotected_admin_routes(body)
             matching_blocks.append((opening, body, statements))
     if len(matching_blocks) != 1:
-        raise ValueError("Expected exactly one Flask proxy server block for proxy.altanis.de.")
+        raise ValueError(
+            "Expected exactly one Flask proxy server block for proxy.altanis.de."
+        )
 
     opening, body, statements = matching_blocks[0]
     catch_all = []

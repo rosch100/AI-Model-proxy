@@ -212,7 +212,10 @@ class ProxyAdminIwaDeploymentTests(unittest.TestCase):
             NGINX_REDIRECT_SITE + NGINX_TLS_SITE,
             NGINX_TLS_SITE + NGINX_REDIRECT_SITE,
         ):
-            with self.subTest(original=original), tempfile.TemporaryDirectory() as directory:
+            with (
+                self.subTest(original=original),
+                tempfile.TemporaryDirectory() as directory,
+            ):
                 configured = insert_admin_locations(original)
                 include = "    include /etc/nginx/snippets/proxy-altanis-admin-iwa-locations.conf;\n"
                 self.assertEqual(configured.count(include), 1)
@@ -235,7 +238,9 @@ class ProxyAdminIwaDeploymentTests(unittest.TestCase):
         ):
             with self.subTest(path=path), self.assertRaises(ValueError):
                 insert_admin_locations(
-                    NGINX_TLS_SITE.replace("/etc/letsencrypt/options-ssl-nginx.conf", path)
+                    NGINX_TLS_SITE.replace(
+                        "/etc/letsencrypt/options-ssl-nginx.conf", path
+                    )
                 )
 
     def test_multiline_admin_location_is_rejected(self):
@@ -293,7 +298,9 @@ class ProxyAdminIwaDeploymentTests(unittest.TestCase):
                 f"# configuration file {site_path}:\n{NGINX_SITE}"
             )
             _validate_unique_active_proxy_server(active_config, site_path)
-            duplicate_content = NGINX_SITE.replace("proxy.altanis.de", "PROXY.ALTANIS.DE")
+            duplicate_content = NGINX_SITE.replace(
+                "proxy.altanis.de", "PROXY.ALTANIS.DE"
+            )
             duplicate_path = Path(directory) / "conf.d" / "duplicate.conf"
             duplicate_path.write_text(duplicate_content, encoding="utf-8")
             duplicate_active_config = (

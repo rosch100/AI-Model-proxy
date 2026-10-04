@@ -103,6 +103,7 @@ class TestConfig:
 
     def test_env_example_loads(self, monkeypatch):
         """Patch Env.read_env to read from .env.example and import settings."""
+        monkeypatch.delenv("SERVICE_API_KEY", raising=False)
         orig_read_env = environs.Env.read_env
         monkeypatch.setattr(
             environs.Env,

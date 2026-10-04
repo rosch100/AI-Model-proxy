@@ -9,7 +9,6 @@ from app.exceptions import ServiceConfigurationError
 from app.tenants import (
     TenantConfig,
     hash_api_key,
-    legacy_sha256_api_key_hash,
     parse_auth_mode,
     parse_tenants,
     resolve_tenant_for_api_key,
@@ -307,24 +306,20 @@ def test_create_app_accepts_tenant_mode_without_service_api_key(monkeypatch):
     assert app.config["TENANTS"][0].id == "acme"
 
 
-def test_hash_api_key_uses_scrypt_and_still_accepts_legacy_sha256():
-    """New digests are scrypt, while stored SHA-256 digests still authenticate."""
+def test_hash_api_key_is_sha256_and_resolves_tenant():
+    """Use standard SHA-256 for high-entropy bearer keys and resolve consistently."""
     api_key = "correct-key"
-    current = hash_api_key(api_key)
-    legacy = legacy_sha256_api_key_hash(api_key)
+    digest = hash_api_key(api_key)
 
-    assert current != legacy
-    assert len(current) == 64
-    assert all(char in "0123456789abcdef" for char in current)
-    # FIPS 180-4 vector, plus the historical digest of this bearer token.
-    assert legacy_sha256_api_key_hash("abc") == (
-        "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+    assert digest == (
+        "ddb0fd2dede48502669718e09ef1447dba46f3d3822e9fbf05af11d874a0f23b"
     )
-    assert legacy == "ddb0fd2dede48502669718e09ef1447dba46f3d3822e9fbf05af11d874a0f23b"
+    assert len(digest) == 64
+    assert all(char in "0123456789abcdef" for char in digest)
 
     tenant = TenantConfig(
         id="acme",
-        api_key_hash=legacy,
+        api_key_hash=digest,
         azure_base_url="https://acme.openai.azure.com",
         azure_api_key="azure-secret",
         azure_model_deployments={"gpt-5.4": "acme-gpt54"},

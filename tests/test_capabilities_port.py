@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import importlib.util
 from pathlib import Path
+from unittest.mock import patch
 
 
 def _load_script():
@@ -35,7 +36,10 @@ def test_find_free_port_binds_loopback_only():
         def getsockname(self):
             return ("127.0.0.1", 9)
 
-    module.socket.socket = lambda *_args, **_kwargs: _Socket()
-
-    assert module.find_free_port() == 9
+    with patch.object(
+        module.socket,
+        "socket",
+        side_effect=lambda *_args, **_kwargs: _Socket(),
+    ):
+        assert module.find_free_port() == 9
     assert bound["address"] == ("127.0.0.1", 0)

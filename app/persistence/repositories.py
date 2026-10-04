@@ -17,8 +17,7 @@ from app.tenants import (
     DatabaseTenantRoutingSnapshot,
     DatabaseTenantSnapshot,
     TenantConfig,
-    api_key_lookup_digests,
-    matching_api_key_hash,
+    hash_api_key,
 )
 
 from .models import ProviderCatalogEntry, ProviderProfile, Tenant
@@ -70,22 +69,6 @@ def validate_routed_profile(
                 raise ValueError(f"Provider setting {key} must be a string")
 
 
-def _upgrade_matched_api_key_hash(
-    tenant: Tenant | None, current: str, legacy: str
-) -> Tenant | None:
-    """Keep a legacy SHA-256 digest working and replace it with scrypt."""
-    if tenant is None:
-        return None
-    upgraded = matching_api_key_hash(tenant.api_key_hash, current, legacy)
-    if upgraded is None:
-        return None
-    if len(tenant.api_key_hash) != len(upgraded) or not hmac.compare_digest(
-        tenant.api_key_hash, upgraded
-    ):
-        tenant.api_key_hash = upgraded
-    return tenant
-
-
 class TenantRepository:
     """Resolve tenant identities and read tenant-owned configuration."""
 
@@ -95,17 +78,19 @@ class TenantRepository:
 
     def get_by_api_key(self, api_key: str) -> Tenant | None:
         """Resolve a tenant using the digest of a presented Cursor API key."""
-        current, legacy = api_key_lookup_digests(api_key)
+        digest = hash_api_key(api_key)
         tenant = self._session.scalar(
-            select(Tenant).where(Tenant.api_key_hash.in_((current, legacy)))
+            select(Tenant).where(Tenant.api_key_hash == digest)
         )
-        return _upgrade_matched_api_key_hash(tenant, current, legacy)
+        if tenant is None or not hmac.compare_digest(tenant.api_key_hash, digest):
+            return None
+        return tenant
 
     def get_proxy_snapshot_by_api_key(
         self, api_key: str, cipher: SecretCipher
     ) -> DatabaseTenantRoutingSnapshot | None:
         """Read identity, ordered route, and validation catalogs in one statement."""
-        current, legacy = api_key_lookup_digests(api_key)
+        digest = hash_api_key(api_key)
         rows = self._session.execute(
             select(Tenant, ProviderProfile, ProviderCatalogEntry)
             .outerjoin(
@@ -118,14 +103,14 @@ class TenantRepository:
                 ProviderCatalogEntry,
                 ProviderCatalogEntry.profile_id == ProviderProfile.id,
             )
-            .where(Tenant.api_key_hash.in_((current, legacy)))
+            .where(Tenant.api_key_hash == digest)
             .order_by(ProviderProfile.route_priority, ProviderCatalogEntry.id)
             .execution_options(populate_existing=True)
         ).all()
         if not rows:
             return None
-        tenant = _upgrade_matched_api_key_hash(rows[0][0], current, legacy)
-        if tenant is None:
+        tenant = rows[0][0]
+        if not hmac.compare_digest(tenant.api_key_hash, digest):
             return None
 
         catalogs: dict[str, list[tuple[str, str | None]]] = {}

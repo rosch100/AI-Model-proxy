@@ -19,16 +19,7 @@ TENANT_CONFIG_DATABASE = "database"
 VALID_AUTH_MODES = frozenset({AUTH_MODE_SINGLE, AUTH_MODE_TENANT})
 
 _PLACEHOLDER_AZURE_API_KEYS = frozenset({"change_me", "change-me"})
-_API_KEY_HASH_HEX_LENGTH = 64
-# Cost parameters for newly stored API-key digests. N=2**14 is the lowest
-# power of two that is still expensive relative to a single SHA-256.
-_SCRYPT_N = 2**14
-_SCRYPT_R = 8
-_SCRYPT_P = 1
-_SCRYPT_DKLEN = 32
-# Deterministic salt so a digest remains a lookup key. Cursor API keys are
-# 256-bit bearer tokens, not low-entropy passwords.
-_SCRYPT_SALT = b"ai-model-proxy.api-key.v1"
+_SHA256_HEX_LENGTH = 64
 
 
 @dataclass(frozen=True)
@@ -111,174 +102,10 @@ class DatabaseTenantRoutingSnapshot:
 
 
 def hash_api_key(api_key: str) -> str:
-    """Return the scrypt hex digest stored for a newly issued API key."""
-    digest = hashlib.scrypt(
-        api_key.encode("utf-8"),
-        salt=_SCRYPT_SALT,
-        n=_SCRYPT_N,
-        r=_SCRYPT_R,
-        p=_SCRYPT_P,
-        dklen=_SCRYPT_DKLEN,
-    )
-    return digest.hex()
-
-
-def legacy_sha256_api_key_hash(api_key: str) -> str:
-    """Return the historical SHA-256 hex digest of an API key.
-
-    Rows and TENANTS entries created before scrypt still store this form.
-    Verification accepts it; database lookups upgrade it to :func:`hash_api_key`
-    when the session can be written. Environment-configured tenants are not
-    rewritten because that configuration is not persisted by the process.
-    """
-    return _sha256_hex(api_key.encode("utf-8"))
-
-
-def _rotr(value: int, bits: int) -> int:
-    """Rotate a 32-bit word right."""
-    return ((value >> bits) | (value << (32 - bits))) & 0xFFFFFFFF
-
-
-# SHA-256 round constants (FIPS 180-4). Used only to recognize digests that
-# were stored before scrypt; new digests go through hash_api_key.
-_SHA256_K = (
-    0x428A2F98,
-    0x71374491,
-    0xB5C0FBCF,
-    0xE9B5DBA5,
-    0x3956C25B,
-    0x59F111F1,
-    0x923F82A4,
-    0xAB1C5ED5,
-    0xD807AA98,
-    0x12835B01,
-    0x243185BE,
-    0x550C7DC3,
-    0x72BE5D74,
-    0x80DEB1FE,
-    0x9BDC06A7,
-    0xC19BF174,
-    0xE49B69C1,
-    0xEFBE4786,
-    0x0FC19DC6,
-    0x240CA1CC,
-    0x2DE92C6F,
-    0x4A7484AA,
-    0x5CB0A9DC,
-    0x76F988DA,
-    0x983E5152,
-    0xA831C66D,
-    0xB00327C8,
-    0xBF597FC7,
-    0xC6E00BF3,
-    0xD5A79147,
-    0x06CA6351,
-    0x14292967,
-    0x27B70A85,
-    0x2E1B2138,
-    0x4D2C6DFC,
-    0x53380D13,
-    0x650A7354,
-    0x766A0ABB,
-    0x81C2C92E,
-    0x92722C85,
-    0xA2BFE8A1,
-    0xA81A664B,
-    0xC24B8B70,
-    0xC76C51A3,
-    0xD192E819,
-    0xD6990624,
-    0xF40E3585,
-    0x106AA070,
-    0x19A4C116,
-    0x1E376C08,
-    0x2748774C,
-    0x34B0BCB5,
-    0x391C0CB3,
-    0x4ED8AA4A,
-    0x5B9CCA4F,
-    0x682E6FF3,
-    0x748F82EE,
-    0x78A5636F,
-    0x84C87814,
-    0x8CC70208,
-    0x90BEFFFA,
-    0xA4506CEB,
-    0xBEF9A3F7,
-    0xC67178F2,
-)
-
-
-def _sha256_hex(data: bytes) -> str:
-    """Return the SHA-256 hex digest of ``data`` (FIPS 180-4)."""
-    bit_length = len(data) * 8
-    padded = data + b"\x80"
-    padded += b"\x00" * ((56 - len(padded) % 64) % 64)
-    padded += bit_length.to_bytes(8, "big")
-
-    state = [
-        0x6A09E667,
-        0xBB67AE85,
-        0x3C6EF372,
-        0xA54FF53A,
-        0x510E527F,
-        0x9B05688C,
-        0x1F83D9AB,
-        0x5BE0CD19,
-    ]
-    for offset in range(0, len(padded), 64):
-        block = padded[offset : offset + 64]
-        words = [
-            int.from_bytes(block[index : index + 4], "big") for index in range(0, 64, 4)
-        ]
-        for index in range(16, 64):
-            first = words[index - 15]
-            second = words[index - 2]
-            small0 = _rotr(first, 7) ^ _rotr(first, 18) ^ (first >> 3)
-            small1 = _rotr(second, 17) ^ _rotr(second, 19) ^ (second >> 10)
-            words.append(
-                (words[index - 16] + small0 + words[index - 7] + small1) & 0xFFFFFFFF
-            )
-        a, b, c, d, e, f, g, h = state
-        for index, word in enumerate(words):
-            sigma1 = _rotr(e, 6) ^ _rotr(e, 11) ^ _rotr(e, 25)
-            choose = (e & f) ^ ((~e) & g)
-            temp1 = (h + sigma1 + choose + _SHA256_K[index] + word) & 0xFFFFFFFF
-            sigma0 = _rotr(a, 2) ^ _rotr(a, 13) ^ _rotr(a, 22)
-            majority = (a & b) ^ (a & c) ^ (b & c)
-            temp2 = (sigma0 + majority) & 0xFFFFFFFF
-            h = g
-            g = f
-            f = e
-            e = (d + temp1) & 0xFFFFFFFF
-            d = c
-            c = b
-            b = a
-            a = (temp1 + temp2) & 0xFFFFFFFF
-        state = [
-            (left + right) & 0xFFFFFFFF
-            for left, right in zip(state, (a, b, c, d, e, f, g, h))
-        ]
-    return "".join(f"{word:08x}" for word in state)
-
-
-def api_key_lookup_digests(api_key: str) -> tuple[str, str]:
-    """Return ``(scrypt, legacy SHA-256)`` digests for one presented API key."""
-    return hash_api_key(api_key), legacy_sha256_api_key_hash(api_key)
-
-
-def _digest_matches(candidate: str, stored_hash: str) -> bool:
-    folded = stored_hash.casefold()
-    if len(candidate) != len(folded):
-        return False
-    return hmac.compare_digest(candidate, folded)
-
-
-def matching_api_key_hash(stored_hash: str, current: str, legacy: str) -> str | None:
-    """Return the scrypt digest when ``stored_hash`` matches either algorithm."""
-    if _digest_matches(current, stored_hash) or _digest_matches(legacy, stored_hash):
-        return current
-    return None
+    """Return the SHA-256 hex digest of a high-entropy bearer API key."""
+    # Cursor API keys are generated as 256-bit random bearer tokens, not passwords.
+    # codeql[py/weak-sensitive-data-hashing]
+    return hashlib.sha256(api_key.encode("utf-8")).hexdigest()
 
 
 def parse_auth_mode(raw_mode: str | None) -> str:
@@ -319,10 +146,10 @@ def resolve_tenant_for_api_key(
     api_key: str, tenants: tuple[TenantConfig, ...]
 ) -> TenantConfig | None:
     """Match an API key against tenant digests with constant-time compares."""
-    current, legacy = api_key_lookup_digests(api_key)
+    digest = hash_api_key(api_key)
     matched: TenantConfig | None = None
     for tenant in tenants:
-        if matching_api_key_hash(tenant.api_key_hash, current, legacy) is not None:
+        if hmac.compare_digest(digest, tenant.api_key_hash):
             matched = tenant
     return matched
 
@@ -355,7 +182,7 @@ def _parse_tenant_entry(entry: Any, index: int) -> TenantConfig:
 
     tenant_id = _required_nonempty_str(entry, "id", index)
     api_key_hash = _required_nonempty_str(entry, "api_key_hash", index).casefold()
-    if len(api_key_hash) != _API_KEY_HASH_HEX_LENGTH or any(
+    if len(api_key_hash) != _SHA256_HEX_LENGTH or any(
         char not in "0123456789abcdef" for char in api_key_hash
     ):
         raise ServiceConfigurationError(

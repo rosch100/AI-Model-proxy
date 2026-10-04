@@ -20,7 +20,7 @@ from app.persistence.database import Database
 from app.persistence.models import Base, ProviderCatalogEntry, ProviderProfile, Tenant
 from app.persistence.repositories import TenantRepository, import_tenants
 from app.persistence.secrets import SecretCipher
-from app.tenants import TenantConfig, hash_api_key, legacy_sha256_api_key_hash
+from app.tenants import TenantConfig
 
 
 def test_database_requires_postgresql_url_and_encryption_key():
@@ -210,8 +210,8 @@ def test_persistence_schema_defines_tenant_and_provider_tables():
     }.issubset(Base.metadata.tables)
 
 
-def test_tenant_repository_resolves_only_the_api_key_digest():
-    """Cursor bearer credentials resolve a tenant without storing plaintext."""
+def test_tenant_repository_resolves_sha256_api_key_digest_without_mutation():
+    """Resolve the digest while keeping the persisted high-entropy token hash stable."""
     engine = create_engine("sqlite:///:memory:")
     Base.metadata.create_all(engine)
     with Session(engine) as session:
@@ -227,9 +227,10 @@ def test_tenant_repository_resolves_only_the_api_key_digest():
 
         assert resolved is not None
         assert resolved.id == "acme"
-        assert resolved.api_key_hash == hash_api_key("cursor-key")
-        assert resolved.api_key_hash != legacy_sha256_api_key_hash("cursor-key")
+        assert resolved.api_key_hash == hashlib.sha256(b"cursor-key").hexdigest()
         assert TenantRepository(session).get_by_api_key("wrong-key") is None
+        session.refresh(tenant)
+        assert tenant.api_key_hash == hashlib.sha256(b"cursor-key").hexdigest()
     engine.dispose()
 
 

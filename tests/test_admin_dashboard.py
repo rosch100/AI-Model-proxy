@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 import secrets
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
@@ -106,6 +107,23 @@ def test_dashboard_shows_status_for_each_same_provider_account(admin_app):
                     route_priority=2,
                     inference_secret_ciphertext="encrypted-backup",
                 ),
+                ProviderProfile(
+                    id="openai-disabled-dashboard",
+                    tenant_id="acme",
+                    provider="openai",
+                    display_name="Disabled OpenAI",
+                    settings={},
+                    default_model="gpt-5.4",
+                    inference_secret_ciphertext="encrypted-disabled",
+                ),
+                ProviderProfile(
+                    id="openai-incomplete-dashboard",
+                    tenant_id="acme",
+                    provider="openai",
+                    display_name="Incomplete OpenAI",
+                    settings={},
+                    default_model=None,
+                ),
             )
         )
 
@@ -115,10 +133,32 @@ def test_dashboard_shows_status_for_each_same_provider_account(admin_app):
     assert response.status_code == 200
     assert 'data-provider-account="openai-primary-dashboard"' in body
     assert 'data-provider-account="openai-backup-dashboard"' in body
+    assert 'data-provider-account="openai-disabled-dashboard"' in body
+    assert 'data-provider-account="openai-incomplete-dashboard"' in body
     assert "Primary OpenAI" in body
     assert "Backup OpenAI" in body
+    assert "Disabled OpenAI" in body
+    assert "Incomplete OpenAI" in body
     assert "Position 1" in body
     assert "Position 2" in body
+    disabled_card = re.search(
+        r'<li class="provider-status-card[^\"]*" '
+        r'data-provider-account="openai-disabled-dashboard">([\s\S]*?)</li>',
+        body,
+    )
+    incomplete_card = re.search(
+        r'<li class="provider-status-card[^\"]*" '
+        r'data-provider-account="openai-incomplete-dashboard">([\s\S]*?)</li>',
+        body,
+    )
+    assert disabled_card is not None
+    assert 'class="provider-status-indicator is-disabled"' in disabled_card.group(1)
+    assert incomplete_card is not None
+    assert 'class="provider-status-indicator needs-attention"' in incomplete_card.group(
+        1
+    )
+    assert "Deaktiviert · nicht in der Anfragenreihenfolge" in disabled_card.group(1)
+    assert "Einrichtung prüfen" in incomplete_card.group(1)
 
 
 def test_dashboard_explains_missing_cost_configuration(admin_app):

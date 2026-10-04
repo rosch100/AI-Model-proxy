@@ -95,7 +95,7 @@ def _route_targets(
     inbound_model: object,
     custom_model_id: str,
 ) -> tuple[tuple[DatabaseTenantSnapshot, str], ...]:
-    """Resolve native models to their provider first, then configure fallbacks."""
+    """Resolve each profile target while preserving the configured route priority."""
     if not isinstance(inbound_model, str) or not inbound_model:
         raise ServiceConfigurationError(
             "Request model must match the tenant's Cursor model ID."
@@ -126,10 +126,8 @@ def _route_targets(
             raise ServiceConfigurationError(
                 "The active provider profile has no default model configured."
             )
-        targets.append((profile, target, target.casefold() == requested_model))
-    if requested_model is not None:
-        targets.sort(key=lambda item: not item[2])
-    return tuple((profile, target) for profile, target, _matches in targets)
+        targets.append((profile, target))
+    return tuple(targets)
 
 
 def _forward_profile(

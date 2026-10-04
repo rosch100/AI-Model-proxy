@@ -52,7 +52,7 @@ NGINX_REDIRECT_SITE = """server {
     listen 80;
     server_name proxy.altanis.de;
     if ($host = proxy.altanis.de) {
-        return 301 https://$host$request_uri;
+        return 301 https://proxy.altanis.de$request_uri;
     }
     return 404;
 }
@@ -325,6 +325,308 @@ class ProxyAdminIwaDeploymentTests(unittest.TestCase):
             spoof_config = f"# configuration file {spoof_path}:\n{spoof_content}"
             with self.assertRaises(DeploymentError):
                 _validate_unique_active_proxy_server(spoof_config, site_path)
+
+            alternate_upstream = NGINX_SITE.replace(
+                "http://127.0.0.1:5000", "http://127.0.0.1:9999"
+            )
+            alternate_path = Path(directory) / "conf.d" / "alternate.conf"
+            alternate_path.write_text(alternate_upstream, encoding="utf-8")
+            alternate_config = (
+                active_config
+                + f"# configuration file {alternate_path}:\n{alternate_upstream}"
+            )
+            with self.assertRaises(DeploymentError):
+                _validate_unique_active_proxy_server(alternate_config, site_path)
+
+    def test_unrelated_map_regex_does_not_block_active_proxy_validation(self):
+        """Allow regex escapes in unrelated Nginx blocks outside the proxy vhost."""
+        with tempfile.TemporaryDirectory() as directory:
+            site_path = Path(directory) / "sites-available" / "proxy.altanis.de"
+            site_path.parent.mkdir()
+            config = "map $uri $is_php { ~\\\\.php$ 1; }\n" + NGINX_SITE
+            site_path.write_text(config, encoding="utf-8")
+            active_config = f"# configuration file {site_path}:\n{config}"
+
+            _validate_unique_active_proxy_server(active_config, site_path)
+            configured = insert_admin_locations(config)
+            self.assertIn("~\\\\.php$", configured)
+            self.assertIn("include /etc/nginx/snippets/", configured)
+
+    def test_line_continuation_cannot_hide_competing_server_block(self):
+        """Reject Nginx line continuations used to hide active directives."""
+        hidden_server = NGINX_SITE.rstrip() + (
+            " serv\\\ner { server_name proxy.altanis.de; "
+            "location / { proxy_pass http://127.0.0.1:9999; } }"
+        )
+        with self.assertRaises(ValueError):
+            insert_admin_locations(hidden_server)
+
+    def test_wildcard_and_regex_server_names_are_competing_vhosts(self):
+        """Reject wildcard/regex host matches that can route proxy traffic."""
+        competing_names = (
+            "*.altanis.de",
+            ".altanis.de",
+            r"~^proxy\.altanis\.de$",
+            r"~^PROXY\.ALTANIS\.DE$",
+            r"\~^proxy\.altanis\.de$",
+        )
+        for server_name in competing_names:
+            with self.subTest(server_name=server_name):
+                competing = (
+                    f"server {{ listen 8443; server_name {server_name}; "
+                    "location / { proxy_pass http://127.0.0.1:9999; } }"
+                )
+                with tempfile.TemporaryDirectory() as directory:
+                    site_path = Path(directory) / "sites-available" / "proxy.altanis.de"
+                    other_path = Path(directory) / "conf.d" / "competing.conf"
+                    site_path.parent.mkdir()
+                    other_path.parent.mkdir()
+                    site_path.write_text(NGINX_SITE, encoding="utf-8")
+                    other_path.write_text(competing, encoding="utf-8")
+                    active_config = (
+                        f"# configuration file {site_path}:\n{NGINX_SITE}"
+                        f"# configuration file {other_path}:\n{competing}"
+                    )
+                    with self.assertRaises(DeploymentError):
+                        _validate_unique_active_proxy_server(active_config, site_path)
+                    with self.assertRaises(ValueError):
+                        insert_admin_locations(NGINX_SITE + competing)
+
+    def test_stream_default_server_does_not_block_proxy_validation(self):
+        """Ignore stream-layer servers when validating HTTP virtual hosts."""
+        stream_config = (
+            "stream { server { listen 3306; " "proxy_pass 127.0.0.1:3307; } }"
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            site_path = Path(directory) / "sites-available" / "proxy.altanis.de"
+            stream_path = Path(directory) / "stream.conf"
+            site_path.parent.mkdir()
+            site_path.write_text(NGINX_TLS_SITE, encoding="utf-8")
+            stream_path.write_text(stream_config, encoding="utf-8")
+            active_config = (
+                f"# configuration file {site_path}:\n{NGINX_TLS_SITE}"
+                f"# configuration file {stream_path}:\n{stream_config}"
+            )
+            _validate_unique_active_proxy_server(active_config, site_path)
+
+    def test_stream_ipv6_equivalent_address_cannot_share_managed_listener(self):
+        """Canonicalize IPv6 literals before checking listener overlap."""
+        managed_site = NGINX_TLS_SITE.replace(
+            "listen 443 ssl;", "listen [2001:db8::1]:443 ssl;"
+        )
+        stream_config = (
+            "stream { server { listen [2001:0db8:0:0:0:0:0:1]:443 reuseport; "
+            "proxy_pass 127.0.0.1:3307; } }"
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            site_path = Path(directory) / "sites-available" / "proxy.altanis.de"
+            stream_path = Path(directory) / "stream.conf"
+            site_path.parent.mkdir()
+            site_path.write_text(managed_site, encoding="utf-8")
+            stream_path.write_text(stream_config, encoding="utf-8")
+            active_config = (
+                f"# configuration file {site_path}:\n{managed_site}"
+                f"# configuration file {stream_path}:\n{stream_config}"
+            )
+            with self.assertRaises(DeploymentError):
+                _validate_unique_active_proxy_server(active_config, site_path)
+
+    def test_stream_reuseport_cannot_share_managed_http_listener(self):
+        """Reject non-HTTP listeners that overlap the protected proxy socket."""
+        managed_site = NGINX_TLS_SITE.replace(
+            "listen 443 ssl;", "listen 443 ssl reuseport;"
+        )
+        stream_config = (
+            "stream { server { listen 443 reuseport; " "proxy_pass 127.0.0.1:3307; } }"
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            site_path = Path(directory) / "sites-available" / "proxy.altanis.de"
+            stream_path = Path(directory) / "stream.conf"
+            site_path.parent.mkdir()
+            site_path.write_text(managed_site, encoding="utf-8")
+            stream_path.write_text(stream_config, encoding="utf-8")
+            active_config = (
+                f"# configuration file {site_path}:\n{managed_site}"
+                f"# configuration file {stream_path}:\n{stream_config}"
+            )
+            with self.assertRaises(DeploymentError):
+                _validate_unique_active_proxy_server(active_config, site_path)
+
+    def test_catch_all_server_on_separate_listener_is_rejected(self):
+        """Reject unprotected catch-all servers on nonstandard proxy ports."""
+        with tempfile.TemporaryDirectory() as directory:
+            site_path = Path(directory) / "sites-available" / "proxy.altanis.de"
+            other_path = Path(directory) / "conf.d" / "default.conf"
+            site_path.parent.mkdir()
+            other_path.parent.mkdir()
+            site_path.write_text(NGINX_TLS_SITE, encoding="utf-8")
+            catch_all_servers = (
+                "server { listen 8443 default_server; "
+                "location / { proxy_pass http://127.0.0.1:9999; } }",
+                "server { listen 8443 default_server; "
+                "server_name unrelated.example; "
+                "location / { proxy_pass http://127.0.0.1:9999; } }",
+            )
+            site_path.write_text(NGINX_TLS_SITE, encoding="utf-8")
+            for catch_all in catch_all_servers:
+                with self.subTest(catch_all=catch_all):
+                    other_path.write_text(catch_all, encoding="utf-8")
+                    active_config = (
+                        f"# configuration file {site_path}:\n{NGINX_TLS_SITE}"
+                        f"# configuration file {other_path}:\n{catch_all}"
+                    )
+                    with self.assertRaises(DeploymentError):
+                        _validate_unique_active_proxy_server(active_config, site_path)
+
+    def test_quic_default_listener_is_not_covered_by_managed_tcp(self):
+        """Treat QUIC/UDP defaults as separate from managed TCP listeners."""
+        quic_default = (
+            "server { listen 443 quic default_server; "
+            "server_name unrelated.example; "
+            "location / { proxy_pass http://127.0.0.1:9999; } }"
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            site_path = Path(directory) / "sites-available" / "proxy.altanis.de"
+            other_path = Path(directory) / "conf.d" / "quic.conf"
+            site_path.parent.mkdir()
+            other_path.parent.mkdir()
+            site_path.write_text(NGINX_TLS_SITE, encoding="utf-8")
+            other_path.write_text(quic_default, encoding="utf-8")
+            active_config = (
+                f"# configuration file {site_path}:\n{NGINX_TLS_SITE}"
+                f"# configuration file {other_path}:\n{quic_default}"
+            )
+            with self.assertRaises(DeploymentError):
+                _validate_unique_active_proxy_server(active_config, site_path)
+
+    def test_specific_address_listener_is_not_covered_by_managed_wildcard(self):
+        """Reject a separate address-specific HTTP server after managed wildcard."""
+        specific_server = (
+            "server { listen 192.168.20.11:443 ssl; "
+            "server_name unrelated.example; "
+            "location / { proxy_pass http://127.0.0.1:9999; } }"
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            site_path = Path(directory) / "sites-available" / "proxy.altanis.de"
+            other_path = Path(directory) / "conf.d" / "specific.conf"
+            site_path.parent.mkdir()
+            other_path.parent.mkdir()
+            site_path.write_text(NGINX_TLS_SITE, encoding="utf-8")
+            other_path.write_text(specific_server, encoding="utf-8")
+            active_config = (
+                f"# configuration file {site_path}:\n{NGINX_TLS_SITE}"
+                f"# configuration file {other_path}:\n{specific_server}"
+            )
+            with self.assertRaises(DeploymentError):
+                _validate_unique_active_proxy_server(active_config, site_path)
+
+    def test_default_listener_on_unmanaged_address_is_rejected(self):
+        """Reject default servers on public addresses absent from managed listen."""
+        managed_site = NGINX_TLS_SITE.replace(
+            "listen 443 ssl;", "listen 192.168.20.11:443 ssl;"
+        )
+        public_default = (
+            "server { listen 0.0.0.0:443 ssl default_server; "
+            "server_name unrelated.example; "
+            "location / { proxy_pass http://127.0.0.1:9999; } }"
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            site_path = Path(directory) / "sites-available" / "proxy.altanis.de"
+            other_path = Path(directory) / "conf.d" / "default.conf"
+            site_path.parent.mkdir()
+            other_path.parent.mkdir()
+            site_path.write_text(managed_site, encoding="utf-8")
+            other_path.write_text(public_default, encoding="utf-8")
+            active_config = (
+                f"# configuration file {site_path}:\n{managed_site}"
+                f"# configuration file {other_path}:\n{public_default}"
+            )
+            with self.assertRaises(DeploymentError):
+                _validate_unique_active_proxy_server(active_config, site_path)
+
+    def test_dual_stack_http_redirect_is_accepted(self):
+        """Allow safe HTTP redirects to listen on IPv4 and IPv6 port 80."""
+        dual_stack_redirect = NGINX_REDIRECT_SITE.replace(
+            "    listen 80;", "    listen 80;\n    listen [::]:80;"
+        )
+        self.assertEqual(
+            insert_admin_locations(dual_stack_redirect + NGINX_TLS_SITE),
+            dual_stack_redirect + insert_admin_locations(NGINX_TLS_SITE),
+        )
+
+    def test_redirect_with_transport_options_is_rejected(self):
+        """Reject listeners that require TLS or a PROXY header for HTTP."""
+        for option in ("ssl", "proxy_protocol", "quic"):
+            with self.subTest(option=option):
+                invalid_redirect = NGINX_REDIRECT_SITE.replace(
+                    "listen 80;", f"listen 80 {option};"
+                )
+                with self.assertRaises(ValueError):
+                    insert_admin_locations(invalid_redirect + NGINX_TLS_SITE)
+
+    def test_non_http_listener_cannot_be_accepted_as_http_redirect(self):
+        """Require a safe redirect server to listen on HTTP port 80."""
+        redirect_on_other_port = NGINX_REDIRECT_SITE.replace(
+            "listen 80;", "listen 8443;"
+        )
+        with self.assertRaises(ValueError):
+            insert_admin_locations(redirect_on_other_port + NGINX_TLS_SITE)
+
+    def test_unrelated_nondefault_regex_server_does_not_block_validation(self):
+        """Allow an unrelated regex vhost behind an explicit listener default."""
+        regex_config = (
+            r"server { listen 9443; server_name ~\^proxy\.altanis\.de$; "
+            "location / { proxy_pass http://127.0.0.1:9999; } }"
+        )
+        managed_site = NGINX_TLS_SITE.replace(
+            "listen 443 ssl;", "listen 443 ssl;\n    listen 9443 ssl;"
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            site_path = Path(directory) / "sites-available" / "proxy.altanis.de"
+            other_path = Path(directory) / "conf.d" / "regex.conf"
+            site_path.parent.mkdir()
+            other_path.parent.mkdir()
+            site_path.write_text(managed_site, encoding="utf-8")
+            other_path.write_text(regex_config, encoding="utf-8")
+            active_config = (
+                f"# configuration file {site_path}:\n{managed_site}"
+                f"# configuration file {other_path}:\n{regex_config}"
+            )
+            _validate_unique_active_proxy_server(active_config, site_path)
+
+    def test_http_redirect_rejects_unreachable_redirect(self):
+        """Reject a redirect placed after an unconditional early return."""
+        unreachable_redirect = NGINX_REDIRECT_SITE.replace(
+            "    if ($host = proxy.altanis.de) {",
+            "    return 404;\n    if ($host = proxy.altanis.de) {",
+        )
+        with self.assertRaises(ValueError):
+            insert_admin_locations(unreachable_redirect + NGINX_TLS_SITE)
+
+    def test_http_redirect_cannot_use_unvalidated_host_variable(self):
+        """Reject host-controlled HTTPS redirects in HTTP redirect servers."""
+        open_redirect = NGINX_REDIRECT_SITE.replace(
+            "https://proxy.altanis.de$request_uri", "https://$host$request_uri"
+        )
+        with self.assertRaises(ValueError):
+            insert_admin_locations(open_redirect + NGINX_TLS_SITE)
+
+    def test_escaped_server_block_keyword_is_rejected(self):
+        """Reject escaped server tokens before locating managed server blocks."""
+        escaped_server = NGINX_SITE.rstrip() + (
+            r" serv\er { server_name proxy.altanis.de; location / { } }"
+        )
+        with self.assertRaises(ValueError):
+            insert_admin_locations(escaped_server)
+
+    def test_backslashes_in_comments_do_not_block_installation(self):
+        """Ignore backslashes in comments while rejecting active escape syntax."""
+        commented_site = NGINX_SITE.replace(
+            "server_name proxy.altanis.de;",
+            "# escaped token: serv\\er\n    server_name proxy.altanis.de;",
+        )
+        configured = insert_admin_locations(commented_site)
+        self.assertIn("# escaped token: serv\\er", configured)
 
     def test_escaped_duplicate_proxy_server_name_is_rejected(self):
         """Reject escaped server directives that hide duplicate proxy hosts."""

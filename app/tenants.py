@@ -102,8 +102,8 @@ class DatabaseTenantRoutingSnapshot:
 
 
 def hash_api_key(api_key: str) -> str:
-    """Return the SHA-256 hex digest of an API key."""
-    # API keys are generated as 256-bit random bearer tokens, not passwords.
+    """Return the SHA-256 hex digest of a high-entropy bearer API key."""
+    # Cursor API keys are generated as 256-bit random bearer tokens, not passwords.
     # codeql[py/weak-sensitive-data-hashing]
     return hashlib.sha256(api_key.encode("utf-8")).hexdigest()
 
@@ -186,7 +186,7 @@ def _parse_tenant_entry(entry: Any, index: int) -> TenantConfig:
         char not in "0123456789abcdef" for char in api_key_hash
     ):
         raise ServiceConfigurationError(
-            f"TENANTS[{index}].api_key_hash must be a SHA-256 hex digest."
+            f"TENANTS[{index}].api_key_hash must be a 64-character hex digest."
         )
 
     azure_base_url = _required_nonempty_str(entry, "azure_base_url", index).rstrip("/")

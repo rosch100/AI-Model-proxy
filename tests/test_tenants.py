@@ -304,3 +304,26 @@ def test_create_app_accepts_tenant_mode_without_service_api_key(monkeypatch):
 
     assert app.config["AUTH_MODE"] == "tenant"
     assert app.config["TENANTS"][0].id == "acme"
+
+
+def test_hash_api_key_is_sha256_and_resolves_tenant():
+    """Use standard SHA-256 for high-entropy bearer keys and resolve consistently."""
+    api_key = "correct-key"
+    digest = hash_api_key(api_key)
+
+    assert digest == (
+        "ddb0fd2dede48502669718e09ef1447dba46f3d3822e9fbf05af11d874a0f23b"
+    )
+    assert len(digest) == 64
+    assert all(char in "0123456789abcdef" for char in digest)
+
+    tenant = TenantConfig(
+        id="acme",
+        api_key_hash=digest,
+        azure_base_url="https://acme.openai.azure.com",
+        azure_api_key="azure-secret",
+        azure_model_deployments={"gpt-5.4": "acme-gpt54"},
+    )
+
+    assert resolve_tenant_for_api_key(api_key, (tenant,)).id == "acme"
+    assert resolve_tenant_for_api_key("wrong-key", (tenant,)) is None

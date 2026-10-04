@@ -56,6 +56,68 @@ from app.providers.openai_compat import openai_compatible_base_url
 from tests.admin_app import build_admin_database, seed_admin
 
 
+@pytest.mark.parametrize(
+    ("provider", "settings", "url", "api_key"),
+    [
+        (
+            "azure",
+            {"base_url": "https://acme.openai.azure.com"},
+            "https://acme.openai.azure.com/openai/deployments?api-version=2022-12-01",
+            "azure-key",
+        ),
+        (
+            "openai",
+            {},
+            "https://api.openai.com/v1/models",
+            "openai-key",
+        ),
+    ],
+)
+def test_catalog_refresh_wraps_azure_and_openai_transport_errors(
+    requests_mock, provider, settings, url, api_key
+):
+    """Wrap catalog transport errors and retain their original causes."""
+    requests_mock.get(url, exc=requests.ConnectTimeout)
+    label = "Azure" if provider == "azure" else "OpenAI"
+    with pytest.raises(
+        CatalogRefreshError, match=f"{label} catalog request failed"
+    ) as error:
+        refresh_provider_catalog(provider, settings, api_key)
+
+    assert isinstance(error.value.__cause__, requests.ConnectTimeout)
+
+
+@pytest.mark.parametrize(
+    ("provider", "settings", "url", "api_key"),
+    [
+        (
+            "azure",
+            {"base_url": "https://acme.openai.azure.com"},
+            "https://acme.openai.azure.com/openai/deployments?api-version=2022-12-01",
+            "azure-key",
+        ),
+        (
+            "openai",
+            {},
+            "https://api.openai.com/v1/models",
+            "openai-key",
+        ),
+    ],
+)
+def test_catalog_refresh_wraps_azure_and_openai_invalid_json(
+    requests_mock, provider, settings, url, api_key
+):
+    """Wrap provider catalog JSON decoding errors with a stable error."""
+    requests_mock.get(url, text="not-json")
+    label = "Azure" if provider == "azure" else "OpenAI"
+    with pytest.raises(
+        CatalogRefreshError, match=f"{label} catalog payload is invalid"
+    ) as error:
+        refresh_provider_catalog(provider, settings, api_key)
+
+    assert isinstance(error.value.__cause__, ValueError)
+
+
 def test_catalog_refresh_parses_openai_models(requests_mock):
     """The OpenAI catalog refresh stores provider model ids."""
     requests_mock.get(

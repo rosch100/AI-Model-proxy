@@ -10,10 +10,10 @@ from click.testing import CliRunner
 from flask import Flask
 from sqlalchemy import create_engine, select
 from sqlalchemy.orm import Session, sessionmaker
-from werkzeug.security import check_password_hash
 
 import app.commands as commands
 from app import create_app
+from app.admin.passwords import verify_admin_password
 from app.persistence.database import Database
 from app.persistence.models import (
     AdminAccount,
@@ -74,7 +74,7 @@ def test_tenants_create_generates_and_displays_only_the_cursor_key():
         assert tenant.custom_model_id.startswith("cursor-")
         assert len(tenant.custom_model_id) <= 128
         assert admin is not None
-        assert check_password_hash(admin.password_hash, "initial-password")
+        assert verify_admin_password(admin.password_hash, "initial-password")
     engine.dispose()
 
 

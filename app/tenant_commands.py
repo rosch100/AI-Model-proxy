@@ -11,8 +11,8 @@ from flask import Flask, current_app
 from flask.cli import with_appcontext
 from sqlalchemy import select, text
 from sqlalchemy.exc import IntegrityError
-from werkzeug.security import generate_password_hash
 
+from app.admin.passwords import hash_admin_password
 from app.tenants import hash_api_key, parse_tenants
 
 from .persistence.database import Database
@@ -70,7 +70,7 @@ def create_tenant(tenant_id: str) -> None:
     admin = AdminAccount(
         tenant_id=tenant_id,
         username=username,
-        password_hash=generate_password_hash(password),
+        password_hash=hash_admin_password(password),
     )
     try:
         with _database().sessions.begin() as session:

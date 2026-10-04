@@ -88,7 +88,7 @@ def test_forwarding_applies_luna_tool_reasoning_compatibility_only_when_needed(
     requests_mock.post(
         f"https://{'api.openai.com' if provider == 'openai' else 'openrouter.ai/api/v1'}/"
         f"{'v1/' if provider == 'openai' else ''}chat/completions",
-        text="data: [DONE]\\n\\n",
+        text="data: [DONE]\n\n",
         headers={"Content-Type": "text/event-stream"},
     )
 
@@ -98,6 +98,7 @@ def test_forwarding_applies_luna_tool_reasoning_compatibility_only_when_needed(
             _snapshot(provider, model),
         )
         response.get_data()
+        assert response.status_code == 200
 
     sent_payload = json.loads(requests_mock.last_request.text)
     assert sent_payload["model"] == model
@@ -118,8 +119,8 @@ def test_deepseek_forwarding_preserves_chat_fields_and_uses_native_origin(
     ]
     requests_mock.post(
         "https://api.deepseek.com/chat/completions",
-        text='data: {"model":"deepseek-v4-flash","choices":[{"delta":{"content":"ok"}}]}\\n\\n'
-        "data: [DONE]\\n\\n",
+        text='data: {"model":"deepseek-v4-flash","choices":[{"delta":{"content":"ok"}}]}\n\n'
+        "data: [DONE]\n\n",
         headers={"Content-Type": "text/event-stream"},
     )
     payload = {
@@ -137,6 +138,7 @@ def test_deepseek_forwarding_preserves_chat_fields_and_uses_native_origin(
     with app.test_request_context("/v1/chat/completions", json=payload):
         response = forward_openai_compatible(request, snapshot)
         response.get_data()
+        assert response.status_code == 200
 
     sent = requests_mock.last_request
     assert sent.url == "https://api.deepseek.com/chat/completions"

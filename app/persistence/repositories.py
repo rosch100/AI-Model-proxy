@@ -11,6 +11,7 @@ from cryptography.exceptions import InvalidTag
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
+from app.models import select_fallback_public_model
 from app.providers.azure_url import validate_azure_base_url
 from app.providers.catalog import selectable_catalog_models
 from app.tenants import (
@@ -182,10 +183,17 @@ def import_tenants(
     """Atomically import static tenants without overwriting differing records."""
     imported = 0
     for tenant_config in tenants:
-        if (
-            tenant_config.azure_default_model
-            not in tenant_config.azure_model_deployments
-        ):
+        default_model = tenant_config.azure_default_model
+        if default_model is None:
+            default_model = select_fallback_public_model(
+                tenant_config.azure_model_deployments
+            )
+            if default_model is None:
+                raise ValueError(
+                    f"TENANTS[{tenant_config.id!r}].azure_default_model is omitted "
+                    "and no preferred fallback model deployment is configured."
+                )
+        elif default_model not in tenant_config.azure_model_deployments:
             raise ValueError(
                 f"TENANTS[{tenant_config.id!r}].azure_default_model must name "
                 "a configured Azure model deployment."
@@ -221,7 +229,7 @@ def import_tenants(
             }
             if (
                 profile.settings != expected_settings
-                or profile.default_model != tenant_config.azure_default_model
+                or profile.default_model != default_model
             ):
                 raise ValueError(
                     f"Existing tenant {tenant_config.id!r} has different provider data"
@@ -256,7 +264,7 @@ def import_tenants(
                 "base_url": tenant_config.azure_base_url,
                 "model_deployments": dict(tenant_config.azure_model_deployments),
             },
-            default_model=tenant_config.azure_default_model,
+            default_model=default_model,
             route_priority=1,
             inference_secret_ciphertext=cipher.encrypt(tenant_config.azure_api_key),
         )

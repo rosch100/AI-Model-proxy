@@ -75,10 +75,16 @@ def _refresh_azure(
         f"{base_url.rstrip('/')}/openai/deployments"
         f"?api-version={AZURE_DEPLOYMENTS_API_VERSION}"
     )
-    response = requests.get(url, headers={"api-key": api_key}, timeout=30)
+    try:
+        response = requests.get(url, headers={"api-key": api_key}, timeout=30)
+    except requests.RequestException as exc:
+        raise CatalogRefreshError("Azure catalog request failed.") from exc
     if response.status_code >= 400:
         raise CatalogRefreshError(f"Azure catalog HTTP {response.status_code}")
-    payload = response.json()
+    try:
+        payload = response.json()
+    except (requests.exceptions.JSONDecodeError, ValueError) as exc:
+        raise CatalogRefreshError("Azure catalog payload is invalid.") from exc
     data = payload.get("data") if isinstance(payload, dict) else payload
     if not isinstance(data, list):
         raise CatalogRefreshError("Azure catalog payload is invalid.")
@@ -95,14 +101,20 @@ def _refresh_azure(
 
 
 def _refresh_openai(api_key: str) -> list[tuple[str, str | None]]:
-    response = requests.get(
-        "https://api.openai.com/v1/models",
-        headers={"Authorization": f"Bearer {api_key}"},
-        timeout=30,
-    )
+    try:
+        response = requests.get(
+            "https://api.openai.com/v1/models",
+            headers={"Authorization": f"Bearer {api_key}"},
+            timeout=30,
+        )
+    except requests.RequestException as exc:
+        raise CatalogRefreshError("OpenAI catalog request failed.") from exc
     if response.status_code >= 400:
         raise CatalogRefreshError(f"OpenAI catalog HTTP {response.status_code}")
-    payload = response.json()
+    try:
+        payload = response.json()
+    except (requests.exceptions.JSONDecodeError, ValueError) as exc:
+        raise CatalogRefreshError("OpenAI catalog payload is invalid.") from exc
     data = payload.get("data") if isinstance(payload, dict) else None
     if not isinstance(data, list):
         raise CatalogRefreshError("OpenAI catalog payload is invalid.")

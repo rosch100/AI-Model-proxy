@@ -306,6 +306,30 @@ def test_tenant_import_satisfies_immediate_tenant_profile_foreign_keys():
     engine.dispose()
 
 
+def test_tenant_import_selects_fallback_for_an_omitted_azure_default():
+    """Choose the configured fallback when the optional default is omitted."""
+    engine = create_engine("sqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    key = base64.urlsafe_b64encode(b"k" * 32).decode("ascii")
+    cipher = SecretCipher.from_key(key)
+    source = TenantConfig(
+        id="acme",
+        api_key_hash=hashlib.sha256(b"cursor-key").hexdigest(),
+        azure_base_url="https://acme.openai.azure.com",
+        azure_api_key="azure-secret",
+        azure_model_deployments={"gpt-6-luna": "acme-luna"},
+    )
+
+    with Session(engine) as session, session.begin():
+        assert import_tenants((source,), session, cipher) == 1
+        profile = session.scalar(
+            select(ProviderProfile).where(ProviderProfile.tenant_id == "acme")
+        )
+        assert profile.default_model == "gpt-6-luna"
+
+    engine.dispose()
+
+
 def test_tenant_import_is_idempotent_and_encrypts_provider_credentials():
     """Repeated identical imports create a single tenant and encrypted profile."""
     engine = create_engine("sqlite:///:memory:")

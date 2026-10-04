@@ -64,6 +64,23 @@ notwendig.
    curl --fail https://proxy.iffm-gmbh.de/health
    ```
 
+PostgreSQL ist nur für `TENANT_CONFIG_SOURCE=database` erforderlich. Für diesen
+Betrieb in `.env` `AUTH_MODE=tenant`, `TENANT_CONFIG_SOURCE=database`,
+`POSTGRES_USER`, `POSTGRES_PASSWORD`, `POSTGRES_DB` und die passende
+`DATABASE_URL=postgresql+psycopg://<POSTGRES_USER>:<POSTGRES_PASSWORD>@postgres:5432/<POSTGRES_DB>`
+setzen. Das Passwort muss URL-sicher sein oder in der URL korrekt percent-encodiert
+werden. PostgreSQL zuerst mit aktivem Profil starten und seine Healthcheck-Bereitschaft
+abwarten, danach den Proxy-/Caddy-Stack starten:
+
+```bash
+docker compose --profile database up -d --wait postgres
+docker compose up -d --build
+```
+
+Im Standardbetrieb (`TENANT_CONFIG_SOURCE=environment` oder Einzelmodus) bleibt
+das PostgreSQL-Profil deaktiviert; `docker compose up -d --build` startet den
+Proxy ohne Datenbank.
+
 Caddy speichert Zertifikate und ACME-Zustand im persistenten Volume
 `caddy_data`; `caddy_config` bewahrt die aktive Konfiguration. Diese Volumes
 bei Updates nicht entfernen und in die Host-Backup-Strategie aufnehmen. Bei

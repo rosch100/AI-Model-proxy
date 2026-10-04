@@ -137,6 +137,10 @@ from app.providers.cost_jobs import (
     start_cost_refresh,
 )
 from app.providers.costs import CostRefreshError
+from app.providers.deepseek_balance import (
+    DeepSeekBalanceError,
+    fetch_deepseek_balance,
+)
 from app.providers.openai_admin import OpenAIProjectLookupError, list_openai_projects
 
 admin_bp = Blueprint("admin", __name__, url_prefix="/admin")
@@ -850,10 +854,11 @@ def create_connection_form():
         ("azure", "Azure"),
         ("openai", "OpenAI"),
         ("openrouter", "OpenRouter"),
+        ("deepseek", "DeepSeek"),
     ]
     form.default_model.choices = [("", "Nach dem Abruf der Modellliste auswählen")]
     provider = request.args.get("provider", "")
-    if provider in {"azure", "openai", "openrouter"}:
+    if provider in {"azure", "openai", "openrouter", "deepseek"}:
         form.provider.data = provider
     return render_template(
         "admin/settings/profile_form.html",
@@ -1218,7 +1223,7 @@ def refresh_catalog(profile_id: str):
                 profile.default_model = (
                     None if was_routed else next(iter(deployments), None)
                 )
-        elif error is None and provider in {"openai", "openrouter"}:
+        elif error is None and provider in {"openai", "openrouter", "deepseek"}:
             selectable = selectable_catalog_models(provider, entries)
             model_ids = [model_id for model_id, _ in selectable]
             if profile.default_model not in model_ids:
@@ -1242,6 +1247,48 @@ def refresh_catalog(profile_id: str):
 def settings_costs():
     """Show bound billing scopes and cost records."""
     return render_template("admin/settings/costs.html", **_costs_context())
+
+
+@admin_bp.post("/settings/costs/deepseek-balance/<profile_id>")
+@login_required
+def fetch_deepseek_profile_balance(profile_id: str):
+    """Render an explicit live balance lookup without storing billing history."""
+    database = _database()
+    with database.sessions() as session:
+        profile = session.scalar(
+            select(ProviderProfile).where(
+                ProviderProfile.id == profile_id,
+                ProviderProfile.tenant_id == g.admin.tenant_id,
+                ProviderProfile.provider == "deepseek",
+                ProviderProfile.deleted_at.is_(None),
+            )
+        )
+        if profile is None:
+            return "Not Found", 404
+        encrypted_key = profile.inference_secret_ciphertext
+        if encrypted_key is None:
+            return "Provider account is incomplete", 400
+        inference_key = database.secret_cipher.decrypt(encrypted_key)
+    try:
+        balance = fetch_deepseek_balance(inference_key)
+    except DeepSeekBalanceError as exc:
+        return (
+            render_template(
+                "admin/settings/costs.html",
+                **_costs_context(
+                    deepseek_balance_profile_id=profile_id,
+                    deepseek_balance_error=str(exc),
+                ),
+            ),
+            502,
+        )
+    return render_template(
+        "admin/settings/costs.html",
+        **_costs_context(
+            deepseek_balance_profile_id=profile_id,
+            deepseek_balance=balance,
+        ),
+    )
 
 
 @admin_bp.post("/settings/costs/azure-scope")
@@ -1652,7 +1699,12 @@ def _set_profile_form_choices(
     form: ProviderProfileForm, provider: str | None = None
 ) -> None:
     """Keep the submitted provider fixed on edit and render only supported choices."""
-    providers = [("azure", "Azure"), ("openai", "OpenAI"), ("openrouter", "OpenRouter")]
+    providers = [
+        ("azure", "Azure"),
+        ("openai", "OpenAI"),
+        ("openrouter", "OpenRouter"),
+        ("deepseek", "DeepSeek"),
+    ]
     form.provider.choices = (
         [(provider, dict(providers)[provider])]
         if provider in dict(providers)
@@ -1705,14 +1757,14 @@ def _provider_settings(form: ProviderProfileForm) -> dict[str, object]:
             "organization": form.organization.data or "",
             "project": form.project.data or "",
         }
-    if provider == "openrouter":
+    if provider in {"openrouter", "deepseek"}:
         return {}
     raise ValueError("Unsupported provider")
 
 
 def _connection_context() -> dict[str, object]:
     database = _database()
-    provider_names = ("azure", "openai", "openrouter")
+    provider_names = ("azure", "openai", "openrouter", "deepseek")
     with database.sessions() as session:
         tenant = session.get(Tenant, g.admin.tenant_id)
         profiles = tuple(
@@ -1790,6 +1842,9 @@ def _costs_context(
     openai_projects: dict[str, list[tuple[str, str]]] | None = None,
     openai_scope_form_profile_id: str | None = None,
     openai_organization_id: str = "",
+    deepseek_balance_profile_id: str | None = None,
+    deepseek_balance: object | None = None,
+    deepseek_balance_error: str | None = None,
 ) -> dict[str, object]:
     database = _database()
     openai_projects = openai_projects or {}
@@ -1943,6 +1998,9 @@ def _costs_context(
             "scope_bound_profile_ids": scope_bound_profile_ids,
             "openai_organization_ids": openai_organization_ids,
             "openai_projects": openai_projects,
+            "deepseek_balance_profile_id": deepseek_balance_profile_id,
+            "deepseek_balance": deepseek_balance,
+            "deepseek_balance_error": deepseek_balance_error,
             "logout_form": LoginForm(),
         }
 

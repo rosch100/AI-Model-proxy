@@ -31,6 +31,9 @@
         <p class="hint">OpenRouter verwendet automatisch die richtige API-Adresse. Verwende für Anfragen einen normalen Schlüssel aus <a href="https://openrouter.ai/settings/keys" target="_blank" rel="noopener noreferrer">Settings → API Keys</a>, keinen Verwaltungsschlüssel. Die verfügbaren Modelle findest du im <a href="https://openrouter.ai/models" target="_blank" rel="noopener noreferrer">OpenRouter-Modellkatalog</a>.</p>
       </div>
     {% endif %}
+    {% if not profile or profile.provider == "deepseek" %}
+      <div data-provider-fields="deepseek"{% if not profile and form.provider.data != "deepseek" %} hidden{% endif %}><p class="hint">DeepSeek verwendet die Standard-API-Adresse.</p></div>
+    {% endif %}
     {% if not profile %}
         <p class="hint">Speichere zuerst das Konto. Lade danach unter „Anbieter und Konten“ die Modellliste und wähle hier dein Standardmodell aus. Bei Azure werden die bereitgestellten Modelle und Bereitstellungen angezeigt.</p>
     {% elif form.default_model.choices|length <= 1 %}

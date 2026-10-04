@@ -23,7 +23,7 @@ _MAX_COOLDOWN = timedelta(hours=24)
 _MAX_BACKOFF_STAGE = 6
 PROBE_LEASE_SECONDS = 30
 _PROBE_LEASE = timedelta(seconds=PROBE_LEASE_SECONDS)
-_SUPPORTED_PROVIDERS = frozenset({"azure", "openai", "openrouter"})
+_SUPPORTED_PROVIDERS = frozenset({"azure", "openai", "openrouter", "deepseek"})
 _SUPPORTED_SCOPES = frozenset({"profile", "organization", "project"})
 
 

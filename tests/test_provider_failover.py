@@ -15,6 +15,7 @@ from app.persistence.admin_ops import (
     replace_catalog_entries,
 )
 from app.persistence.models import (
+    InferenceActivityEvent,
     ProviderAttemptEvent,
     ProviderCircuitState,
     ProviderProfile,
@@ -30,6 +31,7 @@ AUTH = {"Authorization": "Bearer cursor-key"}
 AZURE = "https://test-resource.openai.azure.com/openai/v1/responses"
 OPENAI = "https://api.openai.com/v1/chat/completions"
 OPENROUTER = "https://openrouter.ai/api/v1/chat/completions"
+DEEPSEEK = "https://api.deepseek.com/chat/completions"
 
 
 def event(data, name=None):
@@ -59,6 +61,7 @@ def routed_app(admin_app):
             ),
             ("openai", "gpt-5.4", {}),
             ("openrouter", "anthropic/claude-sonnet-4", {}),
+            ("deepseek", "deepseek-v4-flash", {}),
         ]:
             profile = create_provider_profile(
                 session,
@@ -77,8 +80,23 @@ def routed_app(admin_app):
                 [(model, "azure-deployment" if provider == "azure" else None)],
                 None,
             )
-            activate_provider_profile(session, tenant, profile.id, "ada")
+            if provider != "deepseek":
+                activate_provider_profile(session, tenant, profile.id, "ada")
     return admin_app
+
+
+def activate_deepseek_profile(app):
+    """Append the configured DeepSeek profile to a test tenant's route."""
+    database = app.extensions["database"]
+    with database.sessions.begin() as session:
+        tenant = session.get(Tenant, "acme")
+        profile = session.scalar(
+            select(ProviderProfile).where(
+                ProviderProfile.tenant_id == "acme",
+                ProviderProfile.provider == "deepseek",
+            )
+        )
+        activate_provider_profile(session, tenant, profile.id, "ada")
 
 
 def post(app, path="/v1/chat/completions", model="cursor-acme-model"):
@@ -315,6 +333,51 @@ def test_unexpected_forwarder_exception_releases_probe_and_completes_attempt(
     assert state.lease_token is None
 
 
+def test_deepseek_route_persists_attempt_activity_and_breaker(
+    routed_app, requests_mock
+):
+    """Persist routed DeepSeek usage and breaker state through the public path."""
+    database = routed_app.extensions["database"]
+    with database.sessions.begin() as session:
+        profile = session.scalar(
+            select(ProviderProfile).where(
+                ProviderProfile.tenant_id == "acme",
+                ProviderProfile.provider == "deepseek",
+            )
+        )
+        assert profile is not None
+        for existing in session.scalars(
+            select(ProviderProfile).where(ProviderProfile.tenant_id == "acme")
+        ):
+            existing.route_priority = None
+        session.flush()
+        profile.route_priority = 1
+
+    requests_mock.post(
+        DEEPSEEK,
+        content=successful_chat("deepseek-v4-flash"),
+        headers={"Content-Type": "text/event-stream"},
+    )
+    response = post(routed_app)
+
+    assert response.status_code == 200
+    assert [request.url for request in requests_mock.request_history] == [DEEPSEEK]
+    with database.sessions() as session:
+        attempt = session.scalar(select(ProviderAttemptEvent))
+        activity = session.scalar(select(InferenceActivityEvent))
+    assert attempt.provider == "deepseek"
+    assert attempt.outcome == "success"
+    assert activity.provider == "deepseek"
+
+    breaker = ProviderCircuitBreakerStore(database.sessions, database.secret_cipher)
+    deepseek_scope = breaker.scope("acme", "deepseek", "profile", profile.id)
+    assert breaker.open_quota(deepseek_scope).failure_count == 1
+    with database.sessions() as session:
+        state = session.scalar(select(ProviderCircuitState))
+    assert state.provider == "deepseek"
+    assert state.failure_count == 1
+
+
 def test_late_openrouter_quota_error_pauses_following_request(
     routed_app, requests_mock
 ):
@@ -439,7 +502,11 @@ def test_third_provider_uses_its_own_model(routed_app, requests_mock):
     response = post(routed_app)
     assert response.status_code == 200
     assert b"success" in response.data
-    assert [r.url for r in requests_mock.request_history] == [AZURE, OPENAI, OPENROUTER]
+    assert [r.url for r in requests_mock.request_history] == [
+        AZURE,
+        OPENAI,
+        OPENROUTER,
+    ]
     assert (
         requests_mock.request_history[-1].json()["model"] == "anthropic/claude-sonnet-4"
     )
@@ -497,12 +564,164 @@ def test_partial_azure_output_never_replays(routed_app, requests_mock):
 
 def test_exhausted_route_returns_last_status(routed_app, requests_mock):
     """Return the final provider's status when the route is exhausted."""
+    activate_deepseek_profile(routed_app)
     requests_mock.post(AZURE, status_code=503)
     requests_mock.post(OPENAI, status_code=429)
     requests_mock.post(OPENROUTER, status_code=500)
+    requests_mock.post(DEEPSEEK, status_code=402)
     response = post(routed_app)
-    assert response.status_code == 500
-    assert requests_mock.call_count == 3
+    assert response.status_code == 402
+    assert requests_mock.call_count == 4
+
+
+def test_deepseek_http_402_never_fails_over_and_does_not_leak_credentials(
+    routed_app, requests_mock
+):
+    """The DeepSeek 402 stops before a later tenant-owned profile."""
+    activate_deepseek_profile(routed_app)
+    database = routed_app.extensions["database"]
+    with database.sessions.begin() as session:
+        tenant = session.get(Tenant, "acme")
+        fallback = create_provider_profile(
+            session,
+            database.secret_cipher,
+            "acme",
+            "openai",
+            "openai-fallback",
+            {},
+            "gpt-5.4",
+            "openai-fallback-secret",
+            "ada",
+        )
+        replace_catalog_entries(session, fallback, [("gpt-5.4", None)], None)
+        activate_provider_profile(session, tenant, fallback.id, "ada")
+
+    requests_mock.post(AZURE, status_code=503)
+    requests_mock.post(
+        OPENAI,
+        status_code=503,
+        additional_matcher=lambda request: request.headers["Authorization"]
+        == "Bearer openai-secret",
+    )
+    requests_mock.post(OPENROUTER, status_code=503)
+    requests_mock.post(DEEPSEEK, status_code=402, text="deepseek-secret")
+    requests_mock.post(
+        OPENAI,
+        content=successful_chat("gpt-5.4"),
+        additional_matcher=lambda request: request.headers["Authorization"]
+        == "Bearer openai-fallback-secret",
+    )
+
+    response = post(routed_app)
+
+    assert response.status_code == 402
+    assert [request.url for request in requests_mock.request_history] == [
+        AZURE,
+        OPENAI,
+        OPENROUTER,
+        DEEPSEEK,
+    ]
+    assert (
+        requests_mock.last_request.headers["Authorization"] == "Bearer deepseek-secret"
+    )
+    assert b"deepseek-secret" not in response.data
+
+
+def test_deepseek_http_429_uses_the_next_profile(routed_app, requests_mock):
+    """Retry DeepSeek throttling and preserve the next profile's credential."""
+    activate_deepseek_profile(routed_app)
+    requests_mock.post(AZURE, status_code=503)
+    requests_mock.post(OPENAI, status_code=503)
+    requests_mock.post(OPENROUTER, status_code=503)
+    requests_mock.post(DEEPSEEK, status_code=429)
+    requests_mock.post(
+        OPENAI,
+        content=successful_chat("gpt-5.4"),
+        additional_matcher=lambda request: request.headers["Authorization"]
+        == "Bearer openai-fallback-secret",
+    )
+    database = routed_app.extensions["database"]
+    with database.sessions.begin() as session:
+        tenant = session.get(Tenant, "acme")
+        fallback = create_provider_profile(
+            session,
+            database.secret_cipher,
+            "acme",
+            "openai",
+            "openai-fallback",
+            {},
+            "gpt-5.4",
+            "openai-fallback-secret",
+            "ada",
+        )
+        replace_catalog_entries(session, fallback, [("gpt-5.4", None)], None)
+        activate_provider_profile(session, tenant, fallback.id, "ada")
+
+    response = post(routed_app)
+
+    assert response.status_code == 200
+    assert [request.url for request in requests_mock.request_history] == [
+        AZURE,
+        OPENAI,
+        OPENROUTER,
+        DEEPSEEK,
+        OPENAI,
+    ]
+    assert requests_mock.last_request.headers["Authorization"] == (
+        "Bearer openai-fallback-secret"
+    )
+
+
+def test_deepseek_chat_completion_records_final_usage_before_done(
+    routed_app, requests_mock
+):
+    """A DeepSeek final usage chunk is saved in its own tenant activity row."""
+    activate_deepseek_profile(routed_app)
+    requests_mock.post(AZURE, status_code=503)
+    requests_mock.post(OPENAI, status_code=503)
+    requests_mock.post(OPENROUTER, status_code=503)
+    stream = (
+        event(
+            {
+                "model": "deepseek-v4-flash",
+                "choices": [{"delta": {"content": "hello"}, "finish_reason": None}],
+            }
+        )
+        + event(
+            {
+                "model": "deepseek-v4-flash",
+                "choices": [],
+                "usage": {
+                    "prompt_tokens": 17,
+                    "completion_tokens": 5,
+                    "total_tokens": 22,
+                },
+            }
+        )
+        + b"data: [DONE]\n\n"
+    )
+    requests_mock.post(
+        DEEPSEEK,
+        content=stream,
+        headers={"Content-Type": "text/event-stream"},
+    )
+
+    response = post(routed_app)
+
+    assert response.status_code == 200
+    assert response.data.endswith(b"data: [DONE]\n\n")
+    assert b'"model":"cursor-acme-model"' in response.data
+    database = routed_app.extensions["database"]
+    with database.sessions() as session:
+        activity = session.scalar(
+            select(InferenceActivityEvent).where(
+                InferenceActivityEvent.provider == "deepseek"
+            )
+        )
+    assert activity is not None
+    assert activity.input_tokens == 17
+    assert activity.output_tokens == 5
+    assert activity.total_tokens == 22
 
 
 def test_connect_timeout_is_retryable_but_read_timeout_is_not(

@@ -11,6 +11,7 @@ from cryptography.exceptions import InvalidTag
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
+from app.models import select_fallback_public_model
 from app.providers.azure_url import validate_azure_base_url
 from app.providers.catalog import selectable_catalog_models
 from app.tenants import (
@@ -36,7 +37,7 @@ def validate_routed_profile(
         or not profile.default_model.strip()
     ):
         raise ValueError(f"The {profile.display_name} account is incomplete")
-    if profile.provider not in {"azure", "openai", "openrouter"}:
+    if profile.provider not in {"azure", "openai", "openrouter", "deepseek"}:
         raise ValueError("Unsupported provider")
     selectable = dict(selectable_catalog_models(profile.provider, entries))
     if profile.default_model not in selectable:
@@ -188,10 +189,17 @@ def import_tenants(
     """Atomically import static tenants without overwriting differing records."""
     imported = 0
     for tenant_config in tenants:
-        if (
-            tenant_config.azure_default_model
-            not in tenant_config.azure_model_deployments
-        ):
+        default_model = tenant_config.azure_default_model
+        if default_model is None:
+            default_model = select_fallback_public_model(
+                tenant_config.azure_model_deployments
+            )
+            if default_model is None:
+                raise ValueError(
+                    f"TENANTS[{tenant_config.id!r}].azure_default_model is omitted "
+                    "and no preferred fallback model deployment is configured."
+                )
+        elif default_model not in tenant_config.azure_model_deployments:
             raise ValueError(
                 f"TENANTS[{tenant_config.id!r}].azure_default_model must name "
                 "a configured Azure model deployment."
@@ -226,7 +234,7 @@ def import_tenants(
                 profile
                 for profile in azure_profiles
                 if profile.settings == expected_settings
-                and profile.default_model == tenant_config.azure_default_model
+                and profile.default_model == default_model
             ]
             if not settings_matches:
                 raise ValueError(
@@ -279,7 +287,7 @@ def import_tenants(
                 "base_url": tenant_config.azure_base_url,
                 "model_deployments": dict(tenant_config.azure_model_deployments),
             },
-            default_model=tenant_config.azure_default_model,
+            default_model=default_model,
             route_priority=1,
             inference_secret_ciphertext=cipher.encrypt(tenant_config.azure_api_key),
         )

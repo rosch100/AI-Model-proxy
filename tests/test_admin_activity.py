@@ -778,6 +778,33 @@ def test_provider_attempt_table_stores_outcome_and_profile(admin_app):
     assert Base.metadata.tables["provider_attempt_events"].c.outcome.nullable is False
 
 
+def test_deepseek_activity_is_grouped_and_missing_usage_stays_unknown():
+    """The DeepSeek activity has its provider label without estimated counts."""
+    now = datetime(2026, 10, 3, 16, 20, tzinfo=timezone.utc)
+    event = InferenceActivityEvent(
+        tenant_id="acme",
+        provider="deepseek",
+        inbound_model="cursor-acme-model",
+        routed_model="deepseek-v4-flash",
+        total_tokens=None,
+        input_tokens=None,
+        output_tokens=None,
+        occurred_at=now - timedelta(minutes=1),
+    )
+
+    board = activity_board(
+        [event],
+        custom_model_id="cursor-acme-model",
+        now=now,
+    )
+
+    assert board.providers[0].provider == "deepseek"
+    assert board.providers[0].label == "DeepSeek"
+    assert board.providers[0].rows[0].tokens_per_request is None
+    assert board.requests[0].provider_label == "DeepSeek"
+    assert board.requests[0].total_tokens_label is None
+
+
 def test_record_inference_activity_stores_tenant_scoped_usage(admin_app):
     """Proxy completions persist the inbound model and token counts."""
     with admin_app.app_context():

@@ -151,9 +151,10 @@ def test_provider_circuit_migration_is_postgresql_only_and_has_atomic_identity(
     )
     migration = (
         ScriptDirectory.from_config(config)
-        .get_revision("20261008_provider_circuit_breaker")
+        .get_revision("20261008_provider_breaker")
         .module
     )
+    assert len(migration.revision) <= 32
     with Operations.context(migration_context):
         migration.upgrade()
 

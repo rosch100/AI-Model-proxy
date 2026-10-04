@@ -34,6 +34,7 @@ from app.persistence.models import (
     CostRefreshEvent,
     CostRefreshJob,
     CostUsageRecord,
+    InferenceActivityEvent,
     ProviderCatalogEntry,
     ProviderProfile,
     ProviderScopeBinding,
@@ -197,6 +198,57 @@ def test_deepseek_admin_profile_creation_and_catalog_refresh(admin_app, requests
     page = client.get("/admin/settings/connection")
     assert "DeepSeek" in page.get_data(as_text=True)
     assert "deepseek-v4-flash" in page.get_data(as_text=True)
+
+    activated = client.post(
+        f"/admin/settings/connection/{profile_id}/activate",
+        data={"csrf_token": csrf, "profile_id": profile_id},
+    )
+    assert activated.status_code == 302
+
+    admin_app.config.update(
+        AUTH_MODE="tenant", TENANT_CONFIG_SOURCE="database", ENABLE_AZURE=True
+    )
+    completion = requests_mock.post(
+        "https://api.deepseek.com/chat/completions",
+        content=(
+            b'data: {"model":"deepseek-v4-flash","choices":[{"delta":'
+            b'{"content":"hello"}}]}\n\n'
+            b'data: {"model":"deepseek-v4-flash","choices":[],"usage":'
+            b'{"prompt_tokens":17,"completion_tokens":5,"total_tokens":22}}'
+            b"\n\ndata: [DONE]\n\n"
+        ),
+        headers={"Content-Type": "text/event-stream"},
+    )
+    response = client.post(
+        "/v1/chat/completions",
+        headers={"Authorization": "Bearer cursor-key"},
+        json={
+            "model": "cursor-acme-model",
+            "messages": [{"role": "user", "content": "Hello"}],
+        },
+    )
+
+    assert response.status_code == 200
+    assert b'"content":"hello"' in response.data
+    assert response.data.endswith(b"data: [DONE]\n\n")
+    assert completion.last_request.headers["Authorization"] == (
+        "Bearer deepseek-inference-key"
+    )
+    assert completion.last_request.json()["model"] == "deepseek-v4-flash"
+    with database.sessions() as session:
+        activity = session.scalar(
+            select(InferenceActivityEvent).where(
+                InferenceActivityEvent.provider == "deepseek"
+            )
+        )
+    assert activity is not None
+    assert activity.tenant_id == "acme"
+    assert activity.profile_id == profile_id
+    assert activity.inbound_model == "cursor-acme-model"
+    assert activity.routed_model == "deepseek-v4-flash"
+    assert activity.input_tokens == 17
+    assert activity.output_tokens == 5
+    assert activity.total_tokens == 22
 
 
 def test_catalog_refresh_parses_deepseek_models(requests_mock):

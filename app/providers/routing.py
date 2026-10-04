@@ -2,13 +2,76 @@
 
 from __future__ import annotations
 
-from flask import Request, Response, current_app
+from collections.abc import Callable
+from datetime import datetime
+
+from flask import Request, Response, current_app, jsonify
 
 from app.azure.adapter import AzureAdapter
 from app.exceptions import ServiceConfigurationError
+from app.persistence.database import Database
+from app.persistence.inference_activity import (
+    complete_provider_attempt,
+    start_provider_attempt,
+)
+from app.persistence.provider_circuit_breaker import (
+    CircuitPermit,
+    ProviderCircuitBreakerStore,
+    ProviderCircuitStoreError,
+)
+from app.providers.circuit_breaker import (
+    ProviderCircuitAttempt,
+    retry_after_header,
+)
 from app.providers.failover_upstream import UpstreamError
 from app.providers.openai_compat import forward_openai_compatible
 from app.tenants import DatabaseTenantRoutingSnapshot, DatabaseTenantSnapshot
+
+ProviderForwarder = Callable[
+    [Request, DatabaseTenantSnapshot, str, int | None, ProviderCircuitAttempt | None],
+    Response,
+]
+
+
+def _forward_azure(
+    req: Request,
+    profile: DatabaseTenantSnapshot,
+    target_model: str,
+    attempt_id: int | None,
+    circuit_attempt: ProviderCircuitAttempt | None,
+) -> Response:
+    """Make one Azure attempt for the centrally selected provider model."""
+    return AzureAdapter().forward_attempt(
+        req,
+        profile,
+        target_model=target_model,
+        attempt_id=attempt_id,
+        circuit_attempt=circuit_attempt,
+    )
+
+
+def _forward_openai_compatible(
+    req: Request,
+    profile: DatabaseTenantSnapshot,
+    target_model: str,
+    attempt_id: int | None,
+    circuit_attempt: ProviderCircuitAttempt | None,
+) -> Response:
+    """Make one OpenAI-compatible attempt for the centrally selected model."""
+    return forward_openai_compatible(
+        req,
+        profile,
+        target_model=target_model,
+        attempt_id=attempt_id,
+        circuit_attempt=circuit_attempt,
+    )
+
+
+_PROVIDER_FORWARDERS: dict[str, ProviderForwarder] = {
+    "azure": _forward_azure,
+    "openai": _forward_openai_compatible,
+    "openrouter": _forward_openai_compatible,
+}
 
 
 def routed_profiles(
@@ -23,25 +86,80 @@ def routed_profiles(
             profile.provider != "azure" or current_app.config.get("ENABLE_AZURE", False)
         )
     )
-    return profiles[:1] if azure_only else profiles
+    return profiles
 
 
-def _azure_profile_for_catalog_model(
-    profiles: tuple[DatabaseTenantSnapshot, ...], model: object
-) -> DatabaseTenantSnapshot | None:
-    """Return the Azure account that already publishes this Cursor model ID."""
-    if not isinstance(model, str) or not model:
-        return None
-    requested = model.casefold()
+def _route_targets(
+    profiles: tuple[DatabaseTenantSnapshot, ...],
+    inbound_model: object,
+    custom_model_id: str,
+) -> tuple[tuple[DatabaseTenantSnapshot, str], ...]:
+    """Resolve native models to their provider first, then configure fallbacks."""
+    if not isinstance(inbound_model, str) or not inbound_model:
+        raise ServiceConfigurationError(
+            "Request model must match the tenant's Cursor model ID."
+        )
+    requested_model = (
+        inbound_model.casefold() if inbound_model != custom_model_id else None
+    )
+    if requested_model is not None and not any(
+        requested_model == model.casefold()
+        for profile in profiles
+        for model in profile.catalog_model_ids
+    ):
+        raise ServiceConfigurationError(
+            "Request model must match the tenant's Cursor model ID."
+        )
+
+    targets = []
     for profile in profiles:
-        if profile.provider != "azure":
-            continue
-        deployments = profile.azure_model_deployments
-        if model in deployments or any(
-            published.casefold() == requested for published in deployments
-        ):
-            return profile
-    return None
+        target = next(
+            (
+                model
+                for model in profile.catalog_model_ids
+                if requested_model is not None and model.casefold() == requested_model
+            ),
+            profile.default_model,
+        )
+        if target is None:
+            raise ServiceConfigurationError(
+                "The active provider profile has no default model configured."
+            )
+        targets.append((profile, target, target.casefold() == requested_model))
+    if requested_model is not None:
+        targets.sort(key=lambda item: not item[2])
+    return tuple((profile, target) for profile, target, _matches in targets)
+
+
+def _forward_profile(
+    req: Request,
+    profile: DatabaseTenantSnapshot,
+    target_model: str,
+    attempt_id: int | None,
+    circuit_attempt: ProviderCircuitAttempt | None,
+) -> Response:
+    """Dispatch one profile to its registered protocol adapter."""
+    if profile.provider is None:
+        raise ServiceConfigurationError("The provider profile has no provider.")
+    forwarder = _PROVIDER_FORWARDERS.get(profile.provider)
+    if forwarder is None:
+        raise ServiceConfigurationError(f"Unsupported provider {profile.provider!r}.")
+    return forwarder(req, profile, target_model, attempt_id, circuit_attempt)
+
+
+def _service_unavailable(code: str, message: str, retry_after: str) -> Response:
+    response = jsonify({"error": {"code": code, "message": message}})
+    response.status_code = 503
+    response.headers["Retry-After"] = retry_after
+    return response
+
+
+def _quota_unavailable(retry_at: datetime) -> Response:
+    return _service_unavailable(
+        "provider_quota_unavailable",
+        "All configured providers are temporarily unavailable.",
+        retry_after_header(retry_at),
+    )
 
 
 def forward_tenant_route(
@@ -60,25 +178,86 @@ def forward_tenant_route(
             "Request model must match the tenant's Cursor model ID."
         )
     inbound_model = payload.get("model")
-    if inbound_model != snapshot.custom_model_id:
-        azure_profile = _azure_profile_for_catalog_model(profiles, inbound_model)
-        if azure_profile is None:
-            raise ServiceConfigurationError(
-                "Request model must match the tenant's Cursor model ID."
+    route_targets = _route_targets(profiles, inbound_model, snapshot.custom_model_id)
+    database = current_app.extensions.get("database")
+    breaker_store = (
+        ProviderCircuitBreakerStore(database.sessions, database.secret_cipher)
+        if isinstance(database, Database)
+        else None
+    )
+    blocked_until = []
+    circuit_state_unavailable = False
+    attempts_started = 0
+    last_retryable_error: UpstreamError | None = None
+    for profile, target_model in route_targets:
+        permit = CircuitPermit(True)
+        if breaker_store is not None:
+            scopes = breaker_store.scopes_for_profile(
+                snapshot.id,
+                profile.provider,
+                profile.profile_id,
+                profile.provider_settings,
             )
-        return AzureAdapter().forward(req, azure_profile)
-    if azure_only:
-        return AzureAdapter().forward(req, profiles[0])
-    for profile in profiles:
+            try:
+                permit = breaker_store.acquire(scopes)
+            except ProviderCircuitStoreError:
+                circuit_state_unavailable = True
+                current_app.logger.exception(
+                    "Provider circuit state unavailable; skipping profile=%s",
+                    profile.profile_id,
+                )
+                continue
+            if not permit.allowed:
+                blocked_until.append(permit.retry_at)
+                continue
+        attempts_started += 1
+        circuit_attempt = (
+            ProviderCircuitAttempt(
+                breaker_store,
+                permit,
+                snapshot.id,
+                profile.provider,
+                profile.profile_id,
+                profile.provider_settings,
+            )
+            if breaker_store is not None
+            else None
+        )
+        attempt_id = start_provider_attempt(
+            tenant_id=snapshot.id,
+            provider=profile.provider,
+            profile_id=profile.profile_id,
+            inbound_model=inbound_model,
+            routed_model=target_model,
+        )
         try:
-            if profile.provider == "azure":
-                return AzureAdapter().forward_attempt(req, profile)
-            if profile.provider in {"openai", "openrouter"}:
-                return forward_openai_compatible(req, profile, routed=True)
-            raise ServiceConfigurationError(
-                f"Unsupported provider {profile.provider!r}."
+            response = _forward_profile(
+                req, profile, target_model, attempt_id, circuit_attempt
             )
+            if circuit_attempt is not None:
+                response.call_on_close(circuit_attempt.release)
+            return response
+        except ServiceConfigurationError:
+            if circuit_attempt is not None:
+                circuit_attempt.release()
+            complete_provider_attempt(attempt_id, outcome="failure", status_code=400)
+            raise
         except UpstreamError as exc:
+            circuit_update_failed = False
+            if circuit_attempt is not None:
+                try:
+                    circuit_attempt.failed(exc.classification)
+                except ProviderCircuitStoreError:
+                    circuit_update_failed = True
+                    circuit_state_unavailable = True
+                    current_app.logger.exception(
+                        "Could not resolve provider circuit state for profile=%s",
+                        profile.profile_id,
+                    )
+            complete_provider_attempt(
+                attempt_id, outcome="failure", status_code=exc.status
+            )
+            last_retryable_error = exc
             current_app.logger.warning(
                 "Provider attempt failed: tenant=%s profile=%s provider=%s status=%s retryable=%s",
                 snapshot.id,
@@ -87,6 +266,36 @@ def forward_tenant_route(
                 exc.status,
                 exc.retryable,
             )
-            if not exc.retryable or profile is profiles[-1]:
+            if circuit_update_failed:
+                continue
+            if not exc.retryable:
                 return exc.response()
-    raise AssertionError("A nonempty route must return a response or failure")
+        except Exception:  # noqa: BLE001 - release resources before re-raising
+            if circuit_attempt is not None:
+                try:
+                    circuit_attempt.release()
+                except ProviderCircuitStoreError:
+                    current_app.logger.exception(
+                        "Could not release provider circuit lease after unexpected failure for profile=%s",
+                        profile.profile_id,
+                    )
+            complete_provider_attempt(attempt_id, outcome="failure", status_code=None)
+            raise
+    if circuit_state_unavailable:
+        return _service_unavailable(
+            "provider_circuit_unavailable",
+            "Provider availability could not be verified; retry the request shortly.",
+            "30",
+        )
+    if last_retryable_error is not None:
+        return last_retryable_error.response()
+    if blocked_until:
+        retry_at = min(value for value in blocked_until if value is not None)
+        return _quota_unavailable(retry_at)
+    if attempts_started:
+        raise AssertionError(
+            "A started provider route must return a response or failure"
+        )
+    raise ServiceConfigurationError(
+        "No provider circuit state could be verified; no upstream request was sent."
+    )

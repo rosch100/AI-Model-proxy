@@ -3,12 +3,12 @@
 from __future__ import annotations
 
 import json
-from typing import Any
 
 import requests
 from flask import Request, Response, stream_with_context
 
 from app.exceptions import ServiceConfigurationError
+from app.providers.circuit_breaker import ProviderCircuitAttempt
 from app.providers.failover_upstream import (
     ROUTED_READ_TIMEOUT_SECONDS,
     chat_stream,
@@ -30,7 +30,12 @@ def openai_compatible_base_url(provider: str) -> str:
 
 
 def forward_openai_compatible(
-    req: Request, snapshot: DatabaseTenantSnapshot, *, routed: bool = False
+    req: Request,
+    snapshot: DatabaseTenantSnapshot,
+    *,
+    target_model: str,
+    attempt_id: int | None = None,
+    circuit_attempt: ProviderCircuitAttempt | None = None,
 ) -> Response:
     """Forward a Cursor request to OpenAI or OpenRouter Chat Completions."""
     if snapshot.profile_id is None:
@@ -47,8 +52,7 @@ def forward_openai_compatible(
     if not isinstance(payload, dict):
         payload = {}
     inbound_model = payload.get("model")
-    if inbound_model == snapshot.custom_model_id or not inbound_model:
-        payload = {**payload, "model": snapshot.default_model}
+    payload = {**payload, "model": target_model}
     tools = payload.get("tools")
     if (
         snapshot.provider == "openai"
@@ -81,42 +85,35 @@ def forward_openai_compatible(
             headers=headers,
             data=json.dumps(payload),
             stream=True,
-            timeout=(10.0, ROUTED_READ_TIMEOUT_SECONDS) if routed else 600,
+            timeout=(10.0, ROUTED_READ_TIMEOUT_SECONDS),
         )
     except requests.RequestException as exc:
-        if routed:
-            raise transport_failure(exc) from exc
-        raise
-    if routed:
-        prepared = prepare_upstream(upstream)
-        response = Response(
-            stream_with_context(
-                chat_stream(
-                    prepared,
-                    snapshot.custom_model_id,
-                    activity_tenant_id=snapshot.id,
-                    activity_provider=snapshot.provider,
-                    activity_profile_id=snapshot.profile_id,
-                    inbound_model=inbound_model,
-                    routed_model=payload.get("model"),
-                )
-            ),
-            content_type="text/event-stream",
-            headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
-        )
-        response.call_on_close(prepared.close)
-        return response
-
-    def generate() -> Any:
-        try:
-            for chunk in upstream.iter_content(chunk_size=1024):
-                if chunk:
-                    yield chunk
-        finally:
-            upstream.close()
-
-    return Response(
-        stream_with_context(generate()),
-        status=upstream.status_code,
-        content_type=upstream.headers.get("Content-Type", "text/event-stream"),
+        raise transport_failure(exc) from exc
+    prepared = prepare_upstream(
+        upstream,
+        provider=snapshot.provider,
+        settings=snapshot.provider_settings,
     )
+    if circuit_attempt is not None:
+        circuit_attempt.preflight_succeeded()
+    response = Response(
+        stream_with_context(
+            chat_stream(
+                prepared,
+                snapshot.custom_model_id,
+                activity_tenant_id=snapshot.id,
+                activity_provider=snapshot.provider,
+                activity_profile_id=snapshot.profile_id,
+                inbound_model=inbound_model,
+                routed_model=target_model,
+                attempt_id=attempt_id,
+                provider=snapshot.provider,
+                settings=snapshot.provider_settings,
+                circuit_attempt=circuit_attempt,
+            )
+        ),
+        content_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
+    response.call_on_close(prepared.close)
+    return response

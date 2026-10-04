@@ -347,6 +347,8 @@ class RequestAdapter:
         self,
         req: Request,
         tenant: TenantConfig | DatabaseTenantSnapshot | None = None,
+        *,
+        target_model: str | None = None,
     ) -> Dict[str, Any]:
         """Build requests.request kwargs for the Azure Responses API call.
 
@@ -375,7 +377,22 @@ class RequestAdapter:
         if tenant is None:
             tenant = current_tenant()
         azure_url, azure_api_key, deployment_map = self._azure_runtime_settings(tenant)
-        if (
+        if isinstance(tenant, DatabaseTenantSnapshot) and target_model is not None:
+            matching_model = next(
+                (
+                    model
+                    for model in deployment_map
+                    if model.casefold() == target_model.casefold()
+                ),
+                None,
+            )
+            if matching_model is None:
+                raise ServiceConfigurationError(
+                    "The selected Azure profile model is not present in "
+                    "the tenant deployment map."
+                )
+            payload = {**payload, "model": matching_model}
+        elif (
             isinstance(tenant, DatabaseTenantSnapshot)
             and inbound_model == tenant.custom_model_id
         ):

@@ -80,6 +80,47 @@ def _add_refresh(session, *, job_id, binding_id, status, created_at, amount=None
         )
 
 
+def test_dashboard_shows_status_for_each_same_provider_account(admin_app):
+    """Show every account and its independent route status on the dashboard."""
+    database = admin_app.extensions["database"]
+    with database.sessions.begin() as session:
+        session.add_all(
+            (
+                ProviderProfile(
+                    id="openai-primary-dashboard",
+                    tenant_id="acme",
+                    provider="openai",
+                    display_name="Primary OpenAI",
+                    settings={},
+                    default_model="gpt-5.4",
+                    route_priority=1,
+                    inference_secret_ciphertext="encrypted-primary",
+                ),
+                ProviderProfile(
+                    id="openai-backup-dashboard",
+                    tenant_id="acme",
+                    provider="openai",
+                    display_name="Backup OpenAI",
+                    settings={},
+                    default_model="gpt-5.4",
+                    route_priority=2,
+                    inference_secret_ciphertext="encrypted-backup",
+                ),
+            )
+        )
+
+    response = _authenticated_client(admin_app).get("/admin/")
+    body = response.get_data(as_text=True)
+
+    assert response.status_code == 200
+    assert 'data-provider-account="openai-primary-dashboard"' in body
+    assert 'data-provider-account="openai-backup-dashboard"' in body
+    assert "Primary OpenAI" in body
+    assert "Backup OpenAI" in body
+    assert "Position 1" in body
+    assert "Position 2" in body
+
+
 def test_dashboard_explains_missing_cost_configuration(admin_app):
     """An unconfigured tenant sees a direct path to billing setup."""
     response = _authenticated_client(admin_app).get("/admin/")

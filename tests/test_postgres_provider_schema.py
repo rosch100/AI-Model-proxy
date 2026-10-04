@@ -5,13 +5,17 @@ from __future__ import annotations
 import base64
 import hashlib
 import json
+from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, timedelta, timezone
+from threading import Barrier
 
 import pytest
 from sqlalchemy import inspect, select, text
 from sqlalchemy.exc import IntegrityError
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, sessionmaker
 
 from app.persistence.models import ProviderProfile, Tenant
+from app.persistence.provider_circuit_breaker import ProviderCircuitBreakerStore
 from app.persistence.repositories import import_tenants
 from app.persistence.secrets import SecretCipher
 from app.tenants import TenantConfig
@@ -255,9 +259,12 @@ def test_environment_import_fails_closed_without_unique_active_azure_profile(
                 tenant_id=source.id,
                 provider="azure",
                 display_name=profile_id,
-                settings={"base_url": "https://other.openai.azure.com"},
-                default_model="gpt-5.5",
-                inference_secret_ciphertext=cipher.encrypt("peer-secret"),
+                settings={
+                    "base_url": source.azure_base_url,
+                    "model_deployments": dict(source.azure_model_deployments),
+                },
+                default_model=source.azure_default_model,
+                inference_secret_ciphertext=cipher.encrypt(source.azure_api_key),
             )
             for profile_id in azure_profile_ids
         ]
@@ -275,8 +282,17 @@ def test_environment_import_fails_closed_without_unique_active_azure_profile(
             )
         session.add_all(profiles)
         session.flush()
-        for profile in profiles:
-            profile.route_priority = 1 if profile.id == primary_profile_id else None
+        if azure_profile_ids:
+            active_profile_ids = set(azure_profile_ids)
+        elif primary_profile_id is not None:
+            active_profile_ids = {primary_profile_id}
+        else:
+            active_profile_ids = set()
+        for priority, profile in enumerate(
+            (profile for profile in profiles if profile.id in active_profile_ids),
+            start=1,
+        ):
+            profile.route_priority = priority
         session.flush()
         profile_columns = tuple(ProviderProfile.__table__.columns)
         profile_rows_before = session.execute(
@@ -469,3 +485,38 @@ def test_migration_preserves_profile_catalog_bindings_jobs_and_costs_round_trip(
     with databases.admin_engine.connect() as connection:
         after_round_trip = _legacy_snapshot(connection)
     assert after_round_trip == before
+
+
+def test_provider_circuit_probe_lease_is_exclusive_across_postgres_sessions(
+    postgres_test_databases,
+):
+    """Concurrent workers cannot both claim the same due provider scope."""
+    databases = postgres_test_databases
+    databases.upgrade("head")
+    with databases.runtime_engine.begin() as connection:
+        connection.execute(
+            text(
+                "INSERT INTO tenants (id, api_key_hash, custom_model_id) "
+                "VALUES ('breaker-tenant', 'breaker-digest', 'breaker-cursor')"
+            )
+        )
+
+    now = datetime.now(timezone.utc)
+    cipher = SecretCipher.from_key(base64.urlsafe_b64encode(b"k" * 32).decode("ascii"))
+    sessions = sessionmaker(bind=databases.runtime_engine, expire_on_commit=False)
+    store = ProviderCircuitBreakerStore(sessions, cipher)
+    scope = store.scope("breaker-tenant", "openai", "profile", "profile-a")
+    store.open_quota(scope, now=now - timedelta(hours=1))
+
+    barrier = Barrier(2)
+
+    def acquire_after_barrier():
+        barrier.wait(timeout=10)
+        return store.acquire((scope,), now=now)
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        permits = tuple(pool.map(lambda _worker: acquire_after_barrier(), range(2)))
+
+    assert sum(permit.allowed for permit in permits) == 1
+    assert sum(bool(permit.leases) for permit in permits) == 1
+    assert sum(not permit.allowed for permit in permits) == 1

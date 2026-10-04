@@ -21,7 +21,7 @@ from flask import (
     request,
     url_for,
 )
-from sqlalchemy import func, select
+from sqlalchemy import func, or_, select
 from sqlalchemy.exc import IntegrityError
 from webauthn.helpers import parse_authentication_credential_json
 from webauthn.helpers.exceptions import (
@@ -103,6 +103,7 @@ from app.persistence.models import (
     CostRefreshJob,
     CostUsageRecord,
     InferenceActivityEvent,
+    ProviderAttemptEvent,
     ProviderCatalogEntry,
     ProviderProfile,
     ProviderScopeBinding,
@@ -118,6 +119,10 @@ from app.persistence.passkeys import (
     insert_passkey,
     list_passkeys,
     store_challenge,
+)
+from app.persistence.provider_circuit_breaker import (
+    CircuitSnapshot,
+    ProviderCircuitBreakerStore,
 )
 from app.providers.azure_url import validate_azure_base_url
 from app.providers.catalog import (
@@ -483,6 +488,99 @@ def _activity_period_hours() -> int:
     return period
 
 
+def _provider_circuit_scopes_by_profile(
+    database: Database, tenant_id: str, profiles: tuple[ProviderProfile, ...]
+) -> dict[str, tuple[CircuitSnapshot, ...]]:
+    """Load only tenant-owned profile and configured shared circuit scopes."""
+    store = ProviderCircuitBreakerStore(database.sessions, database.secret_cipher)
+    profile_scopes = {
+        profile.id: store.scopes_for_profile(
+            tenant_id,
+            profile.provider,
+            profile.id,
+            profile.settings,
+        )
+        for profile in profiles
+    }
+    all_scopes = tuple(scope for scopes in profile_scopes.values() for scope in scopes)
+    snapshots = store.snapshots(tenant_id, all_scopes)
+    snapshots_by_identity = {
+        (
+            snapshot.scope.provider,
+            snapshot.scope.scope_type,
+            snapshot.scope.fingerprint,
+        ): snapshot
+        for snapshot in snapshots
+    }
+    return {
+        profile_id: tuple(
+            snapshots_by_identity[identity]
+            for scope in scopes
+            if (identity := (scope.provider, scope.scope_type, scope.fingerprint))
+            in snapshots_by_identity
+        )
+        for profile_id, scopes in profile_scopes.items()
+    }
+
+
+def _latest_provider_activity_events(session, tenant_id: str):
+    """Load one last-request record per profile for the provider status fragment."""
+    ranked_events = (
+        select(
+            InferenceActivityEvent.id.label("event_id"),
+            func.row_number()
+            .over(
+                partition_by=InferenceActivityEvent.profile_id,
+                order_by=(
+                    InferenceActivityEvent.occurred_at.desc(),
+                    InferenceActivityEvent.id.desc(),
+                ),
+            )
+            .label("event_rank"),
+        )
+        .where(
+            InferenceActivityEvent.tenant_id == tenant_id,
+            InferenceActivityEvent.profile_id.is_not(None),
+            InferenceActivityEvent.occurred_at
+            >= datetime.now(timezone.utc) - timedelta(hours=ACTIVITY_LOOKBACK_HOURS),
+        )
+        .subquery()
+    )
+    statement = (
+        select(InferenceActivityEvent)
+        .join(ranked_events, InferenceActivityEvent.id == ranked_events.c.event_id)
+        .where(ranked_events.c.event_rank == 1)
+        .order_by(InferenceActivityEvent.profile_id)
+    )
+    return tuple(session.scalars(statement))
+
+
+def _provider_attempt_events(session, tenant_id: str):
+    """Load recent status history and pending attempts within telemetry retention."""
+    now = datetime.now(timezone.utc)
+    status_start = now - timedelta(minutes=15)
+    pending_start = now - timedelta(hours=24)
+    statement = (
+        select(ProviderAttemptEvent)
+        .where(
+            ProviderAttemptEvent.tenant_id == tenant_id,
+            or_(
+                ProviderAttemptEvent.occurred_at >= status_start,
+                ProviderAttemptEvent.completed_at >= status_start,
+                (
+                    (ProviderAttemptEvent.outcome == "pending")
+                    & (ProviderAttemptEvent.occurred_at >= pending_start)
+                ),
+            ),
+        )
+        .order_by(
+            ProviderAttemptEvent.occurred_at.asc(),
+            ProviderAttemptEvent.id.asc(),
+        )
+    )
+    return tuple(session.scalars(statement))
+
+
 def _activity_events(
     session, tenant_id: str, lookback_hours: int, *, limit: int | None = None
 ):
@@ -618,6 +716,7 @@ def dashboard():
         request_events = _activity_events(
             session, tenant.id, activity_hours, limit=1000
         )
+        provider_attempts = _provider_attempt_events(session, tenant.id)
         view = dashboard_view(
             tenant,
             profiles,
@@ -625,8 +724,12 @@ def dashboard():
             jobs,
             records,
             activity_events,
+            circuit_scopes_by_profile=_provider_circuit_scopes_by_profile(
+                database, tenant.id, profiles
+            ),
             request_events=request_events,
             request_period_hours=activity_hours,
+            provider_attempts=provider_attempts,
         )
         session.expunge_all()
     return render_template(
@@ -635,6 +738,40 @@ def dashboard():
         logout_form=LoginForm(),
         activity_period_options=ACTIVITY_LOOKBACK_OPTIONS,
     )
+
+
+@admin_bp.get("/provider-status")
+@login_required
+def dashboard_provider_status():
+    """Return the live provider profile status fragment for HTMX polling."""
+    database = _database()
+    with database.sessions() as session:
+        tenant = session.get(Tenant, g.admin.tenant_id)
+        profiles = tuple(
+            session.scalars(
+                select(ProviderProfile)
+                .where(
+                    ProviderProfile.tenant_id == tenant.id,
+                    ProviderProfile.deleted_at.is_(None),
+                )
+                .order_by(ProviderProfile.provider, ProviderProfile.display_name)
+            )
+        )
+        activity_events = _latest_provider_activity_events(session, tenant.id)
+        provider_attempts = _provider_attempt_events(session, tenant.id)
+        circuit_scopes_by_profile = _provider_circuit_scopes_by_profile(
+            database, tenant.id, profiles
+        )
+        view = dashboard_view(
+            tenant,
+            profiles,
+            activity_events=activity_events,
+            provider_attempts=provider_attempts,
+            circuit_scopes_by_profile=circuit_scopes_by_profile,
+            include_activity_board=False,
+        )
+        session.expunge_all()
+    return render_template("admin/_provider_status.html", view=view)
 
 
 @admin_bp.get("/activity")

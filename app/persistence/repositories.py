@@ -145,6 +145,12 @@ class TenantRepository:
                     profile_name=profile.display_name,
                     history_generation=profile.history_generation,
                     profile_deleted=False,
+                    catalog_model_ids=tuple(
+                        model
+                        for model, _ in selectable_catalog_models(
+                            profile.provider, catalogs[profile.id]
+                        )
+                    ),
                 )
             )
         return DatabaseTenantRoutingSnapshot(
@@ -196,21 +202,18 @@ def import_tenants(
                 raise ValueError(
                     f"Existing tenant {tenant_config.id!r} has a different API key hash"
                 )
-            profiles = list(
-                session.scalars(
-                    select(ProviderProfile)
-                    .where(
-                        ProviderProfile.tenant_id == tenant_config.id,
-                        ProviderProfile.deleted_at.is_(None),
-                        ProviderProfile.route_priority.is_not(None),
-                    )
-                    .order_by(ProviderProfile.route_priority)
+            azure_profiles = session.scalars(
+                select(ProviderProfile)
+                .where(
+                    ProviderProfile.tenant_id == tenant_config.id,
+                    ProviderProfile.provider == "azure",
+                    ProviderProfile.deleted_at.is_(None),
+                    ProviderProfile.route_priority.is_not(None),
                 )
+                .order_by(ProviderProfile.route_priority)
             )
-            profile = (
-                profiles[0] if profiles and profiles[0].provider == "azure" else None
-            )
-            if profile is None:
+            azure_profiles = list(azure_profiles)
+            if not azure_profiles:
                 raise ValueError(
                     f"Existing tenant {tenant_config.id!r} has ambiguous active "
                     "Azure profile resolution for environment import"
@@ -219,21 +222,41 @@ def import_tenants(
                 "base_url": tenant_config.azure_base_url,
                 "model_deployments": dict(tenant_config.azure_model_deployments),
             }
-            if (
-                profile.settings != expected_settings
-                or profile.default_model != tenant_config.azure_default_model
-            ):
+            settings_matches = [
+                profile
+                for profile in azure_profiles
+                if profile.settings == expected_settings
+                and profile.default_model == tenant_config.azure_default_model
+            ]
+            if not settings_matches:
                 raise ValueError(
                     f"Existing tenant {tenant_config.id!r} has different provider data"
                 )
-            if profile.inference_secret_ciphertext is None:
+            profiles_with_secrets = [
+                profile
+                for profile in settings_matches
+                if profile.inference_secret_ciphertext is not None
+            ]
+            if not profiles_with_secrets:
                 raise ValueError(
                     f"Existing tenant {tenant_config.id!r} has no provider secret"
                 )
-            stored_secret = cipher.decrypt(profile.inference_secret_ciphertext)
-            if not hmac.compare_digest(stored_secret, tenant_config.azure_api_key):
+            matching_profiles = [
+                profile
+                for profile in profiles_with_secrets
+                if hmac.compare_digest(
+                    cipher.decrypt(profile.inference_secret_ciphertext),
+                    tenant_config.azure_api_key,
+                )
+            ]
+            if not matching_profiles:
                 raise ValueError(
                     f"Existing tenant {tenant_config.id!r} has a different provider secret"
+                )
+            if len(matching_profiles) > 1:
+                raise ValueError(
+                    f"Existing tenant {tenant_config.id!r} has ambiguous active "
+                    "Azure profile resolution for environment import"
                 )
             continue
 

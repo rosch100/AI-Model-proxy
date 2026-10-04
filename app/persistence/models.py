@@ -513,6 +513,100 @@ class AuditEvent(Base):
     )
 
 
+class ProviderAttemptEvent(Base):
+    """One pending or completed upstream attempt for a provider profile."""
+
+    __tablename__ = "provider_attempt_events"
+    __table_args__ = (
+        CheckConstraint(
+            "provider IN ('azure', 'openai', 'openrouter')",
+            name="ck_provider_attempt_provider",
+        ),
+        CheckConstraint(
+            "outcome IN ('pending', 'success', 'failure', 'aborted')",
+            name="ck_provider_attempt_outcome",
+        ),
+        Index(
+            "ix_provider_attempt_tenant_profile_time",
+            "tenant_id",
+            "profile_id",
+            "occurred_at",
+        ),
+        Index("ix_provider_attempt_occurred_at", "occurred_at"),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    tenant_id: Mapped[str] = mapped_column(ForeignKey("tenants.id"), nullable=False)
+    provider: Mapped[str] = mapped_column(String(16), nullable=False)
+    profile_id: Mapped[str] = mapped_column(
+        ForeignKey("provider_profiles.id", ondelete="CASCADE"), nullable=False
+    )
+    inbound_model: Mapped[str] = mapped_column(String(256), nullable=False)
+    routed_model: Mapped[str] = mapped_column(String(256), nullable=False)
+    outcome: Mapped[str] = mapped_column(String(16), nullable=False)
+    status_code: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    occurred_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+    completed_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+
+
+class ProviderCircuitState(Base):
+    """Persistent quota breaker state with an optional exclusive probe lease."""
+
+    __tablename__ = "provider_circuit_states"
+    __table_args__ = (
+        UniqueConstraint(
+            "tenant_id",
+            "provider",
+            "scope_fingerprint",
+            name="uq_provider_circuit_scope",
+        ),
+        CheckConstraint(
+            "provider IN ('azure', 'openai', 'openrouter')",
+            name="ck_provider_circuit_provider",
+        ),
+        CheckConstraint(
+            "scope_type IN ('profile', 'organization', 'project')",
+            name="ck_provider_circuit_scope_type",
+        ),
+        CheckConstraint(
+            "failure_category = 'quota_exhausted'",
+            name="ck_provider_circuit_failure_category",
+        ),
+        CheckConstraint("failure_count >= 1", name="ck_provider_circuit_failure_count"),
+        CheckConstraint(
+            "(lease_token IS NULL) = (lease_until IS NULL)",
+            name="ck_provider_circuit_lease_pair",
+        ),
+        Index(
+            "ix_provider_circuit_tenant_probe",
+            "tenant_id",
+            "probe_at",
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    tenant_id: Mapped[str] = mapped_column(
+        ForeignKey("tenants.id", ondelete="CASCADE"), nullable=False
+    )
+    provider: Mapped[str] = mapped_column(String(16), nullable=False)
+    scope_type: Mapped[str] = mapped_column(String(32), nullable=False)
+    scope_fingerprint: Mapped[str] = mapped_column(String(64), nullable=False)
+    failure_category: Mapped[str] = mapped_column(String(32), nullable=False)
+    failure_count: Mapped[int] = mapped_column(Integer, nullable=False)
+    probe_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    lease_token: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    lease_until: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False
+    )
+
+
 class InferenceActivityEvent(Base):
     """One completed proxy inference, for live tenant activity on the overview."""
 

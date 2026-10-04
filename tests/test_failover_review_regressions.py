@@ -30,12 +30,12 @@ def upstream(chunks, status=200):
 def test_known_http_status_does_not_read_error_body():
     """A body timeout cannot erase an already known retryable status."""
     raw = upstream([], 429)
-    raw.json.side_effect = requests.ReadTimeout("unknown outcome")
+    raw.iter_content.side_effect = requests.ReadTimeout("unknown outcome")
     with pytest.raises(UpstreamError) as caught:
         prepare_upstream(raw)
     assert caught.value.status == 429
     assert caught.value.retryable
-    raw.json.assert_not_called()
+    raw.iter_content.assert_called_once_with(chunk_size=4096)
     raw.close.assert_called_once()
 
 
@@ -89,6 +89,42 @@ def test_late_chat_error_is_sanitized():
     assert b"partial" in body
     assert b'"error"' in body
     assert b"secret" not in body
+
+
+def test_late_openrouter_quota_error_is_sanitized_with_provider_classification():
+    """Structured OpenRouter metadata triggers quota handling without leaking details."""
+    raw = upstream(
+        [
+            event({"choices": [{"delta": {"content": "partial"}}]}),
+            event(
+                {
+                    "error": {
+                        "type": "provider_error",
+                        "message": "private provider message",
+                        "metadata": {
+                            "limit_source": "openrouter_key_limit",
+                            "key": "private-provider-metadata",
+                        },
+                    }
+                }
+            ),
+        ]
+    )
+    circuit_attempt = Mock()
+    body = b"".join(
+        chat_stream(
+            prepare_upstream(raw),
+            "cursor-model",
+            provider="openrouter",
+            circuit_attempt=circuit_attempt,
+        )
+    )
+    assert b"partial" in body
+    assert b"upstream_error" in body
+    assert b"private provider message" not in body
+    assert b"private-provider-metadata" not in body
+    classification = circuit_attempt.failed.call_args.args[0]
+    assert classification.category == "quota_exhausted"
 
 
 def test_late_azure_error_is_sanitized(app, monkeypatch):

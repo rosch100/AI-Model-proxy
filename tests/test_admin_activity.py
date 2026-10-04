@@ -4,14 +4,23 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
 
-from sqlalchemy import select
+from sqlalchemy import inspect, select
 
-from app.admin.view_models import activity_board, format_relative_time
+from app.admin.view_models import activity_board, dashboard_view, format_relative_time
 from app.persistence.inference_activity import (
+    complete_provider_attempt,
     parse_provider_usage,
     record_inference_activity,
+    start_provider_attempt,
 )
-from app.persistence.models import InferenceActivityEvent
+from app.persistence.models import (
+    Base,
+    InferenceActivityEvent,
+    ProviderAttemptEvent,
+    ProviderProfile,
+    Tenant,
+)
+from app.persistence.provider_circuit_breaker import ProviderCircuitBreakerStore
 from tests.test_admin_dashboard import _authenticated_client
 
 
@@ -323,6 +332,450 @@ def test_dashboard_renders_provider_model_activity(admin_app):
     assert "zuletzt" in body
     assert 'id="dashboard-activity"' in fragment
     assert "gpt-6-luna" in fragment
+
+
+def test_provider_status_hysteresis_requires_two_failures_then_quiets(admin_app):
+    """Require two recent failures and clear only after a quiet recovery window."""
+    now = datetime.now(timezone.utc)
+    tenant = Tenant(id="acme", api_key_hash="a" * 64, custom_model_id="cursor-acme")
+    profile = ProviderProfile(
+        id="openai-hysteresis",
+        tenant_id="acme",
+        provider="openai",
+        display_name="Hysteresis",
+        settings={},
+        default_model="gpt-5.4",
+        route_priority=1,
+        inference_secret_ciphertext="encrypted-key",
+    )
+    profile_status = dashboard_view(
+        tenant,
+        (profile,),
+        provider_attempts=(
+            ProviderAttemptEvent(
+                profile_id=profile.id,
+                outcome="failure",
+                occurred_at=now - timedelta(seconds=8),
+            ),
+            ProviderAttemptEvent(
+                profile_id=profile.id,
+                outcome="failure",
+                occurred_at=now - timedelta(seconds=2),
+            ),
+        ),
+        now=now,
+    ).providers[0]
+    quiet_status = dashboard_view(
+        tenant,
+        (profile,),
+        provider_attempts=(
+            ProviderAttemptEvent(
+                profile_id=profile.id,
+                outcome="failure",
+                occurred_at=now - timedelta(seconds=25),
+            ),
+            ProviderAttemptEvent(
+                profile_id=profile.id,
+                outcome="failure",
+                occurred_at=now - timedelta(seconds=22),
+            ),
+        ),
+        now=now,
+    ).providers[0]
+    single_failure_status = dashboard_view(
+        tenant,
+        (profile,),
+        provider_attempts=(
+            ProviderAttemptEvent(
+                profile_id=profile.id,
+                outcome="failure",
+                occurred_at=now - timedelta(seconds=2),
+            ),
+        ),
+        now=now,
+    ).providers[0]
+    long_running_status = dashboard_view(
+        tenant,
+        (profile,),
+        provider_attempts=(
+            ProviderAttemptEvent(
+                profile_id=profile.id,
+                outcome="pending",
+                occurred_at=now - timedelta(seconds=60),
+            ),
+        ),
+        now=now,
+    ).providers[0]
+
+    assert profile_status.outcome == "failure"
+    assert quiet_status.outcome == "success"
+    assert single_failure_status.outcome == "success"
+    assert long_running_status.outcome == "pending"
+    assert long_running_status.has_current_activity
+
+
+def test_provider_status_needs_consecutive_failures_and_recovers_after_quiet_period(
+    admin_app,
+):
+    """A success breaks failure streaks; another failure needs a fresh pair."""
+    now = datetime.now(timezone.utc)
+    tenant = Tenant(id="acme", api_key_hash="a" * 64, custom_model_id="cursor-acme")
+    profile = ProviderProfile(
+        id="openai-hysteresis-reset",
+        tenant_id="acme",
+        provider="openai",
+        display_name="Hysteresis reset",
+        settings={},
+        default_model="gpt-5.4",
+        route_priority=1,
+        inference_secret_ciphertext="encrypted-key",
+    )
+    attempts = (
+        ProviderAttemptEvent(
+            profile_id=profile.id,
+            outcome="failure",
+            occurred_at=now - timedelta(seconds=12),
+        ),
+        ProviderAttemptEvent(
+            profile_id=profile.id,
+            outcome="success",
+            occurred_at=now - timedelta(seconds=8),
+        ),
+        ProviderAttemptEvent(
+            profile_id=profile.id,
+            outcome="failure",
+            occurred_at=now - timedelta(seconds=2),
+        ),
+    )
+
+    status = dashboard_view(
+        tenant, (profile,), provider_attempts=attempts, now=now
+    ).providers[0]
+
+    assert status.outcome == "success"
+
+
+def test_provider_attempt_lifecycle_prunes_events_older_than_one_day(admin_app):
+    """Keep provider-attempt telemetry bounded to one day of history."""
+    database = admin_app.extensions["database"]
+    old_attempt = ProviderAttemptEvent(
+        tenant_id="acme",
+        provider="openai",
+        profile_id="openai-retention",
+        inbound_model="cursor-acme",
+        routed_model="gpt-5.4",
+        outcome="success",
+        status_code=200,
+        occurred_at=datetime.now(timezone.utc) - timedelta(days=2),
+        completed_at=datetime.now(timezone.utc) - timedelta(days=2),
+    )
+    with database.sessions.begin() as session:
+        session.add(
+            ProviderProfile(
+                id="openai-retention",
+                tenant_id="acme",
+                provider="openai",
+                display_name="Retention",
+                settings={},
+                default_model="gpt-5.4",
+                inference_secret_ciphertext="encrypted-key",
+            )
+        )
+        session.flush()
+        session.add(old_attempt)
+
+    with database.sessions() as session:
+        assert (
+            session.scalar(
+                select(ProviderAttemptEvent.id).where(
+                    ProviderAttemptEvent.occurred_at
+                    < datetime.now(timezone.utc) - timedelta(hours=24)
+                )
+            )
+            == old_attempt.id
+        )
+
+    with admin_app.app_context():
+        attempt_id = start_provider_attempt(
+            tenant_id="acme",
+            provider="openai",
+            profile_id="openai-retention",
+            inbound_model="cursor-acme",
+            routed_model="gpt-5.4",
+        )
+    assert attempt_id is not None
+
+    with database.sessions() as session:
+        cutoff = datetime.now(timezone.utc) - timedelta(hours=24)
+        expired = tuple(
+            session.scalars(
+                select(ProviderAttemptEvent).where(
+                    ProviderAttemptEvent.occurred_at < cutoff
+                )
+            )
+        )
+        assert expired == ()
+        assert session.get(ProviderAttemptEvent, attempt_id).outcome == "pending"
+
+
+def test_provider_attempt_lifecycle_records_pending_then_terminal_outcome(admin_app):
+    """Keep one attempt row while the adapter finalizes its stream result."""
+    database = admin_app.extensions["database"]
+    with database.sessions.begin() as session:
+        session.add(
+            ProviderProfile(
+                id="openai-attempt-lifecycle",
+                tenant_id="acme",
+                provider="openai",
+                display_name="Attempt lifecycle",
+                settings={},
+                default_model="gpt-5.4",
+                route_priority=1,
+                inference_secret_ciphertext="encrypted-key",
+            )
+        )
+
+    with admin_app.app_context():
+        attempt_id = start_provider_attempt(
+            tenant_id="acme",
+            provider="openai",
+            profile_id="openai-attempt-lifecycle",
+            inbound_model="cursor-acme",
+            routed_model="gpt-5.4",
+        )
+
+    with database.sessions() as session:
+        attempt = session.get(ProviderAttemptEvent, attempt_id)
+        assert attempt.outcome == "pending"
+
+    with admin_app.app_context():
+        complete_provider_attempt(attempt_id, outcome="failure", status_code=429)
+
+    with database.sessions() as session:
+        attempt = session.get(ProviderAttemptEvent, attempt_id)
+
+    assert attempt.outcome == "failure"
+    assert attempt.status_code == 429
+    assert attempt.completed_at is not None
+
+
+def test_dashboard_provider_status_poll_renders_hysteresis_state(admin_app):
+    """Refresh the provider icons with orange active status per profile."""
+    database = admin_app.extensions["database"]
+    now = datetime.now(timezone.utc)
+    with database.sessions.begin() as session:
+        profile = ProviderProfile(
+            id="openai-warning-dashboard",
+            tenant_id="acme",
+            provider="openai",
+            display_name="Warning profile",
+            settings={},
+            default_model="gpt-5.4",
+            route_priority=1,
+            inference_secret_ciphertext="encrypted-key",
+        )
+        session.add(profile)
+        session.flush()
+        session.add_all(
+            (
+                ProviderAttemptEvent(
+                    tenant_id="acme",
+                    provider="openai",
+                    profile_id=profile.id,
+                    inbound_model="cursor-acme",
+                    routed_model="gpt-5.4",
+                    outcome="failure",
+                    status_code=429,
+                    occurred_at=now - timedelta(seconds=8),
+                    completed_at=now - timedelta(seconds=8),
+                ),
+                ProviderAttemptEvent(
+                    tenant_id="acme",
+                    provider="openai",
+                    profile_id=profile.id,
+                    inbound_model="cursor-acme",
+                    routed_model="gpt-5.4",
+                    outcome="failure",
+                    status_code=429,
+                    occurred_at=now - timedelta(seconds=2),
+                    completed_at=now - timedelta(seconds=2),
+                ),
+            )
+        )
+
+    response = _authenticated_client(admin_app).get("/admin/provider-status")
+    body = response.get_data(as_text=True)
+
+    assert response.status_code == 200
+    assert 'data-provider-account="openai-warning-dashboard"' in body
+    assert 'data-activity-outcome="failure"' in body
+    assert "HTTP 429" in body
+    assert "is-warning is-active" in body
+    assert 'hx-trigger="every 5s"' in body
+
+
+def test_provider_status_poll_uses_activity_without_building_history_board(
+    admin_app, monkeypatch
+):
+    """The status fragment loads only status inputs, not the history board."""
+
+    def unexpected_activity_query(*_args, **_kwargs):
+        raise AssertionError(
+            "provider status polling must not load full activity history"
+        )
+
+    def unexpected_activity_board(*_args, **_kwargs):
+        raise AssertionError("provider status polling must not build the history board")
+
+    monkeypatch.setattr("app.admin.views._activity_events", unexpected_activity_query)
+    monkeypatch.setattr(
+        "app.admin.view_models.activity_board", unexpected_activity_board
+    )
+    database = admin_app.extensions["database"]
+    occurred_at = datetime.now(timezone.utc) - timedelta(hours=2)
+    with database.sessions.begin() as session:
+        profile = ProviderProfile(
+            id="openai-provider-poll-history",
+            tenant_id="acme",
+            provider="openai",
+            display_name="Poll history",
+            settings={},
+            default_model="gpt-5.4",
+            inference_secret_ciphertext="encrypted-key",
+        )
+        session.add(profile)
+        session.flush()
+        session.add(
+            InferenceActivityEvent(
+                tenant_id="acme",
+                provider="openai",
+                profile_id=profile.id,
+                inbound_model="cursor-acme",
+                routed_model="gpt-5.4",
+                input_tokens=2,
+                output_tokens=3,
+                total_tokens=5,
+                occurred_at=occurred_at,
+            )
+        )
+
+    response = _authenticated_client(admin_app).get("/admin/provider-status")
+    body = response.get_data(as_text=True)
+
+    assert response.status_code == 200
+    assert "letzte Anfrage vor 2 Stunden" in body
+    assert occurred_at.isoformat() in body
+
+
+def test_provider_status_poll_keeps_attempts_running_beyond_fifteen_minutes(
+    admin_app,
+):
+    """A provider attempt remains visible while a long-running stream is pending."""
+    database = admin_app.extensions["database"]
+    with database.sessions.begin() as session:
+        profile = ProviderProfile(
+            id="openai-long-running-poll",
+            tenant_id="acme",
+            provider="openai",
+            display_name="Long running",
+            settings={},
+            default_model="gpt-5.4",
+            inference_secret_ciphertext="encrypted-key",
+        )
+        session.add(profile)
+        session.flush()
+        session.add(
+            ProviderAttemptEvent(
+                tenant_id="acme",
+                provider="openai",
+                profile_id=profile.id,
+                inbound_model="cursor-acme",
+                routed_model="gpt-5.4",
+                outcome="pending",
+                occurred_at=datetime.now(timezone.utc) - timedelta(minutes=20),
+            )
+        )
+
+    body = (
+        _authenticated_client(admin_app)
+        .get("/admin/provider-status")
+        .get_data(as_text=True)
+    )
+
+    assert 'data-provider-account="openai-long-running-poll"' in body
+    assert 'data-activity-outcome="pending"' in body
+    assert "Provideranfrage läuft" in body
+
+
+def test_dashboard_renders_shared_quota_pause_for_configured_openai_profiles(
+    admin_app,
+):
+    """Project organization breaker state to matching profiles without exposing IDs."""
+    database = admin_app.extensions["database"]
+    probe_at = datetime.now(timezone.utc) + timedelta(hours=2)
+    with database.sessions.begin() as session:
+        session.add_all(
+            (
+                ProviderProfile(
+                    id="openai-shared-one",
+                    tenant_id="acme",
+                    provider="openai",
+                    display_name="Shared One",
+                    settings={"organization": "org-secret-123"},
+                    default_model="gpt-5.4",
+                    route_priority=1,
+                    inference_secret_ciphertext="encrypted-one",
+                ),
+                ProviderProfile(
+                    id="openai-shared-two",
+                    tenant_id="acme",
+                    provider="openai",
+                    display_name="Shared Two",
+                    settings={"organization": "org-secret-123"},
+                    default_model="gpt-5.4",
+                    route_priority=2,
+                    inference_secret_ciphertext="encrypted-two",
+                ),
+                ProviderProfile(
+                    id="openai-different-org",
+                    tenant_id="acme",
+                    provider="openai",
+                    display_name="Different Org",
+                    settings={"organization": "org-other"},
+                    default_model="gpt-5.4",
+                    route_priority=3,
+                    inference_secret_ciphertext="encrypted-three",
+                ),
+            )
+        )
+    store = ProviderCircuitBreakerStore(database.sessions, database.secret_cipher)
+    store.open_quota(
+        store.scope("acme", "openai", "organization", "org-secret-123"),
+        now=probe_at - timedelta(hours=2),
+    )
+
+    body = (
+        _authenticated_client(admin_app)
+        .get("/admin/provider-status")
+        .get_data(as_text=True)
+    )
+
+    assert 'data-provider-account="openai-shared-one"' in body
+    assert 'data-provider-account="openai-shared-two"' in body
+    assert 'data-provider-account="openai-different-org"' in body
+    assert body.count('class="provider-quota-status"') == 2
+    assert "org-secret-123" not in body
+    assert 'aria-label="Quota-Limit – pausiert bis' in body
+    assert 'hx-trigger="every 5s"' in body
+
+
+def test_provider_attempt_table_stores_outcome_and_profile(admin_app):
+    """A provider attempt records its profile-level result without usage counts."""
+    assert (
+        "provider_attempt_events"
+        in inspect(admin_app.extensions["database"].engine).get_table_names()
+    )
+    assert Base.metadata.tables["provider_attempt_events"].c.outcome.nullable is False
 
 
 def test_record_inference_activity_stores_tenant_scoped_usage(admin_app):

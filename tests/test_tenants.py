@@ -1,6 +1,5 @@
 """Tests for static tenant configuration parsing and startup validation."""
 
-import hashlib
 import json
 
 import pytest
@@ -312,12 +311,16 @@ def test_hash_api_key_uses_scrypt_and_still_accepts_legacy_sha256():
     """New digests are scrypt, while stored SHA-256 digests still authenticate."""
     api_key = "correct-key"
     current = hash_api_key(api_key)
-    legacy = hashlib.sha256(api_key.encode("utf-8")).hexdigest()
+    legacy = legacy_sha256_api_key_hash(api_key)
 
     assert current != legacy
     assert len(current) == 64
     assert all(char in "0123456789abcdef" for char in current)
-    assert legacy_sha256_api_key_hash(api_key) == legacy
+    # FIPS 180-4 vector, plus the historical digest of this bearer token.
+    assert legacy_sha256_api_key_hash("abc") == (
+        "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+    )
+    assert legacy == "ddb0fd2dede48502669718e09ef1447dba46f3d3822e9fbf05af11d874a0f23b"
 
     tenant = TenantConfig(
         id="acme",

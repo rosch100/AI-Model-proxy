@@ -133,6 +133,92 @@ WHERE account_id = (SELECT id FROM admin_accounts WHERE username = 'admin');
 When zero passkeys remain, password login is allowed once and redirects to
 forced enrollment.
 
+## Intranet-only Kerberos for `/admin`
+
+The public proxy API stays on the existing Nginx catch-all and retains its
+Bearer-token authentication. Only `/admin` and its subpaths are intercepted by
+the separate SPNEGO location. Nginx first restricts those requests to explicitly
+configured intranet/VPN client CIDRs, then requires Kerberos; it removes the
+incoming `Authorization` header before proxying to Flask. The Flask admin's
+existing account and passkey authentication remains enabled as a second layer.
+
+### Prerequisites
+
+- The production proxy host is `proxy.altanis.de`, with Nginx serving the site
+  `/etc/nginx/sites-available/proxy.altanis.de` and Flask listening only on
+  `127.0.0.1:5000`.
+- The admin application is already configured in tenant database mode, including
+  its database migrations, `ADMIN_SESSION_SECRET`, `WEBAUTHN_RP_ID`,
+  `WEBAUTHN_RP_NAME` and `WEBAUTHN_ORIGINS`. Add the exact origin
+  `https://proxy.altanis.de` to `WEBAUTHN_ORIGINS` if it is not already present.
+- An AD administrator provisions the unique SPN
+  `HTTP/proxy.altanis.de@ALTANIS.DE` and exports a matching keytab. Distribute
+  it using the approved secret-transfer mechanism; never commit it or print its
+  contents. On the proxy host, install it at `/etc/nginx/proxy-admin.keytab`
+  with owner `root`, group `www-data` and mode `0640`.
+- The host can reach AD KDC `192.168.253.5` on TCP and UDP port 88 through its
+  private IONOS interface. The generated persistent host route uses router
+  `192.168.20.31`; the router must permit and SNAT only this proxy-to-KDC
+  Kerberos traffic over its AD-facing WireGuard path.
+- Select actual client source CIDRs for the private network and VPN. Do not
+  infer them from DNS or allow public CIDRs. Verify the addresses Nginx actually
+  sees, particularly where client traffic is NATed.
+
+### Review and deploy
+
+1. On a trusted development machine, render the router's least-privilege nftables
+   rules and review them against the router's existing table and chain
+   definitions:
+
+   ```bash
+   nft -a list chain inet wireguard_filter forward
+   nft -a list chain ip wireguard_nat4 postrouting
+   python3 scripts/deploy_proxy_admin_iwa.py --render-router-rules \
+     --router-kerberos-address <VERIFIED_ROUTER_ADDRESS> \
+     --forward-chain-handle <REVIEWED_FORWARD_RULE_HANDLE> \
+     --nat-chain-handle <REVIEWED_NAT_RULE_HANDLE>
+   ```
+
+   Choose existing rule handles that place the generated forward rules before
+   any terminal drop/reject and the SNAT rules before broader source-NAT rules.
+   The named chains must already exist, and established/related conntrack must
+   be enabled for Kerberos replies. The generated `insert rule ... handle`
+   commands are for controlled one-time application; persist the equivalent
+   rule expressions in the router's native configuration at the same positions.
+   Review the handle targets and do not repeat the commands blindly,
+   since nftables rule insertion is not idempotent. Validate and apply through
+   the router's normal controlled process with a rollback path; do not flush or
+   reload an unrelated ruleset as a shortcut.
+
+2. Copy this repository and the provisioned keytab to `proxy.altanis.de`, then
+   run the installer with only the verified intranet/VPN CIDRs. Repeat
+   `--trusted-network` for each allowed range:
+
+   ```bash
+   sudo python3 scripts/deploy_proxy_admin_iwa.py \
+     --trusted-network 192.168.20.0/24 \
+     --trusted-network 10.66.1.0/24 \
+     --install-spnego-package
+   ```
+
+   Replace the example ranges with the client CIDRs verified for this
+   environment. The installer validates the host identity, SPN/keytab ownership
+   and contents, adds the persistent host route, configures the Kerberos realm,
+   tests Nginx, and reloads it. Without
+   `--install-spnego-package`, required Debian packages must already be
+   installed. Packages installed with that flag remain installed if a later
+   validation fails; on failure the installer attempts to restore every changed
+   configuration file and any route it added, and reports incomplete rollback.
+
+3. From an allowed intranet/VPN client with a valid AD Kerberos ticket, open
+   `https://proxy.altanis.de/admin` and complete the existing passkey/session
+   login. From a public network, `/admin` must return 404 without a SPNEGO
+   challenge. Verify `/health` and a Bearer-authenticated `/v1/models` request
+   from outside the intranet to confirm public proxy behavior is unchanged.
+
+The installer intentionally does not alter the router or create/rotate AD
+accounts, SPNs or keytabs. Router changes, SPN uniqueness and client CIDRs must
+be reviewed by their operators before this procedure is run.
 
 | Thing | Value |
 |---|---|

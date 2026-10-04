@@ -86,13 +86,25 @@ def test_dashboard_explains_missing_cost_configuration(admin_app):
 
     assert response.status_code == 200
     body = response.get_data(as_text=True)
-    assert "Noch keine Kostendaten" in body
+    assert "Noch keine Kosten- oder Verbrauchsdaten" in body
     assert 'href="/admin/settings/costs"' in body
-    assert "Kein Billing-Scope gebunden" in body
-    assert "Live-Verbindungen" in body
-    assert body.index("Live-Verbindungen") < body.index("Kostenübersicht nach Konto")
-    assert body.index("Kostenübersicht nach Konto") < body.index("Aktuelle Aktivität")
-    assert "keine Anfrage in 24 h" in body
+    assert "Die Abrechnung ist noch nicht eingerichtet" in body
+    assert "Anbieterstatus" in body
+    assert "<title>Anfragen und Kosten · Altanis Proxy</title>" in body
+    assert '<h1 id="dashboard-title">Anfragen und Kosten</h1>' in body
+    assert body.index("Anbieterstatus") < body.index("Kosten pro Konto")
+    assert body.index("Kosten pro Konto") < body.index("Aktuelle Anfragen")
+    assert "in den letzten 24 Stunden gab es keine Anfragen" in body
+    assert (
+        "Hier siehst du, welche Anbieter Anfragen bearbeiten, wie viele Anfragen eingehen und welche Kosten entstehen."
+        in body
+    )
+    assert "Nicht eingerichtet" in body
+    assert "Anfragen &amp; Kosten" not in body
+    assert "Mandant acme" not in body
+    assert "Custom-Model-ID" not in body
+    assert "Billing-Scope" not in body
+    assert "Snapshot" not in body
 
 
 def test_dashboard_distinguishes_empty_successful_refresh_from_no_refresh(admin_app):
@@ -169,17 +181,14 @@ def test_dashboard_distinguishes_empty_successful_refresh_from_no_refresh(admin_
     body = response.get_data(as_text=True)
 
     assert (
-        "Einige Konten wurden noch nicht erfolgreich aktualisiert; erfolgreiche "
-        "Refreshes lieferten keine Kostendaten."
+        "Für einige Konten liegen noch keine erfolgreich abgerufenen Daten vor; "
+        "bei den übrigen Konten fehlen Kosten- und Verbrauchsdaten."
     ) in body
-    assert (
-        "Die letzten erfolgreichen Kosten-Refreshes lieferten keine Kostendaten."
-        not in body
-    )
+    assert "Die letzten erfolgreichen Abrufe enthielten keine Kostendaten." not in body
 
 
 def test_dashboard_uses_latest_successful_refresh_without_double_counting(admin_app):
-    """Current totals use one latest successful snapshot even after a later failure."""
+    """Current totals use the latest successful retrieval, even after a later failure."""
     database = admin_app.extensions["database"]
     now = datetime(2026, 10, 3, 5, tzinfo=timezone.utc)
     with database.sessions.begin() as session:
@@ -281,6 +290,15 @@ def test_dashboard_uses_latest_successful_refresh_without_double_counting(admin_
     assert "100,00 USD" not in body
     assert "1.200" in body
     assert "Production" in body
-    assert "Fehlgeschlagen" in body
-    assert "Billing API nicht erreichbar" in body
+    assert "Abruf fehlgeschlagen" in body
+    assert "Beim letzten Abruf gab es ein Problem." in body
+    assert "Billing API nicht erreichbar" not in body
+    assert "Anbieterstatus" in body
+
+    costs_body = (
+        _authenticated_client(admin_app)
+        .get("/admin/settings/costs")
+        .get_data(as_text=True)
+    )
+    assert "Fehlgeschlagen (Billing API nicht erreichbar)" in costs_body
     database.engine.dispose()

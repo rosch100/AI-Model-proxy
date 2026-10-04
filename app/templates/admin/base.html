@@ -14,10 +14,10 @@
     {% if current_user_nav %}
     <header class="topbar">
       <p class="brand">Altanis Proxy</p>
-      <nav aria-label="Admin">
-        <a href="{{ url_for('admin.dashboard') }}">Übersicht</a>
+      <nav aria-label="Kontoverwaltung">
+        <a href="{{ url_for('admin.dashboard') }}">Anfragen und Kosten</a>
         <a href="{{ url_for('admin.settings_general') }}">Allgemein</a>
-        <a href="{{ url_for('admin.settings_connection') }}">Verbindung</a>
+        <a href="{{ url_for('admin.settings_connection') }}">Anbieter und Konten</a>
         <a href="{{ url_for('admin.settings_costs') }}">Kosten</a>
         <a href="{{ url_for('admin.account') }}">Konto</a>
       </nav>

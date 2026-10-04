@@ -73,6 +73,25 @@ def _authenticated_admin_client(admin_app):
     return client
 
 
+def test_provider_create_form_links_credential_and_identifier_sources(admin_app):
+    """Provider-specific forms point to exact sources for entered credentials."""
+    response = _authenticated_admin_client(admin_app).get(
+        "/admin/settings/connection/create"
+    )
+
+    assert response.status_code == 200
+    body = response.get_data(as_text=True)
+    assert "Keys and Endpoint" in body
+    assert "https://platform.openai.com/api-keys" in body
+    assert "https://openrouter.ai/settings/keys" in body
+    assert "https://platform.openai.com/settings/organization/general" in body
+    assert "https://platform.openai.com/settings/organization/projects" in body
+    assert "Dieser Schlüssel ist für Anfragen gedacht" in body
+    assert "sk-admin-" in body
+    assert "Verwaltungsschlüssel für die Abrechnung" in body
+    assert "Modellliste" in body
+
+
 def test_connection_page_renders_same_provider_profiles_without_exposing_secrets(
     admin_app,
 ):
@@ -111,7 +130,7 @@ def test_connection_page_renders_same_provider_profiles_without_exposing_secrets
     assert "Staging" in body
     assert "gpt-6-astra" in body
     assert "gpt-6-luna" in body
-    assert "Schlüssel gespeichert" in body
+    assert "Schlüssel für Anfragen gespeichert" in body
     for secret in secret_values:
         assert secret not in body
     for profile in profiles:
@@ -192,17 +211,27 @@ def test_costs_page_explains_provider_specific_credentials_and_limits(admin_app)
 
     assert response.status_code == 200
     assert "Admin API Key" in body
-    assert "Management Key" in body
+    assert "Management API Key" in body
     assert "platform.openai.com/settings/organization/admin-keys" in body
     assert "openrouter.ai/settings/management-keys" in body
     assert "flask tenants bind-billing-scope" not in body
     assert "sk-admin-" in body
     assert "Usage API" in body
-    assert "Only management keys" in body
-    assert "keine Tenant-Credential" in body
-    assert "letzten 30 abgeschlossenen UTC-Tage" in body
-    assert "OpenRouter- und BYOK-Kosten sowie Tokenverbrauch" in body
-    assert "Kosten und Input-/Output-Tokens" in body
+    assert "Ein normaler Schlüssel für Anfragen reicht nicht aus." in body
+    assert "keine Azure-Zugangsdaten speichern" in body
+    assert "letzten 30 abgeschlossenen Tage" in body
+    assert "Liste deiner Workspaces" in body
+    assert "Workspace-Kennung" in body or "Workspace-ID" in body
+    assert "az cognitiveservices account show" in body
+    assert "az cognitiveservices account deployment list" in body
+    assert "az role assignment list" in body
+    assert "az role assignment create" in body
+    assert "PROXY_PRINCIPAL_ID" in body
+    assert "Cost Management Reader" in body
+    assert "Monitoring Reader" in body
+    assert "niemals" in body and "account keys list" in body
+    assert "api-keys" in body
+    assert "Organization → Projects" in body
 
 
 def test_azure_cost_refresh_rejects_usage_scope_outside_billing_scope(
@@ -350,9 +379,9 @@ def test_costs_page_shows_azure_host_identity_and_bound_scope_controls(admin_app
         .get_data(as_text=True)
     )
 
-    assert "Hostidentität" in body
-    assert "Managed Identity" in body
-    assert "Workload Identity" in body
+    assert "Der Proxy verwendet den Zugang seines Servers" in body
+    assert "Cost Management Reader" in body
+    assert "Monitoring Reader" in body
     assert "Azure-Kosten aktualisieren" in body
     assert 'name="client_secret"' not in body
     assert "Azure-Service-Principal" not in body
@@ -360,12 +389,14 @@ def test_costs_page_shows_azure_host_identity_and_bound_scope_controls(admin_app
 
 
 def test_dashboard_shows_cost_setup_when_no_cost_records_exist(admin_app):
-    """The overview guides a tenant to billing setup before the first refresh."""
+    """The dashboard guides an administrator to billing setup before retrieval."""
     body = _authenticated_admin_client(admin_app).get("/admin/").get_data(as_text=True)
 
-    assert "Kostenübersicht nach Konto" in body
-    assert "Noch keine Kostendaten" in body
-    assert "Kein Billing-Scope gebunden" in body
+    assert "Kosten pro Konto" in body
+    assert "Noch keine Kosten- oder Verbrauchsdaten" in body
+    assert "Die Abrechnung ist noch nicht eingerichtet" in body
+    assert "Mandant acme" not in body
+    assert "Custom-Model-ID" not in body
     assert 'href="/admin/settings/costs"' in body
 
 
@@ -393,10 +424,67 @@ def test_costs_page_renders_azure_scope_fields_before_binding(admin_app):
     assert 'name="resource_group_arm_id"' in body
     assert 'name="cognitive_resource_arm_id"' in body
     assert 'name="exclusive_scope_confirmation"' in body
-    assert "Resource Group ARM-ID" in body
-    assert "Cognitive-Services-Ressource ARM-ID" in body
-    assert "Azure Billing-Scope speichern" in body
+    assert "Kennung der Ressourcengruppe (für Kosten)" in body
+    assert "Kennung des Cognitive-Services-Kontos (für Verbrauchsdaten)" in body
+    assert "Azure-Abrechnungsdaten speichern" in body
+    assert "Formular „Azure-Abrechnung einrichten“ diesem Azure-Konto zu." in body
+    assert (
+        'href="https://portal.azure.com/#view/Microsoft_Azure_Billing/SubscriptionsBlade"'
+        in body
+    )
+    assert (
+        'href="https://portal.azure.com/#view/HubsExtension/BrowseResourceGroups"'
+        in body
+    )
+    assert 'data-azure-scope-link="resource-group"' in body
+    assert 'data-azure-scope-link="cognitive-resource"' in body
+    assert "Kopiere die vollständige Kennung des Cognitive-Services-Kontos" in body
     assert 'name="client_secret"' not in body
+
+
+def test_azure_scope_form_explains_cognitive_id_in_billing_field(admin_app):
+    """Explain when a resource ARM ID was pasted into the Resource Group field."""
+    database = admin_app.extensions["database"]
+    with database.sessions.begin() as session:
+        session.add(
+            ProviderProfile(
+                id="azure-profile",
+                tenant_id="acme",
+                provider="azure",
+                display_name="Azure Production",
+                settings={},
+            )
+        )
+    client = _authenticated_admin_client(admin_app)
+    page = client.get("/admin/settings/costs").get_data(as_text=True)
+    csrf_token = re.search(r'name="csrf_token" type="hidden" value="([^"]+)"', page)
+    assert csrf_token is not None
+    cognitive_resource_id = (
+        "/subscriptions/aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa/"
+        "resourceGroups/acme-rg/providers/Microsoft.CognitiveServices/"
+        "accounts/acme-ai"
+    )
+
+    response = client.post(
+        "/admin/settings/costs/azure-scope",
+        data={
+            "csrf_token": csrf_token.group(1),
+            "profile_id": "azure-profile",
+            "subscription_id": "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
+            "resource_group_arm_id": cognitive_resource_id,
+            "cognitive_resource_arm_id": cognitive_resource_id,
+            "exclusive_scope_confirmation": "y",
+        },
+    )
+
+    assert response.status_code == 400
+    assert (
+        "Diese Kennung gehört zu einem Cognitive-Services-Konto"
+        in response.get_data(as_text=True)
+    )
+    assert "Trage sie in das Feld für Verbrauchsdaten ein" in response.get_data(
+        as_text=True
+    )
 
 
 def test_azure_scope_form_binds_only_matching_tenant_exclusive_scopes(admin_app):

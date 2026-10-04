@@ -714,7 +714,7 @@ def create_connection_form():
         ("openai", "OpenAI"),
         ("openrouter", "OpenRouter"),
     ]
-    form.default_model.choices = [("", "Nach dem Katalogabruf auswählen")]
+    form.default_model.choices = [("", "Nach dem Abruf der Modellliste auswählen")]
     provider = request.args.get("provider", "")
     if provider in {"azure", "openai", "openrouter"}:
         form.provider.data = provider
@@ -767,7 +767,7 @@ def create_connection():
     _set_profile_form_choices(form)
     if not form.validate_on_submit():
         form.api_key.data = ""
-        flash("Accountdaten sind unvollständig.", "error")
+        flash("Angaben zum Konto fehlen noch.", "error")
         return (
             render_template(
                 "admin/settings/profile_form.html",
@@ -794,7 +794,10 @@ def create_connection():
             )
     except (LookupError, ValueError, IntegrityError):
         form.api_key.data = ""
-        flash("Account konnte nicht angelegt werden. Name und Angaben prüfen.", "error")
+        flash(
+            "Das Konto konnte nicht angelegt werden. Prüfe den Namen und die Angaben.",
+            "error",
+        )
         return (
             render_template(
                 "admin/settings/profile_form.html",
@@ -804,7 +807,7 @@ def create_connection():
             ),
             400,
         )
-    flash("Account gespeichert. Er ist noch nicht aktiv.", "info")
+    flash("Konto gespeichert. Es ist noch nicht für Anfragen aktiviert.", "info")
     return redirect(url_for("admin.settings_connection"))
 
 
@@ -836,7 +839,7 @@ def update_connection(profile_id: str):
     _set_default_model_choices(form, profile, catalog_rows)
     if not form.validate_on_submit() or form.provider.data != profile.provider:
         _set_profile_secret_display(form, profile)
-        flash("Accountdaten sind ungültig.", "error")
+        flash("Die Angaben zum Konto sind ungültig.", "error")
         return (
             render_template(
                 "admin/settings/profile_form.html",
@@ -866,7 +869,8 @@ def update_connection(profile_id: str):
     except (LookupError, ValueError, IntegrityError):
         _set_profile_secret_display(form, profile)
         flash(
-            "Account konnte nicht gespeichert werden. Name und Angaben prüfen.", "error"
+            "Das Konto konnte nicht gespeichert werden. Prüfe den Namen und die Angaben.",
+            "error",
         )
         return (
             render_template(
@@ -877,7 +881,7 @@ def update_connection(profile_id: str):
             ),
             400,
         )
-    flash("Account aktualisiert.", "info")
+    flash("Konto aktualisiert.", "info")
     return redirect(url_for("admin.settings_connection"))
 
 
@@ -897,11 +901,12 @@ def delete_connection(profile_id: str):
         return "Not Found", 404
     except ValueError:
         flash(
-            "Account kann nicht entfernt werden, solange Provider-Scopes gebunden sind.",
+            "Das Konto kann nicht entfernt werden, solange noch Abrechnungsdaten "
+            "damit verknüpft sind.",
             "error",
         )
         return redirect(url_for("admin.settings_connection"))
-    flash("Account entfernt.", "info")
+    flash("Konto entfernt.", "info")
     return redirect(url_for("admin.settings_connection"))
 
 
@@ -921,10 +926,14 @@ def activate_connection(profile_id: str):
             activate_provider_profile(session, tenant, profile_id, g.admin.username)
     except LookupError:
         return "Not Found", 404
-    except ValueError as exc:
-        flash(str(exc), "error")
+    except ValueError:
+        flash(
+            "Das Konto konnte nicht aktiviert werden. Prüfe den Schlüssel, das "
+            "Standardmodell und die Anbietereinstellungen.",
+            "error",
+        )
         return redirect(url_for("admin.settings_connection"))
-    flash("Account aktiviert.", "info")
+    flash("Konto für Anfragen aktiviert.", "info")
     return redirect(url_for("admin.settings_connection"))
 
 
@@ -954,7 +963,8 @@ def deactivate_connection():
         for profile_id in profile_ids:
             deactivate_provider_profile(session, tenant, profile_id, g.admin.username)
     flash(
-        "Kein Account aktiv. Proxy-Anfragen sind bis zur nächsten Aktivierung nicht verfügbar.",
+        "Kein Konto ist aktiv. Anfragen über den Proxy sind erst wieder möglich, "
+        "wenn du ein Konto aktivierst.",
         "warning",
     )
     return redirect(url_for("admin.settings_connection"))
@@ -973,7 +983,7 @@ def deactivate_connection_profile(profile_id: str):
             deactivate_provider_profile(session, tenant, profile_id, g.admin.username)
         except LookupError:
             return "Not Found", 404
-    flash("Account aus der Failover-Reihenfolge entfernt.", "info")
+    flash("Konto aus der Reihenfolge entfernt.", "info")
     return redirect(url_for("admin.settings_connection"))
 
 
@@ -994,7 +1004,7 @@ def move_connection(profile_id: str):
         return "Not Found", 404
     except ValueError:
         return "Bad Request", 400
-    flash("Failover-Reihenfolge aktualisiert.", "info")
+    flash("Reihenfolge der Konten aktualisiert.", "info")
     return redirect(url_for("admin.settings_connection"))
 
 
@@ -1016,7 +1026,10 @@ def refresh_catalog(profile_id: str):
         if profile is None:
             return "Not Found", 404
         if not profile.inference_secret_ciphertext:
-            flash("Für den Katalog-Refresh fehlt ein gespeicherter Schlüssel.", "error")
+            flash(
+                "Für den Abruf der Modellliste fehlt ein gespeicherter Schlüssel.",
+                "error",
+            )
             return redirect(url_for("admin.settings_connection"))
         provider = profile.provider
         inference_secret_ciphertext = profile.inference_secret_ciphertext
@@ -1054,8 +1067,8 @@ def refresh_catalog(profile_id: str):
             or profile.catalog_generation != catalog_generation
         ):
             flash(
-                "Accountdaten wurden während des Katalog-Refreshs geändert. "
-                "Bitte den Katalog erneut aktualisieren.",
+                "Die Kontodaten wurden geändert, während die Modellliste abgerufen "
+                "wurde. Bitte rufe die Modellliste erneut ab.",
                 "warning",
             )
             return redirect(url_for("admin.settings_connection"))
@@ -1077,9 +1090,10 @@ def refresh_catalog(profile_id: str):
                 )
     flash(
         (
-            f"Katalog aktualisiert — {len(selectable_catalog_models(provider, entries))} wählbare Modelle übernommen."
+            f"Modellliste aktualisiert: "
+            f"{len(selectable_catalog_models(provider, entries))} Modelle verfügbar."
             if error is None
-            else error
+            else "Die Modellliste konnte nicht abgerufen werden. Prüfe den Schlüssel und versuche es erneut."
         ),
         "info" if error is None else "error",
     )
@@ -1099,7 +1113,7 @@ def save_azure_cost_scopes():
     """Bind tenant-confirmed Azure billing and usage scopes to one profile."""
     form = AzureScopeForm()
     if not form.validate_on_submit():
-        flash("Azure-Scope-Angaben sind ungültig oder unvollständig.", "error")
+        flash("Die Azure-Angaben sind ungültig oder unvollständig.", "error")
         return (
             render_template(
                 "admin/settings/costs.html",
@@ -1122,7 +1136,7 @@ def save_azure_cost_scopes():
                 g.admin.username,
             )
     except (LookupError, ValueError, IntegrityError) as exc:
-        flash(f"Azure-Scopes konnten nicht gebunden werden: {exc}", "error")
+        flash(f"Die Azure-Ressourcen konnten nicht zugeordnet werden: {exc}", "error")
         return (
             render_template(
                 "admin/settings/costs.html",
@@ -1133,7 +1147,7 @@ def save_azure_cost_scopes():
             ),
             400,
         )
-    flash("Azure-Billing- und Usage-Scope wurden gespeichert.", "info")
+    flash("Die Azure-Ressourcen wurden zugeordnet.", "info")
     return redirect(url_for("admin.settings_costs"))
 
 
@@ -1143,7 +1157,7 @@ def save_billing():
     """Store new billing credentials without replacing an existing masked key."""
     form = BillingCredentialsForm()
     if not form.validate_on_submit():
-        flash("Billing-Angaben sind ungültig.", "error")
+        flash("Die Angaben zur Abrechnung sind ungültig.", "error")
         return redirect(url_for("admin.settings_costs"))
     database = _database()
     secret = form.billing_secret.data
@@ -1170,16 +1184,16 @@ def save_billing():
                     g.admin.username,
                 )
             elif not profile.billing_secret_ciphertext:
-                flash("Billing-Schlüssel fehlt.", "error")
+                flash("Der Schlüssel für die Abrechnung fehlt.", "error")
                 return redirect(url_for("admin.settings_costs"))
     except (LookupError, ValueError) as exc:
         flash(str(exc), "error")
         return redirect(url_for("admin.settings_costs"))
     flash(
         (
-            "Billing-Schlüssel gespeichert."
+            "Schlüssel für die Abrechnung gespeichert."
             if secret
-            else "Gespeicherter Billing-Schlüssel beibehalten."
+            else "Gespeicherten Schlüssel für die Abrechnung beibehalten."
         ),
         "info",
     )
@@ -1208,15 +1222,21 @@ def load_openai_projects():
             )
         )
         if profile is None:
-            flash("OpenAI-Account wurde nicht gefunden.", "error")
+            flash("Das OpenAI-Konto wurde nicht gefunden.", "error")
             return redirect(url_for("admin.settings_costs"))
         if not profile.billing_secret_ciphertext:
-            flash("Speichere zuerst den OpenAI Admin API Key.", "error")
+            flash(
+                "Speichere zuerst den OpenAI-Administratorschlüssel für die Abrechnung.",
+                "error",
+            )
             return redirect(url_for("admin.settings_costs"))
         try:
             api_key = database.secret_cipher.decrypt(profile.billing_secret_ciphertext)
         except (InvalidTag, ValueError, UnicodeDecodeError):
-            flash("Der gespeicherte OpenAI Admin API Key ist nicht lesbar.", "error")
+            flash(
+                "Der gespeicherte OpenAI-Abrechnungsschlüssel ist ungültig. Speichere ihn erneut.",
+                "error",
+            )
             return redirect(url_for("admin.settings_costs"))
         profile_id = profile.id
     organization_id = form.organization_id.data or ""
@@ -1262,7 +1282,7 @@ def save_openai_cost_scope():
     """Bind an OpenAI organization and project from the tenant admin page."""
     form = OpenAIScopeForm()
     if not form.validate_on_submit():
-        flash("OpenAI-Scope-Angaben sind ungültig oder unvollständig.", "error")
+        flash("Die OpenAI-Angaben sind ungültig oder unvollständig.", "error")
         return redirect(url_for("admin.settings_costs"))
     try:
         with _database().sessions.begin() as session:
@@ -1278,9 +1298,12 @@ def save_openai_cost_scope():
                 g.admin.username,
             )
     except (LookupError, ValueError, IntegrityError) as exc:
-        flash(f"OpenAI-Scope konnte nicht gespeichert werden: {exc}", "error")
+        flash(
+            f"Die OpenAI-Abrechnungsdaten konnten nicht gespeichert werden: {exc}",
+            "error",
+        )
         return redirect(url_for("admin.settings_costs"))
-    flash("OpenAI Organization- und Project-Scope wurden gespeichert.", "info")
+    flash("Die OpenAI-Abrechnungsdaten wurden gespeichert.", "info")
     return redirect(url_for("admin.settings_costs"))
 
 
@@ -1290,7 +1313,7 @@ def save_openrouter_cost_scope():
     """Bind an OpenRouter workspace from the tenant admin page."""
     form = OpenRouterScopeForm()
     if not form.validate_on_submit():
-        flash("OpenRouter-Scope-Angaben sind ungültig oder unvollständig.", "error")
+        flash("Die OpenRouter-Angaben sind ungültig oder unvollständig.", "error")
         return redirect(url_for("admin.settings_costs"))
     try:
         with _database().sessions.begin() as session:
@@ -1303,9 +1326,12 @@ def save_openrouter_cost_scope():
                 g.admin.username,
             )
     except (LookupError, ValueError, IntegrityError) as exc:
-        flash(f"OpenRouter-Scope konnte nicht gespeichert werden: {exc}", "error")
+        flash(
+            f"Die OpenRouter-Abrechnungsdaten konnten nicht gespeichert werden: {exc}",
+            "error",
+        )
         return redirect(url_for("admin.settings_costs"))
-    flash("OpenRouter-Workspace wurde gespeichert.", "info")
+    flash("Der OpenRouter-Workspace wurde gespeichert.", "info")
     return redirect(url_for("admin.settings_costs"))
 
 

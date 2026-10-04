@@ -4,14 +4,15 @@
 {% block content %}
 <section>
   <h1>Allgemeine Einstellungen</h1>
-  <p class="lede">Die Cursor-Model-ID bleibt fest; der API-Schlüssel kann rotiert werden.</p>
-  <p>Custom-Model-ID: <code>{{ tenant.custom_model_id }}</code></p>
+  <p class="lede">Die Modellkennung für Cursor bleibt unverändert. Den Proxy-Schlüssel kannst du bei Bedarf erneuern.</p>
+  <p>In Cursor verwendete Modellkennung: <code>{{ tenant.custom_model_id }}</code></p>
+  <p class="hint">Trage in Cursor unter <strong>OpenAI API Key</strong> den Proxy-Schlüssel ein, den du bei der Einrichtung erhalten hast. Verwende dazu die oben angezeigte Modellkennung und die Proxy-Adresse, die dir der Administrator mitgeteilt hat; ergänze am Ende <code>/v1</code>. Die Zugangsschlüssel für Azure, OpenAI und OpenRouter gehören nicht in Cursor.</p>
   {% if issued_api_key %}
-    <p class="once-secret">Neuer API-Schlüssel (einmalig): <code>{{ issued_api_key }}</code></p>
+    <p class="once-secret">Neuer Proxy-Schlüssel (wird nur einmal angezeigt): <code>{{ issued_api_key }}</code></p>
   {% endif %}
   <form method="post" action="{{ url_for('admin.rotate_key') }}">
     {{ logout_form.csrf_token }}
-    <button type="submit">API-Schlüssel rotieren</button>
+    <button type="submit">Proxy-Schlüssel erneuern</button>
   </form>
 </section>
 {% endblock %}

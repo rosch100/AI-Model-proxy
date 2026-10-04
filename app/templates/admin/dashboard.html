@@ -1,14 +1,13 @@
 {% extends "admin/base.html" %}
 {% set current_user_nav = true %}
 {% set main_class = "dashboard-main" %}
-{% block title %}Übersicht · Altanis Proxy{% endblock %}
+{% block title %}Anfragen und Kosten · Altanis Proxy{% endblock %}
 {% block content %}
 <section class="dashboard-page" aria-labelledby="dashboard-title">
   <header class="dashboard-heading">
     <div>
-      <p class="eyebrow">Mandant {{ view.tenant_id }}</p>
-      <h1 id="dashboard-title">Übersicht</h1>
-      <p class="lede">Letzte Proxy-Aktivität und Kosten aus dem letzten erfolgreichen Refresh je Anbieter-Konto.</p>
+      <h1 id="dashboard-title">Anfragen und Kosten</h1>
+        <p class="lede">Hier siehst du, welche Anbieter Anfragen bearbeiten, wie viele Anfragen eingehen und welche Kosten entstehen.</p>
     </div>
     <a class="secondary-cta" href="{{ url_for('admin.settings_costs') }}">Kosten verwalten</a>
   </header>
@@ -16,29 +15,28 @@
   <section class="dashboard-section provider-status-section" aria-labelledby="providers-title">
     <div class="section-heading">
       <div>
-        <h2 id="providers-title">Live-Verbindungen</h2>
-        <p class="section-caption">Welche Anbieter in der Route liegen und wann zuletzt eine Proxy-Anfrage dort ankam.</p>
+        <h2 id="providers-title">Anbieterstatus</h2>
+        <p class="section-caption">Hier siehst du, welche Anbieter Anfragen bearbeiten und wann zuletzt eine Anfrage einging.</p>
       </div>
     </div>
     <ul class="provider-status-grid">
       {% for provider in view.providers %}
         <li class="provider-status-card{% if provider.recency %} is-{{ provider.recency }}{% endif %}">
-          <span class="provider-status-indicator{% if provider.recency == 'live' %} is-live{% elif provider.state == 'Gespeichert' %} is-ready{% elif provider.state == 'Prüfung erforderlich' %} needs-attention{% endif %}" aria-hidden="true"></span>
+          <span class="provider-status-indicator{% if provider.recency == 'live' %} is-live{% elif provider.state == 'Eingerichtet' %} is-ready{% elif provider.state == 'Einrichtung prüfen' %} needs-attention{% endif %}" aria-hidden="true"></span>
           <div>
             <strong>{{ provider.label }}</strong>
-            <span>{{ provider.state }}{% if provider.is_active %} · in der Route{% endif %}{% if provider.last_request_label %} · zuletzt {{ provider.last_request_label }}{% if provider.last_request_at %} (<time datetime="{{ provider.last_request_at.isoformat() }}" data-local-time>{{ provider.last_request_at.isoformat() }}</time>){% endif %}{% else %} · keine Anfrage in 24 h{% endif %}</span>
+            <span>{{ provider.state }}{% if provider.is_active %} · für Anfragen ausgewählt{% endif %}{% if provider.last_request_label %} · letzte Anfrage {{ provider.last_request_label }}{% if provider.last_request_at %} (<time datetime="{{ provider.last_request_at.isoformat() }}" data-local-time>{{ provider.last_request_at.isoformat() }}</time>){% endif %}{% else %} · in den letzten 24 Stunden gab es keine Anfragen{% endif %}</span>
           </div>
         </li>
       {% endfor %}
     </ul>
-    <p class="dashboard-model-id">Custom-Model-ID: <code>{{ view.custom_model_id }}</code></p>
   </section>
 
   <section class="dashboard-section" aria-labelledby="accounts-title">
     <div class="section-heading">
       <div>
-        <h2 id="accounts-title">Kostenübersicht nach Konto</h2>
-        <p class="section-caption">Kostenwährungen und Nutzungsmesswerte bleiben getrennt. Für jedes Konto wird nur der letzte erfolgreiche Snapshot gezeigt; spätere Fehlversuche erscheinen als Status.</p>
+        <h2 id="accounts-title">Kosten pro Konto</h2>
+        <p class="section-caption">Kosten und Verbrauch zeigen wir getrennt an. Für jedes Konto siehst du die zuletzt erfolgreich abgerufenen Daten. Wenn ein späterer Abruf fehlschlägt, zeigen wir das zusätzlich an.</p>
       </div>
     </div>
 
@@ -52,7 +50,7 @@
                 <h3>{{ account.profile_name }}</h3>
               </div>
               {% if account.last_job_status %}
-                <span class="refresh-badge{% if account.last_job_status in ('Fehlgeschlagen', 'Nicht verfügbar') %} refresh-badge-warning{% elif account.last_job_status in ('Aktualisierung läuft', 'Wiederholung geplant') %} refresh-badge-pending{% endif %}">{{ account.last_job_status }}</span>
+                <span class="refresh-badge{% if account.last_job_status in ('Abruf fehlgeschlagen', 'Nicht verfügbar') %} refresh-badge-warning{% elif account.last_job_status in ('Abruf läuft', 'Neuer Versuch ausstehend') %} refresh-badge-pending{% endif %}">{{ account.last_job_status }}</span>
               {% endif %}
             </header>
 
@@ -60,7 +58,7 @@
               <div class="account-cost-stats">
                 {% if account.actual_costs %}
                   <div>
-                    <h4>Ist-Kosten</h4>
+                    <h4>Abgerechnete Kosten</h4>
                     <ul class="detail-values">
                       {% for metric in account.actual_costs %}
                         <li><span>{{ metric.label }}</span><strong>{{ metric.formatted_value }} {{ metric.currency }}</strong></li>
@@ -80,7 +78,7 @@
                 {% endif %}
                 {% if account.usage %}
                   <div>
-                    <h4>Nutzung</h4>
+                    <h4>Verbrauch</h4>
                     <ul class="detail-values">
                       {% for metric in account.usage %}
                         <li><span>{{ metric.label }}</span><strong>{{ metric.formatted_value }}</strong></li>
@@ -90,22 +88,22 @@
                 {% endif %}
               </div>
             {% elif account.last_successful_at %}
-              <p class="account-empty">Der letzte erfolgreiche Refresh lieferte keine Kosten- oder Nutzungsdaten.</p>
+              <p class="account-empty">Der letzte erfolgreiche Abruf enthielt keine Kosten- oder Verbrauchsdaten.</p>
             {% else %}
-              <p class="account-empty">Für dieses Konto liegen noch keine erfolgreichen Kosten- oder Nutzungsdaten vor.</p>
+              <p class="account-empty">Für dieses Konto wurden noch keine Kosten- oder Verbrauchsdaten abgerufen.</p>
             {% endif %}
 
             {% if account.last_successful_at %}
-              <p class="account-meta">Zeitraum: {{ account.period_start.strftime('%d.%m.%Y') }} – {{ account.period_end.strftime('%d.%m.%Y') }} UTC · aktualisiert <time datetime="{{ account.last_successful_at.isoformat() }}" data-local-time>{{ account.last_successful_at.isoformat() }}</time></p>
+              <p class="account-meta">Zeitraum: {{ account.period_start.strftime('%d.%m.%Y') }} bis {{ account.period_end.strftime('%d.%m.%Y') }} · zuletzt abgerufen <time datetime="{{ account.last_successful_at.isoformat() }}" data-local-time>{{ account.last_successful_at.isoformat() }}</time></p>
             {% elif not account.has_billing_scope %}
-              <p class="account-meta">Kein Billing-Scope gebunden.</p>
+              <p class="account-meta">Abrechnung noch nicht eingerichtet.</p>
             {% elif not account.has_billing_key %}
-              <p class="account-meta">Billing-Zugang fehlt noch.</p>
+              <p class="account-meta">Zugangsdaten für die Abrechnung fehlen noch.</p>
             {% else %}
-              <p class="account-meta">Es gibt noch keinen erfolgreichen Abruf.</p>
+              <p class="account-meta">Es wurden noch keine Daten abgerufen.</p>
             {% endif %}
-            {% if account.last_job_message %}
-              <p class="account-error">{{ account.last_job_message }}</p>
+            {% if account.last_job_status in ('Abruf fehlgeschlagen', 'Nicht verfügbar') %}
+              <p class="account-error">Beim letzten Abruf gab es ein Problem. Weitere Informationen findest du unter <a href="{{ url_for('admin.settings_costs') }}">Kosten</a>.</p>
             {% endif %}
           </article>
         {% endfor %}
@@ -115,17 +113,17 @@
     {% if view.accounts_with_cost_data == 0 %}
       <div class="empty-state">
         <span class="empty-state-mark" aria-hidden="true">—</span>
-        <h3>Noch keine Kostendaten</h3>
+        <h3>Noch keine Kosten- oder Verbrauchsdaten</h3>
         {% if view.billing_scope_count == 0 %}
-          <p>Kein Billing-Scope gebunden. Hinterlege zuerst den passenden Scope und Anbieterzugang.</p>
+          <p>Die Abrechnung ist noch nicht eingerichtet. Ergänze zuerst die erforderlichen Angaben unter „Kosten“.</p>
         {% elif view.accounts_with_successful_refresh == 0 %}
-          <p>Billing-Scope ist vorhanden, aber es wurde noch kein erfolgreicher Kosten-Refresh gespeichert.</p>
+          <p>Die Abrechnung ist eingerichtet, aber es wurden noch keine Daten erfolgreich abgerufen.</p>
         {% elif view.accounts_with_successful_refresh == view.billing_scope_count %}
-          <p>Die letzten erfolgreichen Kosten-Refreshes lieferten keine Kostendaten.</p>
+          <p>Die letzten erfolgreichen Abrufe enthielten keine Kosten- oder Verbrauchsdaten.</p>
         {% else %}
-          <p>Einige Konten wurden noch nicht erfolgreich aktualisiert; erfolgreiche Refreshes lieferten keine Kostendaten.</p>
+          <p>Für einige Konten liegen noch keine erfolgreich abgerufenen Daten vor; bei den übrigen Konten fehlen Kosten- und Verbrauchsdaten.</p>
         {% endif %}
-        <a class="primary-cta" href="{{ url_for('admin.settings_costs') }}">Kosten einrichten und aktualisieren</a>
+        <a class="primary-cta" href="{{ url_for('admin.settings_costs') }}">Abrechnung einrichten</a>
       </div>
     {% endif %}
   </section>

@@ -65,7 +65,7 @@ def test_connection_shows_priority_order(route_client):
     client, _, ids, _ = route_client
     response = client.get("/admin/settings/connection")
     assert response.status_code == 200
-    assert "Failover-Reihenfolge" in response.text
+    assert "Bevorzugte Reihenfolge" in response.text
     assert response.text.index(f'data-route-profile="{ids[0]}"') < response.text.index(
         f'data-route-profile="{ids[1]}"'
     )

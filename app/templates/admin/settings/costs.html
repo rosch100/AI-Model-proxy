@@ -4,90 +4,127 @@
 {% block content %}
 <section>
   <h1>Kosten</h1>
-  <p class="lede">Billing-Schlüssel und Abrechnungs-Scope sind getrennte Einstellungen. Beide lassen sich hier pro Provider-Account speichern; der Proxy verwendet die Angaben nur für diesen Tenant.</p>
-  <p>Azure verwendet weiterhin die Hostidentität des Proxys; es werden keine Azure-Client-Secrets erfasst.</p>
+  <p class="lede">Richte den Schlüssel für die Abfrage und die dazugehörige Organisation, das Projekt oder den Workspace getrennt ein. Ordne beides dem passenden Konto zu.</p>
+  <p>Für Azure fragt der Proxy die Daten mit seinem eigenen Zugang ab. Du musst hier keine Azure-Zugangsdaten speichern.</p>
 
-  <h2>OpenAI: Admin API Key erzeugen</h2>
-  <p>Ein Projekt- oder User-Key aus <a href="https://platform.openai.com/api-keys" rel="noreferrer">API keys</a> (Präfix typisch <code>sk-proj-</code> oder <code>sk-</code>) darf <code>/v1/organization/costs</code> und <code>/v1/organization/usage/completions</code> nicht aufrufen. Dafür braucht es einen <strong>Admin API Key</strong> der API-Platform-Organisation (Präfix <code>sk-admin-</code>). Nur Organization Owner können ihn anlegen. Er ist nicht für Chat Completions nutzbar.</p>
+  <h2>OpenAI: Abrechnungsschlüssel einrichten</h2>
+  <p>Für die Abfrage brauchst du einen <strong>Admin API Key</strong> der OpenAI-Organisation. Ein normaler Schlüssel von <a href="https://platform.openai.com/api-keys" rel="noreferrer">API keys</a> reicht dafür nicht aus. Der Admin-Schlüssel beginnt mit <code>sk-admin-</code>. Er kann nur von einem Organisationsadministrator erstellt und nicht für Chat-Anfragen verwendet werden.</p>
   <ol>
-    <li>Als Owner anmelden: <a href="https://platform.openai.com/settings/organization/admin-keys" rel="noreferrer">platform.openai.com/settings/organization/admin-keys</a></li>
-    <li>„Create new admin key“, Namen vergeben.</li>
-    <li>Rechte <em>Restricted</em>: mindestens <strong>Usage API → Read</strong> (<code>api.usage.read</code>). Zum automatischen Laden der Projektliste zusätzlich <strong>Organization Administration → Read</strong>. Nicht den Inference-Key wiederverwenden.</li>
-    <li>Den Wert einmalig kopieren und unten als OpenAI-Billing-Schlüssel speichern.</li>
+    <li>Melde dich als Organisationsadministrator an: <a href="https://platform.openai.com/settings/organization/admin-keys" rel="noreferrer">OpenAI-Organisationsschlüssel öffnen</a>.</li>
+    <li>Wähle „Create new admin key“ und gib dem Schlüssel einen Namen.</li>
+    <li>Wähle <em>Restricted</em> und erteile mindestens <strong>Usage API → Read</strong> (<code>api.usage.read</code>). Damit der Proxy deine Projektliste automatisch laden kann, erteile zusätzlich <strong>Organization Administration → Read</strong>.</li>
+    <li>Kopiere den Schlüssel – er wird nur einmal angezeigt – und speichere ihn unten beim passenden Konto.</li>
   </ol>
-  <p class="hint">Die Organization-ID findest du unter <a href="https://platform.openai.com/settings/organization/general" rel="noreferrer">Organization → General</a> (<code>org-…</code>), die Project-ID unter <a href="https://platform.openai.com/settings/organization/projects" rel="noreferrer">Organization → Projects</a> (<code>proj_…</code>). Beide werden unten direkt beim Profil gespeichert; der Refresh filtert Kosten und Tokens auf dieses Projekt.</p>
+  <p class="hint">Wähle in OpenAI dieselbe Organisation, für die du den Schlüssel erstellt hast. Ihre Kennung (<code>org-…</code>) findest du unter <a href="https://platform.openai.com/settings/organization/general" target="_blank" rel="noopener noreferrer">Organization → General</a>. Die Projektkennung (<code>proj_…</code>) findest du unter <a href="https://platform.openai.com/settings/organization/projects" target="_blank" rel="noopener noreferrer">Organization → Projects</a> → Projekt auswählen → Settings/General. Trage beide Kennungen beim passenden Konto ein; Kosten und Verbrauchswerte werden dann diesem Projekt zugeordnet.</p>
 
-  <h2>OpenRouter: Management Key erzeugen</h2>
-  <p>Ein normaler Inference-Key von <a href="https://openrouter.ai/settings/keys" rel="noreferrer">Settings → API Keys</a> (<code>sk-or-v1-…</code>) liefert 403 auf der Activity-API („Only management keys can perform this operation“). Kosten kommen von <code>GET /api/v1/activity</code>, und die verlangt einen <strong>Management API Key</strong>. In Organisationen dürfen nur Organization Admins einen anlegen. Er kann keine Completions ausführen.</p>
+  <h2>OpenRouter: Abrechnungsschlüssel einrichten</h2>
+  <p>Für die Abfrage brauchst du einen <strong>Management API Key</strong> von <a href="https://openrouter.ai/settings/management-keys" rel="noreferrer">Settings → Management API Keys</a>. Ein normaler Schlüssel für Anfragen reicht nicht aus. In Organisationen kann nur ein Organisationsadministrator diesen Verwaltungsschlüssel erstellen. Er lässt sich nicht für Chat-Anfragen verwenden.</p>
   <ol>
-    <li><a href="https://openrouter.ai/settings/management-keys" rel="noreferrer">openrouter.ai/settings/management-keys</a></li>
-    <li>„Create New Key“, Name und Ablaufdatum wählen.</li>
-    <li>Den Wert einmalig kopieren und unten als OpenRouter-Billing-Schlüssel speichern.</li>
+    <li>Öffne <a href="https://openrouter.ai/settings/management-keys" rel="noreferrer">deine OpenRouter-Verwaltungsschlüssel</a>.</li>
+    <li>Wähle „Create New Key“ und gib dem Schlüssel einen Namen sowie ein Ablaufdatum.</li>
+    <li>Kopiere den Schlüssel – er wird nur einmal angezeigt – und speichere ihn unten beim passenden Konto.</li>
   </ol>
-  <p class="hint">Die Workspace-ID ist die UUID des Workspaces unter <a href="https://openrouter.ai/settings" rel="noreferrer">OpenRouter Settings</a> (Workspaces). Sie lässt sich unten direkt beim Account eintragen. Die Activity-API liefert OpenRouter- und BYOK-Kosten sowie Tokenverbrauch der letzten 30 abgeschlossenen UTC-Tage, gefiltert auf diesen Workspace.</p>
+  <p class="hint">Die Workspace-Kennung findest du unter <a href="https://openrouter.ai/settings" target="_blank" rel="noopener noreferrer">OpenRouter Settings → Workspaces</a>. Falls sie dort nicht angezeigt wird, nutze die offizielle <a href="https://openrouter.ai/docs/api/api-reference/workspaces/list-workspaces" target="_blank" rel="noopener noreferrer">Liste deiner Workspaces</a>. Übernimm den Wert aus dem Feld <code>id</code>, nicht den Namen des Workspaces, und trage ihn beim passenden Konto ein. Angezeigt werden Kosten und Verbrauchswerte der letzten 30 abgeschlossenen Tage.</p>
 
-  <h2>Azure-Hostidentität</h2>
-  <p>Es wird keine Tenant-Credential eingegeben. Der Proxy verwendet seine operatorseitig konfigurierte Managed Identity (einschließlich User-assigned Managed Identity) auf Azure oder Workload Identity bzw. Zertifikatsidentität außerhalb Azure. Die gebundene Resource Group benötigt Cost Management Reader; die gebundene Cognitive-Services-Ressource benötigt Monitoring Reader für separat abgefragte Usage-Metriken.</p>
+  <h2>Azure-Zugriff für die Abfrage</h2>
+  <p>Du musst hier keinen Azure-Schlüssel hinterlegen. Der Proxy verwendet den Zugang seines Servers. Dieser benötigt die Rolle <strong>Cost Management Reader</strong> für die Ressourcengruppe und zusätzlich <strong>Monitoring Reader</strong> für das Cognitive-Services-Konto, um Verbrauchsdaten abzurufen.</p>
+  <p class="hint">Die Subscription-Kennung findest du im <a href="https://portal.azure.com/#view/Microsoft_Azure_Billing/SubscriptionsBlade" target="_blank" rel="noopener noreferrer">Azure-Portal unter Subscriptions</a>. Die Kennung der Ressourcengruppe findest du unter <a href="https://portal.azure.com/#view/HubsExtension/BrowseResourceGroups" target="_blank" rel="noopener noreferrer">Resource Groups → gewünschte Gruppe → Properties → Resource ID</a>. Die Kennung des Cognitive-Services-Kontos findest du unter <a href="https://portal.azure.com/#view/HubsExtension/BrowseAll" target="_blank" rel="noopener noreferrer">Alle Ressourcen → Cognitive-Services-Konto → Properties → Resource ID</a>. Um zu prüfen, ob der Proxyserver Zugriff hat, öffne die jeweilige Ressource und wähle <strong>Access control (IAM) → Check access</strong>. Suche dort nach der Identität des Proxyservers. <a href="https://learn.microsoft.com/azure/role-based-access-control/role-assignments-list-portal" target="_blank" rel="noopener noreferrer">Microsoft-Anleitung: Zugriffsrollen im Portal prüfen</a>.</p>
+  <details>
+    <summary>Azure-Kennungen und Zugriffsrechte mit der Befehlszeile prüfen</summary>
+    <p>Die folgenden Befehle rufen nur Informationen ab. Melde dich zuerst mit <code>az login</code> an und ersetze die Platzhalter durch deine Werte. <code>az account set</code> ändert nur die aktive Subscription in deiner lokalen Azure-CLI. Rufe niemals <code>account keys list</code> auf und teile keine ausgegebenen Schlüssel.</p>
+    <pre><code>az login
+az account list --query '[].{Name:name, SubscriptionId:id, TenantId:tenantId}' -o table
+az account set --subscription '&lt;subscription-guid&gt;'
+az account show --query '{subscription:id, tenant:tenantId}' -o yaml
 
-  <h2>Kosten- und Nutzungsarten</h2>
-  <dl class="cost-summary" aria-label="Verfügbare Kosten- und Nutzungswerte">
-    <div><dt>Tatsächliche Kosten</dt><dd>Provider-abgerechnete Kosten je verfügbarer Währung und Zeitbucket</dd><dd>{% if view.records|selectattr("kind", "equalto", "actual")|list %}{{ view.records|selectattr("kind", "equalto", "actual")|list|length }} Datensätze insgesamt{% else %}Noch keine Datensätze{% endif %}</dd></div>
-    <div><dt>Verbrauch</dt><dd>Provider-gemeldete Token- oder Ressourcenmetriken ohne erfundene Kostenumrechnung</dd><dd>{% if view.records|selectattr("kind", "equalto", "usage")|list %}{{ view.records|selectattr("kind", "equalto", "usage")|list|length }} Datensätze insgesamt{% else %}Noch keine Datensätze{% endif %}</dd></div>
-    <div><dt>Schätzungen</dt><dd>Nur mit belegter Preisquelle, Version, Modell und passender Usage-Grundlage</dd><dd>{% if view.records|selectattr("kind", "equalto", "estimate")|list %}{{ view.records|selectattr("kind", "equalto", "estimate")|list|length }} Datensätze insgesamt{% else %}Noch keine Datensätze{% endif %}</dd></div>
+# Die beiden IDs, die in die Azure-Billing-Felder gehören:
+az group show --name '&lt;resource-group&gt;' --query id -o tsv
+az cognitiveservices account show --name '&lt;cognitive-account&gt;' --resource-group '&lt;resource-group&gt;' --query '{id:id, endpoint:properties.endpoint}' -o yaml
+
+# Deployment-Namen und Modell der Ressource (keine Schlüssel):
+az cognitiveservices account deployment list --name '&lt;cognitive-account&gt;' --resource-group '&lt;resource-group&gt;' --query '[].{deployment:name, model:properties.model.name, state:properties.provisioningState}' -o table</code></pre>
+    <p>Für die Rollenprüfung benötigst du die <strong>Object-/Principal-ID der Identität des Proxyservers</strong>. Du findest sie unter <a href="https://portal.azure.com/#view/HubsExtension/BrowseAll" target="_blank" rel="noopener noreferrer">Azure-Portal → Proxyserver → Identity</a>. Verwende nicht die Client-ID oder die Identität des Cognitive-Services-Kontos. In der Spalte <code>scope</code> muss die Rolle für die angefragte Ressource oder eine übergeordnete Ressource gelten.</p>
+    <pre><code>RESOURCE_GROUP_ID="$(az group show --name '&lt;resource-group&gt;' --query id -o tsv)"
+COGNITIVE_RESOURCE_ID="$(az cognitiveservices account show --name '&lt;cognitive-account&gt;' --resource-group '&lt;resource-group&gt;' --query id -o tsv)"
+PROXY_PRINCIPAL_ID='&lt;principal-object-id-der-proxy-hostidentitaet&gt;'
+
+# Erwartet: Cost Management Reader auf der Resource Group (oder geerbt von oben)
+az role assignment list --scope "$RESOURCE_GROUP_ID" --all --include-inherited --assignee-object-id "$PROXY_PRINCIPAL_ID" --query "[?roleDefinitionName=='Cost Management Reader'].{role:roleDefinitionName, scope:scope}" -o table
+
+# Erwartet: Monitoring Reader auf der Cognitive-Services-Ressource (oder geerbt)
+az role assignment list --scope "$COGNITIVE_RESOURCE_ID" --all --include-inherited --assignee-object-id "$PROXY_PRINCIPAL_ID" --query "[?roleDefinitionName=='Monitoring Reader'].{role:roleDefinitionName, scope:scope}" -o table</code></pre>
+    <p>Falls die Rollen fehlen, kann ein Azure-Administrator sie mit den folgenden <em>ändernden</em> Befehlen auf genau diesen Scopes zuweisen. Nur mit entsprechender Berechtigung (z. B. User Access Administrator/Owner) ausführen; die Proxy-Hostidentität als Assignee verwenden:</p>
+    <pre><code>az role assignment create --assignee-object-id "$PROXY_PRINCIPAL_ID" --assignee-principal-type ServicePrincipal --role 'Cost Management Reader' --scope "$RESOURCE_GROUP_ID"
+az role assignment create --assignee-object-id "$PROXY_PRINCIPAL_ID" --assignee-principal-type ServicePrincipal --role 'Monitoring Reader' --scope "$COGNITIVE_RESOURCE_ID"</code></pre>
+    <p><a href="https://learn.microsoft.com/cli/azure/cognitiveservices/account?view=azure-cli-latest" target="_blank" rel="noopener noreferrer">CLI-Referenz: Cognitive Services</a> · <a href="https://learn.microsoft.com/cli/azure/role/assignment?view=azure-cli-latest" target="_blank" rel="noopener noreferrer">CLI-Referenz: RBAC-Rollenzuweisungen</a> · <a href="https://learn.microsoft.com/azure/cost-management-billing/costs/understand-work-scopes#using-scopes-with-cost-management-apis" target="_blank" rel="noopener noreferrer">Microsoft: Cost-Management-Scopes</a>.</p>
+  </details>
+
+  <h2>Welche Daten werden angezeigt?</h2>
+  <dl class="cost-summary" aria-label="Verfügbare Kosten- und Verbrauchswerte">
+    <div><dt>Abgerechnete Kosten</dt><dd>Vom Anbieter gemeldete Beträge, getrennt nach Währung und Zeitraum</dd><dd>{% if view.records|selectattr("kind", "equalto", "actual")|list %}{{ view.records|selectattr("kind", "equalto", "actual")|list|length }} Einträge insgesamt{% else %}Noch keine Einträge{% endif %}</dd></div>
+    <div><dt>Verbrauch</dt><dd>Vom Anbieter gemeldete Token- oder Ressourcenzahlen; daraus werden keine Kosten abgeleitet</dd><dd>{% if view.records|selectattr("kind", "equalto", "usage")|list %}{{ view.records|selectattr("kind", "equalto", "usage")|list|length }} Einträge insgesamt{% else %}Noch keine Einträge{% endif %}</dd></div>
+    <div><dt>Kostenschätzungen</dt><dd>Werden nur angezeigt, wenn eine passende Preisgrundlage vorliegt</dd><dd>{% if view.records|selectattr("kind", "equalto", "estimate")|list %}{{ view.records|selectattr("kind", "equalto", "estimate")|list|length }} Einträge insgesamt{% else %}Noch keine Einträge{% endif %}</dd></div>
   </dl>
   <ul>
-    <li><strong>OpenAI:</strong> Admin API Key (nicht der Projekt-Inference-Key). Kosten und Input-/Output-Tokens werden auf das hier konfigurierte Projekt gefiltert.</li>
-    <li><strong>OpenRouter:</strong> Management Key (nicht der Completions-API-Key). Activity-API der letzten 30 abgeschlossenen UTC-Tage, gefiltert auf die gebundene Workspace-UUID.</li>
-    <li><strong>Azure-Hostidentität:</strong> keine Tenant-Credential. Cost Management Reader auf der Resource Group, Monitoring Reader auf der Cognitive-Services-Ressource.</li>
+    <li><strong>OpenAI:</strong> Für Abrechnungsdaten brauchst du einen Admin API Key. Die Werte beziehen sich auf das ausgewählte Projekt.</li>
+    <li><strong>OpenRouter:</strong> Für Abrechnungsdaten brauchst du einen Management API Key. Die Werte beziehen sich auf den ausgewählten Workspace und die letzten 30 abgeschlossenen Tage.</li>
+    <li><strong>Azure:</strong> Der Proxyserver benötigt Zugriff auf die Ressourcengruppe und das Cognitive-Services-Konto.</li>
   </ul>
 
-  <h2>Azure-Billing konfigurieren</h2>
+  <h2>Azure-Abrechnung einrichten</h2>
   {% set azure_profiles = view.profiles|selectattr("provider", "equalto", "azure")|list %}
   {% if azure_profiles %}
     {% for profile in azure_profiles %}
       <article class="cost-account">
         <h3>{{ profile.display_name }} (Azure)</h3>
-        <p class="hint">Die Resource Group ist der Billing-Scope, die darin liegende Cognitive-Services-Ressource der Usage-Scope. Beide müssen ausschließlich diesem Tenant zugeordnet sein. Die Azure-Hostidentität benötigt Cost Management Reader auf der Gruppe und Monitoring Reader auf der Ressource.</p>
+        <p class="hint">Trage die Kennung der Ressourcengruppe für die Kosten und die vollständige Kennung des Cognitive-Services-Kontos für Verbrauchsdaten ein. Beide Ressourcen müssen ausschließlich diesem Konto zugeordnet sein. Der Proxyserver benötigt für die Ressourcengruppe die Rolle <strong>Cost Management Reader</strong> und für das Cognitive-Services-Konto die Rolle <strong>Monitoring Reader</strong>.</p>
         {% if profile.id in view.azure_scope_bound_profile_ids %}
-          <p>Azure-Scopes sind unveränderlich gebunden. Die gespeicherten Resource-Group- und Usage-ARM-IDs sind unten unter „Gebundene Scopes“ sichtbar.</p>
+          <p>Die Azure-Ressourcen sind bereits fest zugeordnet. Die gespeicherten IDs findest du unten unter „Zugeordnete Ressourcen“.</p>
         {% else %}
           {% set scope_form = azure_scope_forms[profile.id] %}
-          <form method="post" action="{{ url_for('admin.save_azure_cost_scopes') }}" class="stack">
+          <form method="post" action="{{ url_for('admin.save_azure_cost_scopes') }}" class="stack" data-azure-scope-form>
             {{ scope_form.csrf_token }}
             <input type="hidden" name="profile_id" value="{{ profile.id }}" />
             <label for="azure-subscription-{{ profile.id }}">{{ scope_form.subscription_id.label.text }}
               {{ scope_form.subscription_id(id="azure-subscription-" ~ profile.id, placeholder="00000000-0000-0000-0000-000000000000", autocomplete="off", aria_describedby="azure-scope-hint-" ~ profile.id) }}
             </label>
+            <p class="hint">Die Subscription-ID ist eine Kennung aus Buchstaben und Zahlen, kein vollständiger Ressourcenpfad. Öffne <a href="https://portal.azure.com/#view/Microsoft_Azure_Billing/SubscriptionsBlade" target="_blank" rel="noopener noreferrer">Subscriptions im Azure-Portal</a> und wähle die richtige Subscription aus. Die ID findest du unter <strong>Overview → Subscription ID</strong>. Alternativ kannst du sie mit <code>az account show --query id -o tsv</code> oder aus der oben angezeigten Liste abrufen.</p>
             {% if scope_form.errors %}<ul class="error-text">{% for field_errors in scope_form.errors.values() %}{% for error in field_errors %}<li>{{ error }}</li>{% endfor %}{% endfor %}</ul>{% endif %}
-            <label for="azure-resource-group-{{ profile.id }}">{{ scope_form.resource_group_arm_id.label.text }}
+            <label for="azure-resource-group-{{ profile.id }}">Kennung der Ressourcengruppe (für Kosten) *
               {{ scope_form.resource_group_arm_id(id="azure-resource-group-" ~ profile.id, placeholder="/subscriptions/<subscription-id>/resourceGroups/<resource-group>", autocomplete="off", aria_describedby="azure-scope-hint-" ~ profile.id) }}
             </label>
-            <label for="azure-cognitive-resource-{{ profile.id }}">{{ scope_form.cognitive_resource_arm_id.label.text }}
+            <p class="hint">Öffne <a href="https://portal.azure.com/#view/HubsExtension/BrowseResourceGroups" target="_blank" rel="noopener noreferrer">Resource Groups</a>, wähle die gewünschte Gruppe und kopiere unter <strong>Properties → Resource ID</strong> die Kennung der Gruppe. Verwende nicht die Kennung eines einzelnen Kontos.
+              <br />Direktlink: <a data-azure-scope-link="resource-group" target="_blank" rel="noopener noreferrer" hidden>Ressourcengruppe im Azure-Portal öffnen</a>
+            </p>
+            <label for="azure-cognitive-resource-{{ profile.id }}">Kennung des Cognitive-Services-Kontos (für Verbrauchsdaten) *
               {{ scope_form.cognitive_resource_arm_id(id="azure-cognitive-resource-" ~ profile.id, placeholder="/subscriptions/<id>/resourceGroups/<group>/providers/Microsoft.CognitiveServices/accounts/<account>", autocomplete="off", aria_describedby="azure-scope-hint-" ~ profile.id) }}
             </label>
+            <p class="hint">Kopiere die vollständige Kennung des Cognitive-Services-Kontos. Öffne <a href="https://portal.azure.com/#view/HubsExtension/BrowseAll" target="_blank" rel="noopener noreferrer">Alle Ressourcen im Azure-Portal</a>, wähle das gewünschte Konto und kopiere unter <strong>Properties → Resource ID</strong> dessen Kennung.
+              <br />Direktlink: <a data-azure-scope-link="cognitive-resource" target="_blank" rel="noopener noreferrer" hidden>Cognitive-Services-Konto im Azure-Portal öffnen</a>
+            </p>
             <label class="reveal-toggle">{{ scope_form.exclusive_scope_confirmation() }}{{ scope_form.exclusive_scope_confirmation.label.text }}</label>
-            <p id="azure-scope-hint-{{ profile.id }}" class="hint">ARM-IDs werden vor dem Speichern validiert; die Ressource muss in exakt dieser Subscription und Resource Group liegen. Eine spätere Änderung ist wegen unveränderlicher Scope-Attribution nicht möglich.</p>
-            <button type="submit">Azure Billing-Scope speichern</button>
+            <p id="azure-scope-hint-{{ profile.id }}" class="hint">Die Kennungen werden vor dem Speichern geprüft. Das Cognitive-Services-Konto muss zur ausgewählten Subscription und Ressourcengruppe gehören. Diese Zuordnungen können nach dem Speichern nicht mehr geändert werden.</p>
+            <button type="submit">Azure-Abrechnungsdaten speichern</button>
           </form>
         {% endif %}
       </article>
     {% endfor %}
   {% else %}
-    <p>Für Azure-Kostendaten zuerst einen Azure-Account unter <a href="{{ url_for('admin.settings_connection') }}">Verbindung</a> anlegen.</p>
+    <p>Lege zuerst unter <a href="{{ url_for('admin.settings_connection') }}">Anbieter und Konten</a> ein Azure-Konto an.</p>
   {% endif %}
 
-  <h2>Gebundene Scopes</h2>
+  <h2>Zugeordnete Ressourcen</h2>
   {% if view.bindings %}
     <ul>
       {% for profile, binding, node in view.bindings %}
-        <li>{{ profile.display_name }} ({{ profile.provider }}) / {{ binding.purpose }}: <code>{{ node.canonical_scope_id }}</code>{% if profile.provider == "openai" and profile.id in openai_organization_ids %} · Organization <code>{{ openai_organization_ids[profile.id] }}</code>{% endif %}</li>
+        <li>{{ profile.display_name }} ({{ profile.provider }}) · {% if binding.purpose == "billing" %}Abrechnung{% else %}Verbrauchsdaten{% endif %}: <code>{{ node.canonical_scope_id }}</code>{% if profile.provider == "openai" and profile.id in openai_organization_ids %} · OpenAI-Organisation <code>{{ openai_organization_ids[profile.id] }}</code>{% endif %}</li>
       {% endfor %}
     </ul>
   {% else %}
-    <p>Noch keine Billing- oder Usage-Scopes für diesen Tenant konfiguriert.</p>
+    <p>Es sind noch keine Ressourcen für Abrechnungs- oder Verbrauchsdaten zugeordnet.</p>
   {% endif %}
 
-  <h2>Accounts</h2>
+  <h2>Konten</h2>
   {% for profile in view.profiles %}
     <article>
       <h3>{{ profile.display_name }} ({{ profile.provider }})</h3>
@@ -97,29 +134,29 @@
           {{ account_billing_form.csrf_token }}
           <input type="hidden" name="profile_id" value="{{ profile.id }}" />
           {% if profile.provider == "openai" %}
-            <label for="openai-billing-secret-{{ profile.id }}">OpenAI Admin API Key
+            <label for="openai-billing-secret-{{ profile.id }}">OpenAI-Administratorschlüssel für die Abrechnung
               {{ account_billing_form.billing_secret(id="openai-billing-secret-" ~ profile.id, autocomplete="new-password", aria_describedby="openai-billing-hint-" ~ profile.id) }}
             </label>
-            <p id="openai-billing-hint-{{ profile.id }}" class="hint">{% if view.billing_key_masks[profile.id] %}Gespeichert (maskiert). Leer lassen, um den Key beizubehalten; einen neuen Key hier eingeben, um ihn zu ersetzen.{% else %}Noch nicht gespeichert.{% endif %} Erforderlich ist ein Admin API Key von <a href="https://platform.openai.com/settings/organization/admin-keys" rel="noreferrer">Organization → Admin keys</a> mit Usage API Read. Für das automatische Laden der Projektliste zusätzlich Organization Administration Read.</p>
+            <p id="openai-billing-hint-{{ profile.id }}" class="hint">{% if view.billing_key_masks[profile.id] %}Bereits gespeichert. Lass das Feld leer, um den Schlüssel beizubehalten. Gib hier einen neuen Schlüssel ein, um ihn zu ersetzen.{% else %}Noch nicht gespeichert.{% endif %} Erforderlich ist ein Admin API Key von <a href="https://platform.openai.com/settings/organization/admin-keys" target="_blank" rel="noopener noreferrer">Organization → Admin keys</a> mit der Berechtigung <strong>Usage API → Read</strong>. Zum automatischen Laden der Projektliste brauchst du zusätzlich <strong>Organization Administration → Read</strong>.</p>
           {% else %}
-            <label for="openrouter-billing-secret-{{ profile.id }}">OpenRouter Management Key
+            <label for="openrouter-billing-secret-{{ profile.id }}">OpenRouter-Verwaltungsschlüssel für die Abrechnung
               {{ account_billing_form.billing_secret(id="openrouter-billing-secret-" ~ profile.id, autocomplete="new-password", aria_describedby="openrouter-billing-hint-" ~ profile.id) }}
             </label>
-            <p id="openrouter-billing-hint-{{ profile.id }}" class="hint">{% if view.billing_key_masks[profile.id] %}Gespeichert (maskiert). Leer lassen, um den Key beizubehalten; einen neuen Key hier eingeben, um ihn zu ersetzen.{% else %}Noch nicht gespeichert.{% endif %} Erforderlich ist ein Management Key von <a href="https://openrouter.ai/settings/management-keys" rel="noreferrer">Settings → Management API Keys</a>.</p>
+            <p id="openrouter-billing-hint-{{ profile.id }}" class="hint">{% if view.billing_key_masks[profile.id] %}Bereits gespeichert. Lass das Feld leer, um den Schlüssel beizubehalten. Gib hier einen neuen Schlüssel ein, um ihn zu ersetzen.{% else %}Noch nicht gespeichert.{% endif %} Erforderlich ist ein Management API Key von <a href="https://openrouter.ai/settings/management-keys" target="_blank" rel="noopener noreferrer">Settings → Management API Keys</a>.</p>
           {% endif %}
-          <button type="submit">Billing-Key speichern</button>
+          <button type="submit">Abrechnungsschlüssel speichern</button>
         </form>
         {% if profile.provider == "openai" and profile.id in openai_scope_forms %}
           {% set scope_form = openai_scope_forms[profile.id] %}
-          <h4>OpenAI Billing-Scope</h4>
+          <h4>OpenAI-Abrechnungsdaten zuordnen</h4>
           <form method="post" action="{{ url_for('admin.load_openai_projects') }}" class="stack">
             {{ scope_form.csrf_token }}
             <input type="hidden" name="profile_id" value="{{ profile.id }}" />
-            <label for="openai-organization-lookup-{{ profile.id }}">OpenAI Organization-ID *
+            <label for="openai-organization-lookup-{{ profile.id }}">OpenAI-Organisationskennung *
               <input id="openai-organization-lookup-{{ profile.id }}" name="organization_id" type="text" required maxlength="128" pattern="org-[A-Za-z0-9_-]+" value="{{ scope_form.organization_id.data or '' }}" autocomplete="off" />
             </label>
             <button type="submit" {% if not view.billing_key_masks[profile.id] %}disabled{% endif %}>Projekte automatisch laden</button>
-            <p class="hint">Organization-ID findest du in Organization → General. Die Liste wird mit dem gespeicherten Admin-Key direkt bei OpenAI abgerufen.</p>
+            <p class="hint">Die Kennung beginnt mit <code>org-</code>. Wähle im OpenAI-Dashboard oben links die richtige Organisation und kopiere die Kennung unter <a href="https://platform.openai.com/settings/organization/general" target="_blank" rel="noopener noreferrer">Organization → General</a>. Die Projektliste wird mit dem gespeicherten Administratorschlüssel geladen.</p>
           </form>
           <form method="post" action="{{ url_for('admin.save_openai_cost_scope') }}" class="stack">
             {{ scope_form.csrf_token }}
@@ -134,28 +171,28 @@
               {% endfor %}
             </datalist>
             <label class="reveal-toggle">{{ scope_form.exclusive_scope_confirmation() }}{{ scope_form.exclusive_scope_confirmation.label.text }}</label>
-            <button type="submit">OpenAI-Scope speichern</button>
+            <button type="submit">OpenAI-Abrechnungsdaten speichern</button>
           </form>
         {% elif profile.provider == "openrouter" and profile.id in openrouter_scope_forms %}
           {% set scope_form = openrouter_scope_forms[profile.id] %}
-          <h4>OpenRouter Billing-Scope</h4>
+          <h4>OpenRouter-Abrechnungsdaten zuordnen</h4>
           <form method="post" action="{{ url_for('admin.save_openrouter_cost_scope') }}" class="stack">
             {{ scope_form.csrf_token }}
             <input type="hidden" name="profile_id" value="{{ profile.id }}" />
-            <label>{{ scope_form.workspace_id.label }}{{ scope_form.workspace_id(autocomplete="off", placeholder="Workspace UUID") }}</label>
+            <label>{{ scope_form.workspace_id.label }}{{ scope_form.workspace_id(autocomplete="off", placeholder="Workspace-ID") }}</label>
             <label class="reveal-toggle">{{ scope_form.exclusive_scope_confirmation() }}{{ scope_form.exclusive_scope_confirmation.label.text }}</label>
-            <button type="submit">OpenRouter-Scope speichern</button>
+            <button type="submit">OpenRouter-Abrechnungsdaten speichern</button>
           </form>
         {% endif %}
         {% if view.billing_key_masks[profile.id] and profile.id in scope_bound_profile_ids %}
           <form method="post" action="{{ url_for('admin.refresh_costs') }}">
             {{ account_billing_form.csrf_token }}
             <input type="hidden" name="profile_id" value="{{ profile.id }}" />
-            <button type="submit">{{ profile.provider }} aktualisieren</button>
+            <button type="submit">{{ profile.provider }}-Daten aktualisieren</button>
           </form>
         {% endif %}
       {% elif profile.provider == "azure" %}
-        <p class="hint">Azure-Kosten verwenden die operatorseitige Hostidentität; ein Azure-Inference-Key oder Tenant-Service-Principal wird nicht für Billing verwendet.</p>
+        <p class="hint">Für Azure verwendet der Proxy den Zugang, der auf seinem Server eingerichtet wurde. Dein Azure-Schlüssel für Anfragen wird nicht für die Abrechnungsabfrage verwendet.</p>
         {% if profile.id in view.azure_costs_ready_profile_ids %}
           <form method="post" action="{{ url_for('admin.refresh_costs') }}">
             <input type="hidden" name="csrf_token" value="{{ csrf_token() }}" />
@@ -163,41 +200,40 @@
             <button type="submit">Azure-Kosten aktualisieren</button>
           </form>
         {% else %}
-          <p class="hint">Kosten sind noch nicht abrufbereit. Operatorseitig müssen eine tenantdedizierte Resource Group als Billing-Scope und die darin liegende Cognitive-Services-Ressource als Usage-Scope an dieses Profil gebunden sein.</p>
+          <p class="hint">Die Abfrage ist noch nicht eingerichtet. Ordne die Ressourcengruppe und das dazugehörige Cognitive-Services-Konto weiter oben auf dieser Seite im Formular „Azure-Abrechnung einrichten“ diesem Azure-Konto zu. Falls dem Proxyserver die erforderlichen Zugriffsrollen fehlen, wende dich an den Administrator des Proxyservers.</p>
         {% endif %}
       {% endif %}
     </article>
   {% endfor %}
 
   {% if view.jobs %}
-    <h2>Letzte Jobs</h2>
+    <h2>Letzte Abrufe</h2>
     <ul>
       {% for job in view.jobs %}
-        <li>{{ view.binding_profile_names.get(job.binding_id, job.provider) }} — {{ job.status }}{% if job.limitation %} ({{ job.limitation }}){% endif %}</li>
+        <li>{{ view.binding_profile_names.get(job.binding_id, job.provider) }} — {% if job.status == "success" %}Erfolgreich{% elif job.status == "failed" %}Fehlgeschlagen{% elif job.status == "retry_wait" %}Erneuter Versuch geplant{% elif job.status == "running" %}Wird abgerufen{% elif job.status == "unavailable" %}Vorübergehend nicht verfügbar{% else %}{{ job.status }}{% endif %}{% if job.status == "failed" and job.limitation %} ({{ job.limitation }}){% endif %}</li>
       {% endfor %}
     </ul>
   {% endif %}
-  <h2>Kosten- und Verbrauchsdaten</h2>
-  <div class="table-scroll">
+  <details>
+    <summary>Abgerufene Einzelwerte anzeigen (Details)</summary>
+    <div class="table-scroll">
     <table class="cost-records">
-      <caption>Provider-Datensätze, Buckets und Datenherkunft</caption>
-      <thead><tr><th scope="col">Account</th><th scope="col">Art / Metrik</th><th scope="col">Wert</th><th scope="col">Zeitraum (UTC)</th><th scope="col">Granularität</th><th scope="col">Quelle</th><th scope="col">Einschränkungen</th></tr></thead>
+      <caption>Vom Anbieter gemeldete Einzelwerte</caption>
+      <thead><tr><th scope="col">Konto</th><th scope="col">Datenart</th><th scope="col">Wert</th><th scope="col">Zeitraum</th></tr></thead>
       <tbody>
         {% for record in view.records %}
           <tr>
             <td>{{ view.binding_profile_names.get(record.binding_id, record.provider) }}</td>
-            <td>{{ record.kind }} / {{ record.metric }}</td>
-            <td>{{ record.value }}{% if record.currency %} {{ record.currency }}{% else %} {{ record.unit }}{% endif %}</td>
-            <td>{{ record.bucket_start.strftime("%Y-%m-%d %H:%M") }} – {{ record.bucket_end.strftime("%Y-%m-%d %H:%M") }}</td>
-            <td>{{ record.granularity }}</td>
-            <td>{{ record.source }}</td>
-            <td>{{ record.dimensions.get("limitation", "—") }}</td>
+            <td>{% if record.kind == "actual" %}Abgerechnete Kosten{% elif record.kind == "usage" %}Verbrauch{% elif record.kind == "estimate" %}Kostenschätzung{% else %}{{ record.kind }}{% endif %} · {{ {"cost": "Kosten", "input_tokens": "Eingabe", "output_tokens": "Ausgabe", "prompt_tokens": "Eingabe", "completion_tokens": "Ausgabe", "reasoning_tokens": "Schlussfolgerungen", "byok_inference_cost": "Kosten über den eigenen Schlüssel"}.get(record.metric, record.metric) }}</td>
+            <td>{{ record.value }}{% if record.currency %} {{ record.currency }}{% elif record.unit == "tokens" %} Token{% else %} {{ record.unit }}{% endif %}</td>
+            <td><time datetime="{{ record.bucket_start.isoformat() }}" data-local-time>{{ record.bucket_start.isoformat() }}</time> – <time datetime="{{ record.bucket_end.isoformat() }}" data-local-time>{{ record.bucket_end.isoformat() }}</time></td>
           </tr>
         {% else %}
-          <tr><td colspan="7">Noch keine Datensätze. Nach dem ersten erfolgreichen Abruf erscheinen hier nur durch den Provider belegte Werte.</td></tr>
+          <tr><td colspan="4">Noch keine Werte vorhanden. Nach dem ersten erfolgreichen Abruf erscheinen hier die Angaben des Anbieters.</td></tr>
         {% endfor %}
       </tbody>
     </table>
-  </div>
+    </div>
+  </details>
 </section>
 {% endblock %}

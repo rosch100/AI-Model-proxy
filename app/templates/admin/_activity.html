@@ -9,13 +9,13 @@
 >
   <div class="section-heading">
     <div>
-      <h2 id="activity-title">Aktuelle Aktivität</h2>
+      <h2 id="activity-title">Aktuelle Anfragen</h2>
       <p class="section-caption" id="activity-time-hint">
-        Live-Kennzahlen beziehen sich auf die letzten 15 Minuten; die Liste zeigt den gewählten Zeitraum. Zeiten werden in deiner lokalen Zeitzone angezeigt. Aktualisiert alle 15 Sekunden.
+        Die Zusammenfassungen beziehen sich auf die letzten 15 Minuten und die letzte Stunde. Die Liste zeigt den ausgewählten Zeitraum. Alle Uhrzeiten werden in deiner Zeitzone angezeigt. Die Anzeige aktualisiert sich alle 15 Sekunden.
       </p>
     </div>
     <form class="activity-period-form" method="get" action="{{ url_for('admin.dashboard') }}">
-      <label for="activity-period">Zeitraum der Liste
+      <label for="activity-period">Anfragen anzeigen für
         <select id="activity-period" name="activity_hours" data-activity-period>
           {% for hours, label in activity_period_options %}
             <option value="{{ hours }}"{% if hours == activity.request_period_hours %} selected{% endif %}>{{ label }}</option>
@@ -25,34 +25,36 @@
       <button type="submit">Anwenden</button>
     </form>
     {% if activity.last_request_label %}
-      <p class="activity-updated">Zuletzt {{ activity.last_request_label }}</p>
+      <p class="activity-updated">Letzte Anfrage: {{ activity.last_request_label }}</p>
     {% endif %}
   </div>
 
-  {% if activity.requests %}
+  {% if activity.window_summaries %}
     <dl class="activity-summary">
-      <div>
-        <dt>Anfragen · letzte {{ activity.window_minutes }} Min.</dt>
-        <dd>{{ activity.total_requests_in_window }}</dd>
-      </div>
-      <div>
-        <dt>Mit Tokenangabe</dt>
-        <dd>{{ activity.total_requests_with_usage_in_window }} <span class="activity-summary-detail">von {{ activity.total_requests_in_window }}</span></dd>
-      </div>
+      {% for summary in activity.window_summaries %}
+        <div>
+          <dt>{{ summary.label }}</dt>
+          <dd>{{ summary.total_requests }} <span class="activity-summary-detail">{% if summary.total_requests == 1 %}Anfrage{% else %}Anfragen{% endif %}</span></dd>
+          <dd class="activity-summary-tokens">{{ summary.total_tokens_label or "—" }} <span class="activity-summary-detail">Tokens insgesamt</span></dd>
+          <dd class="activity-summary-coverage">Für {{ summary.total_requests_with_usage }} von {{ summary.total_requests }} Anfragen liegen Tokenangaben vor</dd>
+        </div>
+      {% endfor %}
     </dl>
+  {% endif %}
 
+  {% if activity.requests %}
     <div class="activity-request-list">
       <div class="activity-request-list-heading">
-        <h3>Letzte Anfragen</h3>
-        <span>Bis zu {{ activity.requests|length }} der neuesten Einträge · älteste oben, neueste unten</span>
+        <h3>Anfragen im gewählten Zeitraum</h3>
+        <span>Neueste Anfragen zuerst · {{ activity.requests|length }} Einträge</span>
       </div>
       <div class="activity-table-scroll">
         <table class="activity-table">
           <thead>
             <tr>
-              <th scope="col">Zeit (lokal)</th>
-              <th scope="col">Abgefragtes Modell</th>
-              <th scope="col">Tokens / Anfrage</th>
+              <th scope="col">Zeit</th>
+              <th scope="col">Modell</th>
+              <th scope="col">Tokens pro Anfrage</th>
             </tr>
           </thead>
           <tbody>
@@ -65,15 +67,15 @@
                   <strong>{{ row.requested_model }}</strong>
                   <span class="activity-provider-label">{{ row.provider_label }}</span>
                   {% if row.routed_model and row.routed_model != row.requested_model %}
-                    <span class="activity-inbound">Weitergeleitet an <code>{{ row.routed_model }}</code></span>
+                    <span class="activity-inbound">Verwendetes Modell: <code>{{ row.routed_model }}</code></span>
                   {% endif %}
                 </td>
                 <td class="activity-token-cell">
                   {% if row.total_tokens_label %}
                     <strong>{{ row.total_tokens_label }}</strong>
-                    <span class="activity-token-breakdown">Eingabe {{ row.input_tokens_label }} · Ausgabe {{ row.output_tokens_label }}</span>
+                    <span class="activity-token-breakdown">Eingabe: {{ row.input_tokens_label }} · Ausgabe: {{ row.output_tokens_label }}</span>
                   {% else %}
-                    <span class="activity-unknown">Nicht gemeldet</span>
+                    <span class="activity-unknown">Keine Tokenangabe</span>
                   {% endif %}
                 </td>
               </tr>
@@ -85,8 +87,8 @@
   {% else %}
     <div class="empty-state">
       <span class="empty-state-mark" aria-hidden="true">·</span>
-      <h3>Keine Proxy-Aktivität im ausgewählten Zeitraum</h3>
-      <p>In diesem Zeitraum hat der Mandant noch keine Chat-Anfragen über den Proxy gesendet.</p>
+      <h3>Keine Anfragen im gewählten Zeitraum</h3>
+      <p>In diesem Zeitraum gab es noch keine Anfragen.</p>
     </div>
   {% endif %}
 </section>

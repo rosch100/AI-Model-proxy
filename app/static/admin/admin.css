@@ -729,6 +729,17 @@ code {
   letter-spacing: 0;
 }
 
+.activity-summary .activity-summary-tokens {
+  margin-top: 0.25rem;
+  font-size: 1.15rem;
+}
+
+.activity-summary .activity-summary-coverage {
+  margin: 0.4rem 0 0;
+  color: var(--muted);
+  font-size: 0.8rem;
+}
+
 .activity-request-list {
   overflow: hidden;
   border: 1px solid var(--line);

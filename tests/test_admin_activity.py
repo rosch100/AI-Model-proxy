@@ -89,16 +89,22 @@ def test_activity_board_shows_average_tokens_per_request_and_last_query():
     assert board.total_requests_in_window == 3
     assert board.total_requests_with_usage_in_window == 2
     assert board.total_tokens_per_request_label == "8.250"
+    assert board.window_summaries[0].minutes == 15
+    assert board.window_summaries[0].total_requests == 3
+    assert board.window_summaries[0].total_tokens_label == "16.500"
+    assert board.window_summaries[1].minutes == 60
+    assert board.window_summaries[1].total_requests == 3
+    assert board.window_summaries[1].total_tokens_label == "16.500"
     assert [row.requested_model for row in board.requests] == [
-        "gpt-5",
-        "openrouter/free",
         "cursor-acme-model",
+        "openrouter/free",
+        "gpt-5",
     ]
-    assert board.requests[-1].total_tokens_label == "15.000"
-    assert board.requests[-1].input_tokens_label == "14.000"
-    assert board.requests[-1].output_tokens_label == "1.000"
-    assert board.requests[-1].provider_label == "Azure"
-    assert board.requests[-1].time_label == "2026-10-03T16:19:00+00:00"
+    assert board.requests[0].total_tokens_label == "15.000"
+    assert board.requests[0].input_tokens_label == "14.000"
+    assert board.requests[0].output_tokens_label == "1.000"
+    assert board.requests[0].provider_label == "Azure"
+    assert board.requests[0].time_label == "2026-10-03T16:19:00+00:00"
     assert board.requests[1].total_tokens_label is None
     azure = board.providers[0]
     assert azure.label == "Azure"
@@ -111,7 +117,7 @@ def test_activity_board_shows_average_tokens_per_request_and_last_query():
     assert openai.rows[0].model == "gpt-5"
     assert openai.rows[0].tokens_per_request_label == "1.500"
     assert openai.rows[0].bar_percent == 10
-    assert openai.rows[0].last_request_label == "vor 5 min"
+    assert openai.rows[0].last_request_label == "vor 5 Minuten"
     openrouter = board.providers[2]
     assert openrouter.rows[0].requests_in_window == 1
     assert openrouter.rows[0].requests_with_usage_in_window == 0
@@ -120,11 +126,45 @@ def test_activity_board_shows_average_tokens_per_request_and_last_query():
     assert openrouter.rows[0].recency == "recent"
 
 
+def test_activity_board_summarizes_requests_and_reported_tokens_per_window():
+    """Fixed activity windows include counts and only reported token totals."""
+    now = datetime(2026, 10, 3, 16, 20, tzinfo=timezone.utc)
+    events = tuple(
+        InferenceActivityEvent(
+            tenant_id="acme",
+            provider="azure",
+            inbound_model="gpt-6-luna",
+            routed_model="gpt-6-luna",
+            total_tokens=total_tokens,
+            occurred_at=now - timedelta(minutes=minutes_ago),
+        )
+        for minutes_ago, total_tokens in (
+            (8, 100),
+            (14, None),
+            (45, 200),
+            (60, 300),
+            (61, 400),
+        )
+    )
+
+    board = activity_board(events, custom_model_id="cursor-acme-model", now=now)
+
+    short_window, long_window = board.window_summaries
+    assert short_window.label == "Letzte 15 Minuten"
+    assert short_window.total_requests == 2
+    assert short_window.total_requests_with_usage == 1
+    assert short_window.total_tokens_label == "100"
+    assert long_window.label == "Letzte Stunde"
+    assert long_window.total_requests == 4
+    assert long_window.total_requests_with_usage == 3
+    assert long_window.total_tokens_label == "600"
+
+
 def test_relative_time_is_timezone_neutral_for_older_activity():
     """Older live timestamps use relative labels, not a UTC clock rendering."""
     now = datetime(2026, 10, 3, 16, 20, tzinfo=timezone.utc)
 
-    assert format_relative_time(now - timedelta(hours=2), now) == "vor 2 Std."
+    assert format_relative_time(now - timedelta(hours=2), now) == "vor 2 Stunden"
 
 
 def test_activity_board_filters_request_list_by_selected_period():
@@ -147,8 +187,8 @@ def test_activity_board_filters_request_list_by_selected_period():
     )
 
     assert [row.occurred_at for row in board.requests] == [
-        now - timedelta(minutes=30),
         now - timedelta(minutes=5),
+        now - timedelta(minutes=30),
     ]
 
 
@@ -174,16 +214,21 @@ def test_activity_board_limits_request_list_to_most_recent_entries():
     board = activity_board(events, custom_model_id="cursor-acme-model", now=now)
 
     assert len(board.requests) == 50
-    assert board.requests[0].occurred_at == now - timedelta(minutes=49)
-    assert board.requests[-1].occurred_at == now
+    assert board.requests[0].occurred_at == now
+    assert board.requests[-1].occurred_at == now - timedelta(minutes=49)
 
 
 def test_dashboard_renders_activity_empty_state(admin_app):
-    """An idle tenant still sees the live activity section."""
+    """An idle tenant still sees the current requests section."""
     body = _authenticated_client(admin_app).get("/admin/").get_data(as_text=True)
 
-    assert "Aktuelle Aktivität" in body
-    assert "Keine Proxy-Aktivität im ausgewählten Zeitraum" in body
+    assert "Aktuelle Anfragen" in body
+    assert "Keine Anfragen im gewählten Zeitraum" in body
+    assert "In diesem Zeitraum gab es noch keine Anfragen." in body
+    assert "Letzte 15 Minuten" in body
+    assert "Letzte Stunde" in body
+    assert "Für 0 von 0 Anfragen liegen Tokenangaben vor" in body
+    assert "Tokens insgesamt" in body
 
 
 def test_dashboard_rejects_unsupported_activity_period(admin_app):
@@ -235,7 +280,7 @@ def test_dashboard_activity_range_includes_older_events(admin_app):
 
 
 def test_dashboard_renders_provider_model_activity(admin_app):
-    """The overview shows throughput and recency from recorded inferences."""
+    """The page shows understandable request, provider, and cost information."""
     database = admin_app.extensions["database"]
     now = datetime.now(timezone.utc)
     with database.sessions.begin() as session:
@@ -259,18 +304,22 @@ def test_dashboard_renders_provider_model_activity(admin_app):
     fragment = client.get("/admin/activity").get_data(as_text=True)
 
     assert "gpt-6-luna" in body
-    assert "Tokens / Anfrage" in body
-    assert "Zeit (lokal)" in body
-    assert "Zeitraum der Liste" in body
+    assert "Tokens pro Anfrage" in body
+    assert "Uhrzeiten werden in deiner Zeitzone angezeigt" in body
+    assert "Anfragen anzeigen für" in body
     assert "Letzte 7 Tage" in body
     assert "data-local-time" in body
-    assert body.index("Live-Verbindungen") < body.index("Kostenübersicht nach Konto")
-    assert body.index("Kostenübersicht nach Konto") < body.index("Aktuelle Aktivität")
+    assert body.index("Anbieterstatus") < body.index("Kosten pro Konto")
+    assert body.index("Kosten pro Konto") < body.index("Aktuelle Anfragen")
     assert "15.000" in body
-    assert "Eingabe 14.000 · Ausgabe 1.000" in body
+    assert "Eingabe: 14.000 · Ausgabe: 1.000" in body
+    assert "Letzte 15 Minuten" in body
+    assert "Letzte Stunde" in body
+    assert "Tokens insgesamt" in body
+    assert "Neueste Anfragen zuerst" in body
     assert "Azure" in body
-    assert "Live-Verbindungen" in body
-    assert body.index("Live-Verbindungen") < body.index("Aktuelle Aktivität")
+    assert "Anbieterstatus" in body
+    assert body.index("Anbieterstatus") < body.index("Aktuelle Anfragen")
     assert "zuletzt" in body
     assert 'id="dashboard-activity"' in fragment
     assert "gpt-6-luna" in fragment

@@ -225,7 +225,7 @@ def test_azure_scope_canonicalizers_reject_invalid_resource_names(
     scope_id, canonicalizer
 ):
     """Canonical Azure IDs reject resource names outside ARM naming rules."""
-    with pytest.raises(click.ClickException, match="name is invalid"):
+    with pytest.raises(click.ClickException, match="ungültig"):
         canonicalizer(scope_id)
 
 

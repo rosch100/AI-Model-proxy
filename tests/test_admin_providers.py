@@ -202,12 +202,12 @@ def test_openrouter_account_key_survives_save_and_catalog_refresh(
     page = client.get("/admin/settings/connection")
     page_body = page.get_data(as_text=True)
     assert "openai/gpt-4o" in page_body
-    assert "Schlüssel gespeichert" in page_body
+    assert "Konto gespeichert. Es ist noch nicht für Anfragen aktiviert." in page_body
     assert key not in page_body
 
     edit_page = client.get(f"/admin/settings/connection/{profile_id}/edit")
     edit_body = edit_page.get_data(as_text=True)
-    assert "leer lassen oder unverändert lassen" in edit_body
+    assert "leer lassen, um ihn beizubehalten" in edit_body
     assert 'name="api_key"' in edit_body
     assert 'value="••••••••"' in edit_body
     assert key not in edit_body
@@ -218,7 +218,7 @@ def test_openrouter_account_key_survives_save_and_catalog_refresh(
     )
     assert activated.status_code == 302
     active_page = client.get("/admin/settings/connection")
-    assert "Aktiver Account: <strong>OpenRouter · Production</strong>" in (
+    assert "Derzeit ausgewählt: <strong>OpenRouter · Production</strong>" in (
         active_page.get_data(as_text=True)
     )
 
@@ -388,7 +388,7 @@ def test_provider_profile_form_requires_azure_base_url_but_not_for_openrouter(
         )
         azure_form.provider.choices = [("azure", "Azure")]
         assert not azure_form.validate()
-        assert "Azure Base-URL ist erforderlich." in azure_form.errors["base_url"]
+        assert "Die Azure-Adresse fehlt." in azure_form.errors["base_url"]
 
         openrouter_form = ProviderProfileForm(
             data={
@@ -483,8 +483,8 @@ def test_connection_page_lists_every_same_provider_account(admin_app):
     page = response.get_data(as_text=True)
     assert page.count("<h3>Production</h3>") == 1
     assert page.count("<h3>Staging</h3>") == 1
-    assert "Dieser Account kann nicht entfernt werden" in page
-    assert page.count(">Account entfernen</button>") == 1
+    assert "Dieses Konto kann nicht entfernt werden" in page
+    assert page.count(">Konto entfernen</button>") == 1
     database.engine.dispose()
 
 
@@ -657,7 +657,7 @@ def test_azure_profile_updates_validate_url_and_keep_model_deployments():
         replace_catalog_entries(
             session, profile, [("gpt-6-astra", "deployment-a")], None
         )
-        with pytest.raises(ValueError, match="HTTPS-Adresse"):
+        with pytest.raises(ValueError, match="HTTPS beginnen"):
             create_provider_profile(
                 session,
                 database.secret_cipher,
@@ -691,7 +691,7 @@ def test_azure_profile_updates_validate_url_and_keep_model_deployments():
                 )
             )
         )
-        with pytest.raises(ValueError, match="HTTPS-Adresse"):
+        with pytest.raises(ValueError, match="HTTPS beginnen"):
             update_provider_profile(
                 session,
                 database.secret_cipher,

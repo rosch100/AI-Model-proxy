@@ -45,8 +45,10 @@ class PasswordChangeForm(FlaskForm):
 class AzureConnectionForm(FlaskForm):
     """Azure inference connection settings for one tenant profile."""
 
-    base_url = StringField("Azure Base-URL *", validators=[DataRequired()])
-    api_key = RevealablePasswordField("Azure API-Schlüssel", validators=[Optional()])
+    base_url = StringField("Azure-Adresse *", validators=[DataRequired()])
+    api_key = RevealablePasswordField(
+        "API-Schlüssel für Anfragen", validators=[Optional()]
+    )
     default_model = SelectField(
         "Standardmodell *",
         validators=[DataRequired(message="Standardmodell ist erforderlich.")],
@@ -59,7 +61,9 @@ class AzureConnectionForm(FlaskForm):
 class OpenAIConnectionForm(FlaskForm):
     """OpenAI inference connection settings for one tenant profile."""
 
-    api_key = RevealablePasswordField("OpenAI API-Schlüssel", validators=[Optional()])
+    api_key = RevealablePasswordField(
+        "API-Schlüssel für Anfragen", validators=[Optional()]
+    )
     default_model = SelectField(
         "Standardmodell *",
         validators=[DataRequired(message="Standardmodell ist erforderlich.")],
@@ -75,7 +79,7 @@ class OpenRouterConnectionForm(FlaskForm):
     """OpenRouter inference connection settings for one tenant profile."""
 
     api_key = RevealablePasswordField(
-        "OpenRouter API-Schlüssel", validators=[Optional()]
+        "API-Schlüssel für Anfragen", validators=[Optional()]
     )
     default_model = SelectField(
         "Standardmodell *",
@@ -99,17 +103,19 @@ class ProviderProfileForm(FlaskForm):
         validators=[DataRequired()],
     )
     display_name = StringField(
-        "Account-Name *", validators=[DataRequired(), Length(max=128)]
+        "Name des Kontos *", validators=[DataRequired(), Length(max=128)]
     )
-    base_url = StringField("Azure Base-URL *")
+    base_url = StringField("Azure-Adresse *")
     default_model = SelectField(
         "Standardmodell",
         validators=[Optional(), Length(max=256)],
-        choices=[("", "Nach dem Katalogabruf auswählen")],
+        choices=[("", "Nach dem Abruf der Modellliste auswählen")],
         validate_choice=True,
         render_kw={"size": 8},
     )
-    api_key = RevealablePasswordField("Inference-Schlüssel", validators=[Optional()])
+    api_key = RevealablePasswordField(
+        "API-Schlüssel für Anfragen", validators=[Optional()]
+    )
     organization = StringField("Organisation (optional)", validators=[Optional()])
     project = StringField("Projekt (optional)", validators=[Optional()])
 
@@ -153,7 +159,7 @@ class BillingCredentialsForm(FlaskForm):
 
     profile_id = StringField(validators=[DataRequired(), Length(max=36)])
     billing_secret = RevealablePasswordField(
-        "Billing-Schlüssel *", validators=[Optional()]
+        "Schlüssel für die Abrechnung *", validators=[Optional()]
     )
 
 
@@ -162,18 +168,16 @@ class OpenAIScopeForm(FlaskForm):
 
     profile_id = StringField(validators=[DataRequired(), Length(max=36)])
     organization_id = StringField(
-        "OpenAI Organization-ID *",
+        "OpenAI-Organisationskennung *",
         validators=[DataRequired(), Length(max=128), Regexp(r"^org-[A-Za-z0-9_-]+$")],
     )
     project_id = StringField(
-        "OpenAI Project-ID *",
+        "OpenAI-Projektkennung *",
         validators=[DataRequired(), Length(max=128), Regexp(r"^proj_[A-Za-z0-9_-]+$")],
     )
     exclusive_scope_confirmation = BooleanField(
-        "Organisation und Projekt sind ausschließlich diesem Tenant zugeordnet.",
-        validators=[
-            DataRequired(message="Die exklusive Scope-Zuordnung muss bestätigt werden.")
-        ],
+        "Organisation und Projekt sind ausschließlich diesem Konto zugeordnet.",
+        validators=[DataRequired(message="Bestätige die Zuordnung dieser Ressource.")],
     )
 
 
@@ -182,7 +186,7 @@ class OpenAIProjectLookupForm(FlaskForm):
 
     profile_id = StringField(validators=[DataRequired(), Length(max=36)])
     organization_id = StringField(
-        "OpenAI Organization-ID *",
+        "OpenAI-Organisationskennung *",
         validators=[DataRequired(), Length(max=128), Regexp(r"^org-[A-Za-z0-9_-]+$")],
     )
 
@@ -192,13 +196,11 @@ class OpenRouterScopeForm(FlaskForm):
 
     profile_id = StringField(validators=[DataRequired(), Length(max=36)])
     workspace_id = StringField(
-        "OpenRouter Workspace-ID *", validators=[DataRequired(), Length(max=36)]
+        "OpenRouter-Workspace-Kennung *", validators=[DataRequired(), Length(max=36)]
     )
     exclusive_scope_confirmation = BooleanField(
-        "Der Workspace ist ausschließlich diesem Tenant zugeordnet.",
-        validators=[
-            DataRequired(message="Die exklusive Scope-Zuordnung muss bestätigt werden.")
-        ],
+        "Der Workspace ist ausschließlich diesem Konto zugeordnet.",
+        validators=[DataRequired(message="Bestätige die Zuordnung dieser Ressource.")],
     )
 
 
@@ -207,18 +209,24 @@ class AzureScopeForm(FlaskForm):
 
     profile_id = StringField(validators=[DataRequired(), Length(max=36)])
     subscription_id = StringField(
-        "Azure Subscription-ID *", validators=[DataRequired(), Length(max=36)]
+        "Azure-Abonnementkennung *", validators=[DataRequired(), Length(max=36)]
     )
     resource_group_arm_id = StringField(
-        "Resource Group ARM-ID *", validators=[DataRequired(), Length(max=1024)]
+        "Kennung der Ressourcengruppe (für Kosten) *",
+        validators=[DataRequired(), Length(max=1024)],
     )
     cognitive_resource_arm_id = StringField(
-        "Cognitive-Services-Ressource ARM-ID *",
+        "Kennung des Cognitive-Services-Kontos (für Verbrauchsdaten) *",
         validators=[DataRequired(), Length(max=1024)],
     )
     exclusive_scope_confirmation = BooleanField(
-        "Ich bestätige, dass beide Azure-Scopes ausschließlich diesem Tenant zugeordnet sind.",
+        "Ich bestätige, dass beide Azure-Ressourcen nur diesem Konto zugeordnet sind.",
         validators=[
-            DataRequired(message="Die exklusive Scope-Zuordnung muss bestätigt werden.")
+            DataRequired(
+                message=(
+                    "Bestätige, dass beide Azure-Ressourcen nur diesem Konto "
+                    "zugeordnet sind."
+                )
+            )
         ],
     )

@@ -108,12 +108,24 @@ class ActivityRequestRow:
 
 
 @dataclass(frozen=True)
+class ActivityWindowSummary:
+    """Request and reported-token totals for one rolling time window."""
+
+    minutes: int
+    label: str
+    total_requests: int
+    total_requests_with_usage: int
+    total_tokens_label: str | None
+
+
+@dataclass(frozen=True)
 class ActivityBoard:
     """Recent proxy requests and aggregate status for the overview."""
 
     window_minutes: int
     generated_at: datetime
     requests: tuple[ActivityRequestRow, ...]
+    window_summaries: tuple[ActivityWindowSummary, ...]
     total_tokens_per_request: float | None
     total_tokens_per_request_label: str | None
     total_requests_in_window: int
@@ -185,20 +197,23 @@ class CostsView:
 
 _PROVIDER_LABELS = {"azure": "Azure", "openai": "OpenAI", "openrouter": "OpenRouter"}
 _ACTIVITY_REQUEST_LIST_LIMIT = 50
-_COST_METRIC_LABELS = {"cost": "Providerkosten", "byok_inference_cost": "BYOK-Kosten"}
+_COST_METRIC_LABELS = {
+    "cost": "Anbieterkosten",
+    "byok_inference_cost": "Kosten über den eigenen API-Schlüssel",
+}
 _USAGE_METRIC_LABELS = {
-    "input_tokens": "Eingabe-Tokens",
-    "output_tokens": "Ausgabe-Tokens",
-    "prompt_tokens": "Prompt-Tokens",
-    "completion_tokens": "Completion-Tokens",
-    "reasoning_tokens": "Reasoning-Tokens",
+    "input_tokens": "Eingabe-Token",
+    "output_tokens": "Ausgabe-Token",
+    "prompt_tokens": "Eingabe-Token",
+    "completion_tokens": "Ausgabe-Token",
+    "reasoning_tokens": "Token für Schlussfolgerungen",
 }
 _REFRESH_STATUS_LABELS = {
-    "running": "Aktualisierung läuft",
-    "retry_wait": "Wiederholung geplant",
-    "success": "Erfolgreich",
+    "running": "Abruf läuft",
+    "retry_wait": "Neuer Versuch ausstehend",
+    "success": "Abruf erfolgreich",
     "unavailable": "Nicht verfügbar",
-    "failed": "Fehlgeschlagen",
+    "failed": "Abruf fehlgeschlagen",
 }
 
 
@@ -240,14 +255,14 @@ def _summarize_records(
 
 
 def provider_state(profile: ProviderProfile | None) -> str:
-    """Return the German dashboard label for one provider profile."""
+    """Return a clear setup status for one provider profile."""
     if profile is None:
-        return "Nicht konfiguriert"
+        return "Nicht eingerichtet"
     if not profile.inference_secret_ciphertext or not profile.default_model:
-        return "Prüfung erforderlich"
+        return "Einrichtung prüfen"
     if profile.catalog_error:
-        return "Prüfung erforderlich"
-    return "Gespeichert"
+        return "Einrichtung prüfen"
+    return "Eingerichtet"
 
 
 def _latest_jobs_by_binding(
@@ -445,11 +460,17 @@ def format_relative_time(moment: datetime, now: datetime) -> str:
     if elapsed < 10:
         return "gerade eben"
     if elapsed < 60:
-        return f"vor {int(elapsed)} s"
+        seconds = int(elapsed)
+        unit = "Sekunde" if seconds == 1 else "Sekunden"
+        return f"vor {seconds} {unit}"
     if elapsed < 3600:
-        return f"vor {int(elapsed // 60)} min"
+        minutes = int(elapsed // 60)
+        unit = "Minute" if minutes == 1 else "Minuten"
+        return f"vor {minutes} {unit}"
     if elapsed < 86400:
-        return f"vor {int(elapsed // 3600)} Std."
+        hours = int(elapsed // 3600)
+        unit = "Stunde" if hours == 1 else "Stunden"
+        return f"vor {hours} {unit}"
     days = int(elapsed // 86400)
     return f"vor {days} Tag" if days == 1 else f"vor {days} Tagen"
 
@@ -462,6 +483,13 @@ class _ActivityAccumulator:
     window_tokens: int = 0
     window_requests: int = 0
     window_with_usage: int = 0
+
+
+@dataclass
+class _ActivityWindowAccumulator:
+    requests: int = 0
+    requests_with_usage: int = 0
+    total_tokens: int = 0
 
 
 def _display_model(
@@ -525,6 +553,7 @@ def activity_board(
     if clock.tzinfo is None:
         raise ValueError("Activity board clock must be timezone-aware")
     window_start = clock - timedelta(minutes=window_minutes)
+    hour_start = clock - timedelta(hours=1)
     lookback_start = clock - timedelta(hours=lookback_hours)
     request_start = clock - timedelta(hours=request_period_hours)
     list_events = request_events if request_events is not None else events
@@ -535,13 +564,34 @@ def activity_board(
             if _aware_utc(event.occurred_at) >= request_start
         ),
         key=lambda row: row.occurred_at,
-    )[-_ACTIVITY_REQUEST_LIST_LIMIT:]
+        reverse=True,
+    )[:_ACTIVITY_REQUEST_LIST_LIMIT]
+    summary_windows = (
+        (
+            ACTIVITY_WINDOW_MINUTES,
+            f"Letzte {ACTIVITY_WINDOW_MINUTES} Minuten",
+            clock - timedelta(minutes=ACTIVITY_WINDOW_MINUTES),
+        ),
+        (60, "Letzte Stunde", hour_start),
+    )
+    summary_accumulators = {
+        minutes: _ActivityWindowAccumulator()
+        for minutes, _label, _start in summary_windows
+    }
     buckets: dict[tuple[str, str], _ActivityAccumulator] = {}
     total_tokens = 0
     total_requests = 0
     total_requests_with_usage = 0
     for event in events:
         occurred_at = _aware_utc(event.occurred_at)
+        if occurred_at <= clock and occurred_at >= hour_start:
+            for minutes, _label, summary_start in summary_windows:
+                if occurred_at >= summary_start:
+                    summary = summary_accumulators[minutes]
+                    summary.requests += 1
+                    if event.total_tokens is not None:
+                        summary.requests_with_usage += 1
+                        summary.total_tokens += event.total_tokens
         if occurred_at < lookback_start:
             continue
         display = _display_model(
@@ -571,6 +621,20 @@ def activity_board(
         total_tokens += event.total_tokens
         total_requests_with_usage += 1
 
+    window_summaries = tuple(
+        ActivityWindowSummary(
+            minutes=minutes,
+            label=label,
+            total_requests=summary_accumulators[minutes].requests,
+            total_requests_with_usage=summary_accumulators[minutes].requests_with_usage,
+            total_tokens_label=(
+                format_token_count(summary_accumulators[minutes].total_tokens)
+                if summary_accumulators[minutes].requests_with_usage
+                else None
+            ),
+        )
+        for minutes, label, _summary_start in summary_windows
+    )
     prepared: list[tuple[str, str, _ActivityAccumulator, float | None]] = []
     scale = 0.0
     for (provider, model), bucket in buckets.items():
@@ -582,8 +646,6 @@ def activity_board(
         weight = tokens_per_request or 0.0
         scale = max(scale, weight)
         prepared.append((provider, model, bucket, tokens_per_request))
-
-    request_rows.sort(key=lambda row: row.occurred_at)
 
     grouped: dict[str, list[ModelActivityRow]] = {
         name: [] for name in ("azure", "openai", "openrouter")
@@ -644,6 +706,7 @@ def activity_board(
         window_minutes=window_minutes,
         generated_at=clock,
         requests=tuple(request_rows),
+        window_summaries=tuple(window_summaries),
         total_tokens_per_request=total_tokens_per_request,
         total_tokens_per_request_label=(
             None

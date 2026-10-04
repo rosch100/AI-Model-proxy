@@ -114,7 +114,7 @@ def test_enrollment_only_blocks_dashboard(admin_app):
     assert redirected.headers["Location"].endswith("/admin/passkeys/enroll")
     enroll = client.get("/admin/passkeys/enroll")
     assert enroll.status_code == 200
-    assert "Passkey erforderlich" in enroll.get_data(as_text=True)
+    assert "Passkey einrichten" in enroll.get_data(as_text=True)
 
 
 def test_full_session_without_passkeys_is_forced_to_enroll(admin_app):
@@ -241,7 +241,7 @@ def test_additional_passkey_redirects_to_account(admin_app, monkeypatch):
     account_page = client.get("/admin/account")
     assert account_page.status_code == 200
     html = account_page.get_data(as_text=True)
-    assert "Mehrere Passkeys sind erlaubt" in html
+    assert "Du kannst mehrere Passkeys verwenden" in html
     marker = 'name="csrf-token" content="'
     start = html.index(marker) + len(marker)
     csrf = html[start : html.index('"', start)]

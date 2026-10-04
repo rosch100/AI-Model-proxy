@@ -1,43 +1,57 @@
 {% extends "admin/base.html" %}
 {% set current_user_nav = true %}
-{% block title %}{% if profile %}Account bearbeiten{% else %}Neuer Account{% endif %} · Altanis Proxy{% endblock %}
+{% block title %}{% if profile %}Konto bearbeiten{% else %}Konto hinzufügen{% endif %} · Altanis Proxy{% endblock %}
 {% block content %}
 <section>
-  <h1>{% if profile %}Account bearbeiten{% else %}Neuer Account{% endif %}</h1>
+  <h1>{% if profile %}Konto bearbeiten{% else %}Konto hinzufügen{% endif %}</h1>
   <form method="post" action="{% if profile %}{{ url_for('admin.update_connection', profile_id=profile.id) }}{% else %}{{ url_for('admin.create_connection') }}{% endif %}" class="stack">
     {{ form.csrf_token }}
     <label>{{ form.provider.label }}{{ form.provider(disabled=profile is not none, **{"data-provider-switch": ""}) }}</label>
     {% if profile %}<input type="hidden" name="provider" value="{{ profile.provider }}" />{% endif %}
     <label>{{ form.display_name.label }}{{ form.display_name(required=true, maxlength=128) }}</label>
+    <p class="hint">Gib dem Konto einen Namen, an dem du es leicht wiedererkennst, zum Beispiel „Produktion“. Dieser Name ist nur hier sichtbar.</p>
     {% if not profile %}
-      <p class="hint">Der Anbieter bestimmt die darunter angezeigten Konfigurationsfelder. Das Profil wird zunächst inaktiv gespeichert.</p>
+      <p class="hint">Je nach Anbieter werden unterschiedliche Angaben benötigt. Das neue Konto wird zunächst gespeichert, aber noch nicht für Anfragen verwendet.</p>
     {% endif %}
     {% if not profile or profile.provider == "azure" %}
       <div data-provider-fields="azure"{% if not profile and form.provider.data != "azure" %} hidden{% endif %}>
         <label>{{ form.base_url.label }}{{ form.base_url(type="url", placeholder="https://resource.openai.azure.com") }}</label>
+        <p class="hint">Öffne im <a href="https://portal.azure.com/#view/HubsExtension/BrowseAll" target="_blank" rel="noopener noreferrer">Azure-Portal</a> deine Cognitive-Services- oder Azure-OpenAI-Ressource. Unter <strong>Keys and Endpoint</strong> findest du die Adresse (<strong>Endpoint</strong>) und den API-Schlüssel (Key 1 oder Key 2). Kopiere die Adresse ohne zusätzlichen Pfad oder URL-Parameter. Teile den Schlüssel nicht in Befehlsausgaben, Tickets oder Protokollen.</p>
       </div>
     {% endif %}
     {% if not profile or profile.provider == "openai" %}
       <div data-provider-fields="openai"{% if not profile and form.provider.data != "openai" %} hidden{% endif %}>
         <label>{{ form.organization.label }}{{ form.organization() }}</label>
         <label>{{ form.project.label }}{{ form.project() }}</label>
+          <p class="hint">Optional: Mit einer Organisations- oder Projektkennung kannst du Anfragen auf eine bestimmte OpenAI-Organisation oder ein Projekt begrenzen. Die Kennungen findest du unter <a href="https://platform.openai.com/settings/organization/general" target="_blank" rel="noopener noreferrer">Organization → General</a> und <a href="https://platform.openai.com/settings/organization/projects" target="_blank" rel="noopener noreferrer">Organization → Projects</a>. Die Angaben für die Abrechnung richtest du getrennt unter <a href="{{ url_for('admin.settings_costs') }}">Kosten</a> ein.</p>
       </div>
     {% endif %}
     {% if not profile or profile.provider == "openrouter" %}
-      <div data-provider-fields="openrouter"{% if not profile and form.provider.data != "openrouter" %} hidden{% endif %}><p class="hint">OpenRouter verwendet die Standard-API-Adresse.</p></div>
+      <div data-provider-fields="openrouter"{% if not profile and form.provider.data != "openrouter" %} hidden{% endif %}>
+        <p class="hint">OpenRouter verwendet automatisch die richtige API-Adresse. Verwende für Anfragen einen normalen Schlüssel aus <a href="https://openrouter.ai/settings/keys" target="_blank" rel="noopener noreferrer">Settings → API Keys</a>, keinen Verwaltungsschlüssel. Die verfügbaren Modelle findest du im <a href="https://openrouter.ai/models" target="_blank" rel="noopener noreferrer">OpenRouter-Modellkatalog</a>.</p>
+      </div>
     {% endif %}
     {% if not profile %}
-      <p class="hint">Nach dem Anlegen können Sie den Anbieter-Katalog laden. Das erste verfügbare Modell wird automatisch als Standardmodell gesetzt; anschließend kann es hier geändert werden.</p>
+        <p class="hint">Speichere zuerst das Konto. Lade danach unter „Anbieter und Konten“ die Modellliste und wähle hier dein Standardmodell aus. Bei Azure werden die bereitgestellten Modelle und Bereitstellungen angezeigt.</p>
     {% elif form.default_model.choices|length <= 1 %}
-      <p class="hint">Für dieses Konto ist noch kein Katalogmodell verfügbar. Laden Sie zuerst den Katalog auf der Verbindungsseite.</p>
+      <p class="hint">Für dieses Konto ist noch keine Modellliste verfügbar. Lade sie zuerst unter „Anbieter und Konten“.</p>
     {% endif %}
     <label>{{ form.default_model.label }}{{ form.default_model(aria_describedby="default-model-hint") }}</label>
-    {% if profile %}<p id="default-model-hint" class="hint">Auswahl aus dem Katalog dieses Accounts. Die Scrollbox zeigt mehrere Modelle gleichzeitig.</p>{% endif %}
-    <label>{{ form.api_key.label }}{% if profile and profile.inference_secret_ciphertext %} (maskiert; leer lassen oder unverändert lassen, um den Schlüssel beizubehalten){% endif %}{{ form.api_key(autocomplete="new-password") }}</label>
+    {% if profile %}<p id="default-model-hint" class="hint">Wähle ein Modell aus der Liste. Bei Azure muss dafür eine passende Bereitstellung eingerichtet sein. Diese findest du unter <a href="https://ai.azure.com/" target="_blank" rel="noopener noreferrer">Azure AI Foundry → Deployments</a>.</p>{% endif %}
+    <label>{{ form.api_key.label }}{% if profile and profile.inference_secret_ciphertext %} (bereits gespeichert; leer lassen, um ihn beizubehalten){% endif %}{{ form.api_key(autocomplete="new-password") }}</label>
     {% if profile and profile.inference_secret_ciphertext %}
-      <p class="hint">Der gespeicherte Schlüssel wird maskiert angezeigt. Einen neuen Schlüssel hier eingeben, um ihn zu ersetzen.</p>
+      <p class="hint">Der gespeicherte Schlüssel wird aus Sicherheitsgründen nicht angezeigt. Gib einen neuen Schlüssel ein, wenn du ihn ersetzen möchtest.</p>
     {% endif %}
-    <button type="submit">{% if profile %}Änderungen speichern{% else %}Account speichern{% endif %}</button>
+    {% if not profile or profile.provider == "azure" %}
+      <p class="hint" data-provider-fields="azure"{% if not profile and form.provider.data != "azure" %} hidden{% endif %}>Verwende Key 1 oder Key 2 der ausgewählten Ressource unter <strong>Keys and Endpoint</strong> im <a href="https://portal.azure.com/#view/HubsExtension/BrowseAll" target="_blank" rel="noopener noreferrer">Azure-Portal</a>. Dieser Schlüssel ist für Anfragen gedacht, nicht für die Abrechnung.</p>
+    {% endif %}
+    {% if not profile or profile.provider == "openai" %}
+      <p class="hint" data-provider-fields="openai"{% if not profile and form.provider.data != "openai" %} hidden{% endif %}>Erstelle unter <a href="https://platform.openai.com/api-keys" target="_blank" rel="noopener noreferrer">API keys</a> einen Schlüssel für Anfragen. Ein Projektschlüssel ist geeignet. Verwende nicht den Abrechnungsschlüssel mit dem Präfix <code>sk-admin-…</code>.</p>
+    {% endif %}
+    {% if not profile or profile.provider == "openrouter" %}
+      <p class="hint" data-provider-fields="openrouter"{% if not profile and form.provider.data != "openrouter" %} hidden{% endif %}>Erstelle unter <a href="https://openrouter.ai/settings/keys" target="_blank" rel="noopener noreferrer">Settings → API Keys</a> einen Schlüssel für Anfragen. Verwende dafür nicht den Verwaltungsschlüssel für die Abrechnung.</p>
+    {% endif %}
+    <button type="submit">{% if profile %}Änderungen speichern{% else %}Konto speichern{% endif %}</button>
     <a href="{{ url_for('admin.settings_connection') }}">Abbrechen</a>
   </form>
   {% if form.errors %}

@@ -15,17 +15,33 @@ def canonical_resource_group_id(scope_id: str) -> str:
     """Validate and normalize an Azure Resource Group ARM ID."""
     parts = scope_id.strip("/").split("/")
     if (
+        len(parts) == 8
+        and parts[0].casefold() == "subscriptions"
+        and parts[2].casefold() == "resourcegroups"
+        and parts[4].casefold() == "providers"
+        and parts[5].casefold() == "microsoft.cognitiveservices"
+        and parts[6].casefold() == "accounts"
+    ):
+        raise ValueError(
+            "Diese Kennung gehört zu einem Cognitive-Services-Konto. Trage sie in "
+            "das Feld für Verbrauchsdaten ein. Im Feld für Kosten wird die Kennung "
+            "der übergeordneten Ressourcengruppe benötigt; sie endet auf "
+            "'/resourceGroups/<Gruppenname>'."
+        )
+    if (
         len(parts) != 4
         or parts[0].casefold() != "subscriptions"
         or parts[2].casefold() != "resourcegroups"
         or any(not part for part in parts)
     ):
-        raise ValueError("Azure billing scope must be a Resource Group ARM ID.")
+        raise ValueError(
+            "Die Kennung für Kosten muss zu einer Azure-Ressourcengruppe gehören."
+        )
     subscription_id = _subscription_id(parts[1])
     _reject_url_components(scope_id)
     resource_group = parts[3]
     if not _is_valid_resource_name(resource_group, max_length=90):
-        raise ValueError("Azure Resource Group name is invalid.")
+        raise ValueError("Der Name der Azure-Ressourcengruppe ist ungültig.")
     return f"/subscriptions/{subscription_id}/resourcegroups/{resource_group.lower()}"
 
 
@@ -42,10 +58,14 @@ def canonical_cost_scopes(
     if not resource_group.startswith(
         expected_prefix
     ) or not cognitive_resource.startswith(expected_prefix):
-        raise ValueError("Azure ARM scopes must belong to the entered subscription.")
+        raise ValueError(
+            "Beide Azure-Ressourcen müssen zur angegebenen Subscription gehören."
+        )
     parent_prefix = resource_group + "/providers/microsoft.cognitiveservices/accounts/"
     if not cognitive_resource.startswith(parent_prefix):
-        raise ValueError("Azure usage scope must belong to the bound Resource Group.")
+        raise ValueError(
+            "Das Cognitive-Services-Konto muss zu dieser Ressourcengruppe gehören."
+        )
     return resource_group, cognitive_resource
 
 
@@ -62,16 +82,16 @@ def canonical_cognitive_resource_id(scope_id: str) -> str:
         or any(not part for part in parts)
     ):
         raise ValueError(
-            "Azure usage scope must be a Cognitive Services account ARM ID."
+            "Die Kennung für Verbrauchsdaten muss zu einem Cognitive-Services-Konto gehören."
         )
     subscription_id = _subscription_id(parts[1])
     _reject_url_components(scope_id)
     resource_group = parts[3]
     account_name = parts[7]
     if not _is_valid_resource_name(resource_group, max_length=90):
-        raise ValueError("Azure Resource Group name is invalid.")
+        raise ValueError("Der Name der Azure-Ressourcengruppe ist ungültig.")
     if not _is_valid_cognitive_account_name(account_name):
-        raise ValueError("Azure Cognitive Services account name is invalid.")
+        raise ValueError("Der Name des Cognitive-Services-Kontos ist ungültig.")
     return (
         f"/subscriptions/{subscription_id}/resourcegroups/{resource_group.lower()}"
         f"/providers/microsoft.cognitiveservices/accounts/{account_name.casefold()}"
@@ -82,12 +102,14 @@ def _subscription_id(value: str) -> str:
     try:
         return str(UUID(value))
     except ValueError as exc:
-        raise ValueError("Azure scope has an invalid subscription GUID.") from exc
+        raise ValueError("Die Subscription-Kennung ist ungültig.") from exc
 
 
 def _reject_url_components(scope_id: str) -> None:
     if "?" in scope_id or "#" in scope_id or "://" in scope_id:
-        raise ValueError("Azure scope must not contain a URL, query, or fragment.")
+        raise ValueError(
+            "Trage nur die Ressourcenkennung ein, keine Portaladresse oder weiteren URL-Angaben."
+        )
 
 
 def _is_valid_resource_name(name: str, *, max_length: int) -> bool:

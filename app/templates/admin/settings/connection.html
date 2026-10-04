@@ -1,22 +1,22 @@
 {% extends "admin/base.html" %}
 {% set current_user_nav = true %}
-{% block title %}Verbindung · Altanis Proxy{% endblock %}
+{% block title %}Anbieter und Konten · Altanis Proxy{% endblock %}
 {% block content %}
 <section>
   {% set labels = {"azure": "Azure", "openai": "OpenAI", "openrouter": "OpenRouter"} %}
-  <h1>Provider-Accounts</h1>
-  <p class="lede">Mehrere Accounts können gemeinsam eine priorisierte Failover-Reihenfolge bilden. Neue Accounts bleiben inaktiv, bis sie ausdrücklich hinzugefügt werden.</p>
-  <h2>Failover-Reihenfolge</h2>
-  <p>Cursor-Modell-ID: <code>{{ cursor_model_id }}</code> → Standardmodell des jeweiligen Profils.</p>
-  <p>Das erste Profil wird bevorzugt. Bei HTTP 408/429/5xx oder sicherem Verbindungsfehler vor der Antwort wird das nächste versucht. Andere 4xx und Fehler nach Stream-Beginn werden nicht erneut abgesendet.</p>
-  <p class="hint">Das Standardmodell jedes Profils ist dessen Zielmodell für die stabile Cursor-Modell-ID. Unterschiedliche Modelle sind nicht automatisch gleichwertig. Ein Wechsel kann zusätzliche Kosten verursachen; es gibt keine Exactly-once-Garantie.</p>
+  <h1>Anbieter und Konten</h1>
+  <p class="lede">Du kannst mehrere Konten festlegen. Der Proxy nutzt sie in der angezeigten Reihenfolge und versucht bei Verbindungsproblemen oder Überlastung das nächste Konto. Neue Konten sind zunächst deaktiviert.</p>
+  <h2>Bevorzugte Reihenfolge</h2>
+  <p>Cursor verwendet die Modellkennung <code>{{ cursor_model_id }}</code>. Der Proxy leitet Anfragen an das Standardmodell des ausgewählten Kontos weiter.</p>
+  <p>Nur bei vorübergehenden Verbindungsproblemen oder Überlastung versucht der Proxy das nächste Konto. Bei anderen Fehlern oder nach Beginn einer Antwort wird die Anfrage nicht erneut gesendet.</p>
+  <p class="hint">Jedes Konto verwendet sein ausgewähltes Standardmodell. Verschiedene Modelle können unterschiedlich antworten und unterschiedliche Kosten verursachen. Ein erneuter Versuch kann dazu führen, dass eine Anfrage mehrfach berechnet wird.</p>
   {% if view.routed_profiles %}
     <ol class="provider-route">
     {% for profile in view.routed_profiles %}
       <li data-route-profile="{{ profile.id }}">
         <strong>{{ labels[profile.provider] }} · {{ profile.display_name }}</strong>
         · {{ profile.default_model }}
-        {% if loop.first %}<span>Primärprofil</span>{% else %}<span>Fallback {{ loop.index - 1 }}</span>{% endif %}
+        {% if loop.first %}<span>Erste Wahl</span>{% else %}<span>Danach {{ loop.index - 1 }}</span>{% endif %}
         <form method="post" action="{{ url_for('admin.move_connection', profile_id=profile.id) }}">
           <input type="hidden" name="csrf_token" value="{{ csrf_token() }}" />
           <input type="hidden" name="profile_id" value="{{ profile.id }}" />
@@ -33,11 +33,11 @@
     </ol>
   {% endif %}
   {% if view.active_profile_id %}
-    <p>Aktiver Account: <strong>{{ labels.get(view.active_provider, "Unbekannter Anbieter") }} · {{ view.active_profile_name or "Unbekannter Account" }}</strong></p>
+    <p>Derzeit ausgewählt: <strong>{{ labels.get(view.active_provider, "Unbekannter Anbieter") }} · {{ view.active_profile_name or "Unbekanntes Konto" }}</strong></p>
   {% else %}
-    <p class="error-text">Kein Account aktiv. Proxy-Anfragen sind nicht verfügbar.</p>
+    <p class="error-text">Kein Konto ist aktiv. Anfragen über den Proxy sind derzeit nicht möglich.</p>
   {% endif %}
-  <p><a href="{{ url_for('admin.create_connection_form') }}">Neuer Account</a></p>
+  <p><a href="{{ url_for('admin.create_connection_form') }}">Konto hinzufügen</a></p>
 
   {% for provider in ["azure", "openai", "openrouter"] %}
     <h2>{{ labels[provider] }}</h2>
@@ -47,39 +47,39 @@
         <li>
           <h3>{{ profile.display_name }}</h3>
           <p>
-            {% if profile.route_priority is not none %}<strong>Aktiv · Priorität {{ profile.route_priority }}</strong>{% else %}Inaktiv{% endif %}
-            · Modell: {{ profile.default_model or "nicht gesetzt" }}
-            · {% if profile.catalog_error %}Katalogfehler{% elif profile.catalog_refreshed_at %}Katalog aktualisiert{% else %}Katalog noch nicht geladen{% endif %}
-            · {% if profile.inference_secret_ciphertext %}Schlüssel gespeichert{% else %}Schlüssel fehlt{% endif %}
+            {% if profile.route_priority is not none %}<strong>Für Anfragen ausgewählt · Position {{ profile.route_priority }}</strong>{% else %}Nicht ausgewählt{% endif %}
+            · Standardmodell: {{ profile.default_model or "nicht ausgewählt" }}
+            · {% if profile.catalog_error %}Modellliste konnte nicht geladen werden{% elif profile.catalog_refreshed_at %}Modellliste aktualisiert{% else %}Modellliste noch nicht geladen{% endif %}
+            · {% if profile.inference_secret_ciphertext %}Schlüssel für Anfragen gespeichert{% else %}Schlüssel für Anfragen fehlt{% endif %}
           </p>
           <p>
             <a href="{{ url_for('admin.edit_connection_form', profile_id=profile.id) }}">Bearbeiten</a>
             · <a href="{{ url_for('admin.settings_costs') }}">Kosten</a>
           </p>
           {% if profile.id in view.profiles_with_bindings %}
-            <p class="hint">Dieser Account kann nicht entfernt werden, solange Provider-Scopes gebunden sind.</p>
+            <p class="hint">Dieses Konto kann nicht entfernt werden, solange noch Abrechnungsdaten damit verknüpft sind.</p>
           {% else %}
             <form method="post" action="{{ url_for('admin.delete_connection', profile_id=profile.id) }}">
               <input type="hidden" name="csrf_token" value="{{ csrf_token() }}" />
               <input type="hidden" name="profile_id" value="{{ profile.id }}" />
-              <button type="submit">Account entfernen</button>
+              <button type="submit">Konto entfernen</button>
             </form>
           {% endif %}
           <form method="post" action="{{ url_for('admin.refresh_catalog', profile_id=profile.id) }}">
             <input type="hidden" name="csrf_token" value="{{ csrf_token() }}" />
-            <button type="submit">Katalog aktualisieren</button>
+            <button type="submit">Modellliste aktualisieren</button>
           </form>
           {% if profile.route_priority is none %}
             <form method="post" action="{{ url_for('admin.activate_connection', profile_id=profile.id) }}">
               <input type="hidden" name="csrf_token" value="{{ csrf_token() }}" />
               <input type="hidden" name="profile_id" value="{{ profile.id }}" />
-              <button type="submit" {% if not profile.inference_secret_ciphertext or profile.default_model not in view.selectable_model_ids[profile.id] %}disabled{% endif %}>Account aktivieren</button>
+              <button type="submit" {% if not profile.inference_secret_ciphertext or profile.default_model not in view.selectable_model_ids[profile.id] %}disabled{% endif %}>Konto aktivieren</button>
             </form>
           {% endif %}
           {% if profile.catalog_error %}<p class="error-text">{{ profile.catalog_error }}</p>{% endif %}
           {% if view.catalogs[profile.id] %}
             <details>
-              <summary>Modelle im Katalog ({{ view.catalogs[profile.id]|length }})</summary>
+              <summary>Verfügbare Modelle ({{ view.catalogs[profile.id]|length }})</summary>
               <ul class="compact-catalog">
               {% for entry in view.catalogs[profile.id] %}
                 <li><code>{{ entry.model_id }}</code>{% if entry.deployment_id and entry.deployment_id != entry.model_id %} → <code>{{ entry.deployment_id }}</code>{% endif %}</li>
@@ -91,14 +91,14 @@
       {% endfor %}
       </ul>
     {% else %}
-      <p>Keine Accounts konfiguriert.</p>
+      <p>Für {{ labels[provider] }} ist noch kein Konto eingerichtet.</p>
     {% endif %}
   {% endfor %}
 
   {% if view.active_profile_id %}
     <form method="post" action="{{ url_for('admin.deactivate_connection') }}">
       <input type="hidden" name="csrf_token" value="{{ csrf_token() }}" />
-      <button type="submit">Gesamte Failover-Reihenfolge deaktivieren</button>
+      <button type="submit">Alle Konten deaktivieren</button>
     </form>
   {% endif %}
 </section>

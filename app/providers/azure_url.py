@@ -17,7 +17,7 @@ AZURE_HOST_SUFFIXES = (
 def validate_azure_base_url(value: object) -> str:
     """Normalize an HTTPS Azure endpoint and reject unsafe or unrelated URLs."""
     if not isinstance(value, str) or not value.strip():
-        raise ValueError("Azure Base-URL ist erforderlich.")
+        raise ValueError("Die Azure-Adresse fehlt.")
 
     normalized = value.strip().rstrip("/")
     try:
@@ -25,7 +25,7 @@ def validate_azure_base_url(value: object) -> str:
         hostname = parsed.hostname
         parsed.port
     except ValueError as exc:
-        raise ValueError("Azure Base-URL ist ungültig.") from exc
+        raise ValueError("Die Azure-Adresse ist ungültig.") from exc
 
     if (
         parsed.scheme != "https"
@@ -40,7 +40,8 @@ def validate_azure_base_url(value: object) -> str:
         or "#" in normalized
     ):
         raise ValueError(
-            "Azure Base-URL muss eine HTTPS-Adresse eines Azure OpenAI- oder "
-            "Cognitive-Services-Endpunkts ohne Zugangsdaten, Query oder Fragment sein."
+            "Die Azure-Adresse muss mit HTTPS beginnen und zu einer Azure OpenAI- "
+            "oder Cognitive-Services-Ressource gehören. Ergänze keine Zugangsdaten "
+            "oder weiteren URL-Angaben."
         )
     return normalized

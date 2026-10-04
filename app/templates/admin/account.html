@@ -7,14 +7,14 @@
   <p class="lede">Angemeldet als {{ username }}.</p>
 
   <h2>Passkeys</h2>
-  <p class="lede">Mehrere Passkeys sind erlaubt. iCloud-Geräte teilen denselben Passkey automatisch; für ein Backup einen Security Key oder ein anderes Ökosystem hinzufügen.</p>
+  <p class="lede">Du kannst mehrere Passkeys verwenden. Über den iCloud-Schlüsselbund sind sie auf deinen Apple-Geräten verfügbar. Als zusätzliche Sicherung empfiehlt sich ein weiterer Passkey auf einem anderen Gerät oder ein Sicherheitsschlüssel.</p>
   {% if passkeys %}
   <ul class="passkey-list">
     {% for key in passkeys %}
     <li>
       <div>
         <strong>{{ key.label }}</strong>
-        <p class="meta">Erstellt {{ key.created_at }}{% if key.last_used_at %} · Zuletzt {{ key.last_used_at }}{% endif %}</p>
+        <p class="meta">Hinzugefügt am {{ key.created_at }}{% if key.last_used_at %} · Zuletzt verwendet am {{ key.last_used_at }}{% endif %}</p>
       </div>
       <form method="post" action="{{ url_for('admin.delete_account_passkey', passkey_id=key.id) }}">
         {{ logout_form.csrf_token }}
@@ -28,7 +28,7 @@
   {% endif %}
   <div class="stack">
     <label>
-      Bezeichnung für neuen Passkey
+      Name für den neuen Passkey
       <input id="passkey-label" type="text" value="Zusatzgerät" maxlength="128" />
     </label>
     <button type="button" id="passkey-register">Weiteren Passkey hinzufügen</button>
@@ -46,7 +46,7 @@
   </form>
   {% else %}
   <h2>Passwort</h2>
-  <p class="lede">Nach der Passkey-Einrichtung ist die Anmeldung nur noch per Passkey möglich. Passwortänderung ist deaktiviert.</p>
+  <p class="lede">Sobald ein Passkey eingerichtet ist, meldest du dich nur noch damit an. Dein Passwort kannst du danach nicht mehr ändern.</p>
   {% endif %}
 </section>
 {% endblock %}

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import math
 import random
 import re
@@ -35,6 +36,7 @@ MIN_AZURE_RATE_LIMIT_DELAY_SECONDS = 15.0
 # Shared per-deployment cooldown so concurrent Cursor streams do not retry
 # into an already exhausted Azure token window.
 _rate_limit_not_before: dict[str, float] = {}
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -141,6 +143,11 @@ class AzureAdapter:
                 if self.resume_stream
                 else None
             ),
+            cancel_response=(
+                partial(self._cancel_azure_response, request_kwargs)
+                if self.resume_stream
+                else None
+            ),
         )
         response.call_on_close(prepared.close)
         return response
@@ -162,8 +169,39 @@ class AzureAdapter:
             headers=headers,
             params={"stream": "true", "starting_after": sequence_number},
             stream=True,
-            timeout=request_kwargs["timeout"],
+            timeout=(10.0, AZURE_ROUTED_READ_TIMEOUT_SECONDS),
         )
+
+    @staticmethod
+    def _cancel_azure_response(
+        request_kwargs: dict[str, Any], response_id: str
+    ) -> None:
+        """Cancel a stored Azure response after streaming cannot continue."""
+        url = (
+            f"{request_kwargs['url'].rstrip('/')}"
+            f"/{quote(response_id, safe='')}/cancel"
+        )
+        headers = {
+            key: value
+            for key, value in request_kwargs["headers"].items()
+            if key.casefold() not in {"content-length", "transfer-encoding", "expect"}
+        }
+        try:
+            response = requests.post(
+                url,
+                headers=headers,
+                timeout=(10.0, 10.0),
+            )
+            try:
+                response.raise_for_status()
+            finally:
+                response.close()
+        except requests.RequestException as exc:
+            logger.warning(
+                "Azure response cancellation failed: response_id=%s error_type=%s",
+                response_id,
+                type(exc).__name__,
+            )
 
     def _request_upstream(
         self, request_context: AzureRequestContext

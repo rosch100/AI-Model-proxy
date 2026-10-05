@@ -88,6 +88,7 @@ class _ResponseStreamState:
     events: int = 0
     has_emitted_output: bool = False
     completed_successfully: bool = False
+    terminal_event_seen: bool = False
     status_code: int | None = None
     aborted: bool = False
     quota_failure: bool = False
@@ -95,6 +96,7 @@ class _ResponseStreamState:
     sequence_number: int | None = None
     failure_details: dict[str, object] | None = None
     resume_stream: Callable[[str, int], Any] | None = None
+    cancel_response: Callable[[str], None] | None = None
     sanitize_errors: bool = False
     resume_attempts: int = 0
 
@@ -791,6 +793,7 @@ class ResponseAdapter:
             "response.incomplete",
         }
         if is_terminal:
+            state.terminal_event_seen = True
             state.completed_successfully = original_event.event == "response.completed"
             if state.completed_successfully:
                 state.status_code = 200
@@ -849,9 +852,13 @@ class ResponseAdapter:
         raw_event = event.event or ""
         event_data = event.json
         rate_limit = self._is_rate_limit_failure(raw_event, event_data)
-        attempt.retry_response = self._retry_stream_if_possible(
-            event, state, request_context
-        )
+        try:
+            attempt.retry_response = self._retry_stream_if_possible(
+                event, state, request_context
+            )
+        except requests.RequestException:
+            self._reset_stream_attempt(state)
+            raise
         if attempt.retry_response is not None:
             return
         event = self._sanitize_stream_event(event, state)
@@ -903,12 +910,21 @@ class ResponseAdapter:
             and state.resume_attempts < 3
         ):
             return False, error
-        state.resume_attempts += 1
-        time.sleep(0.25 * (2 ** (state.resume_attempts - 1)))
-        try:
-            replacement = state.resume_stream(state.response_id, state.sequence_number)
-        except requests.RequestException as resume_error:
+        resume_error = error
+        while state.resume_attempts < 3:
+            state.resume_attempts += 1
+            time.sleep(0.25 * (2 ** (state.resume_attempts - 1)))
+            try:
+                replacement = state.resume_stream(
+                    state.response_id, state.sequence_number
+                )
+            except requests.RequestException as exc:
+                resume_error = exc
+                continue
+            break
+        else:
             return False, resume_error
+
         if replacement.status_code != 200:
             state.status_code = replacement.status_code
             state.failure_details = {
@@ -1049,6 +1065,8 @@ class ResponseAdapter:
                     if attempt.stop_stream or attempt.retry_response is not None:
                         break
             except requests.RequestException as exc:
+                if state.terminal_event_seen:
+                    return
                 resumed, resume_error = self._resume_interrupted_stream(state, exc)
                 if resumed:
                     attempt.resumed_stream = True
@@ -1080,6 +1098,13 @@ class ResponseAdapter:
         """Discard adaptation state belonging to a failed upstream attempt."""
         state.events = 0
         state.completion_msg = {"role": "assistant", "content": "", "tool_calls": []}
+        state.completed_successfully = False
+        state.terminal_event_seen = False
+        state.status_code = None
+        state.response_id = None
+        state.sequence_number = None
+        state.failure_details = None
+        state.resume_attempts = 0
         self._reasoning_open = False
         self._reasoning_pending_whitespace = ""
         self._tool_calls = 0
@@ -1210,12 +1235,14 @@ class ResponseAdapter:
         activity_attempt_id: int | None = None,
         circuit_attempt: ProviderCircuitAttempt | None = None,
         resume_stream: Callable[[str, int], Any] | None = None,
+        cancel_response: Callable[[str], None] | None = None,
     ) -> Iterable[Dict[str, Any]]:
         """Manage per-stream state, logging, and upstream response cleanup."""
         state = _ResponseStreamState(
             upstream_resp=upstream_resp,
             completion_msg={"role": "assistant", "content": "", "tool_calls": []},
             resume_stream=resume_stream,
+            cancel_response=cancel_response,
             sanitize_errors=isinstance(upstream_resp, PreparedUpstream)
             or resume_stream is not None,
         )
@@ -1228,21 +1255,37 @@ class ResponseAdapter:
             state.aborted = True
             raise
         finally:
-            complete_provider_attempt(
-                activity_attempt_id,
-                outcome=(
-                    "aborted"
-                    if state.aborted
-                    else "success" if state.completed_successfully else "failure"
-                ),
-                status_code=(
-                    200
-                    if state.completed_successfully and not state.aborted
-                    else state.status_code
-                ),
-                failure_details=state.failure_details,
-            )
-            state.upstream_resp.close()
+            try:
+                complete_provider_attempt(
+                    activity_attempt_id,
+                    outcome=(
+                        "aborted"
+                        if state.aborted
+                        else "success" if state.completed_successfully else "failure"
+                    ),
+                    status_code=(
+                        200
+                        if state.completed_successfully and not state.aborted
+                        else state.status_code
+                    ),
+                    failure_details=state.failure_details,
+                )
+            finally:
+                try:
+                    if (
+                        cancel_response is not None
+                        and state.response_id is not None
+                        and (
+                            state.aborted
+                            or (
+                                not state.completed_successfully
+                                and not state.terminal_event_seen
+                            )
+                        )
+                    ):
+                        cancel_response(state.response_id)
+                finally:
+                    state.upstream_resp.close()
 
     def adapt(
         self,
@@ -1252,6 +1295,7 @@ class ResponseAdapter:
         activity_attempt_id: int | None = None,
         circuit_attempt: ProviderCircuitAttempt | None = None,
         resume_stream: Callable[[str, int], Any] | None = None,
+        cancel_response: Callable[[str], None] | None = None,
     ) -> Response:
         """Adapt an upstream Azure streaming response into SSE for Flask."""
 
@@ -1276,6 +1320,7 @@ class ResponseAdapter:
                         activity_attempt_id,
                         circuit_attempt,
                         resume_stream,
+                        cancel_response,
                     )
                 )
             except requests.RequestException:

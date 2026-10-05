@@ -1,6 +1,7 @@
 """Unit tests for Azure response adaptation."""
 
 import json
+from unittest.mock import Mock
 
 import pytest
 import requests
@@ -108,11 +109,11 @@ def test_response_adapter_yields_each_delta_before_reading_next_upstream_chunk(a
     adapter = AzureAdapter()
     adapter.inbound_model = "gpt-5.4"
     adapter.include_usage = False
+    adapter.response_adapter._chat_completion_id = "chatcmpl-test"
     adapter.response_adapter._reasoning_open = False
     adapter.response_adapter._reasoning_pending_whitespace = ""
     adapter.response_adapter._tool_calls = 0
     adapter.response_adapter._usage = None
-    adapter.response_adapter._chat_completion_id = "chatcmpl-test"
     upstream_advanced = False
 
     def upstream_chunks():
@@ -172,6 +173,43 @@ def test_resume_request_targets_response_and_sequence(monkeypatch):
         "params": {"stream": "true", "starting_after": 17},
         "stream": True,
         "timeout": (10.0, 300.0),
+    }
+
+
+def test_cancel_azure_response_uses_response_endpoint_and_bounded_timeout(monkeypatch):
+    """Cancel one Azure background response using a bounded request timeout."""
+    captured = {}
+
+    class _SuccessfulResponse:
+        def raise_for_status(self):
+            pass
+
+        def close(self):
+            pass
+
+    def fake_post(url, **kwargs):
+        captured["url"] = url
+        captured.update(kwargs)
+        return _SuccessfulResponse()
+
+    monkeypatch.setattr("app.azure.adapter.requests.post", fake_post)
+
+    AzureAdapter._cancel_azure_response(
+        {
+            "url": "https://resource.openai.azure.com/openai/v1/responses",
+            "headers": {
+                "api-key": "secret",
+                "content-type": "application/json",
+                "content-length": "36",
+            },
+        },
+        "resp_123",
+    )
+
+    assert captured == {
+        "url": "https://resource.openai.azure.com/openai/v1/responses/resp_123/cancel",
+        "headers": {"api-key": "secret", "content-type": "application/json"},
+        "timeout": (10.0, 10.0),
     }
 
 
@@ -239,6 +277,354 @@ def test_read_timeout_resumes_azure_response_after_last_emitted_sequence(app):
     assert body.endswith(b"data: [DONE]\n\n")
     assert original_upstream.close_count == 1
     assert resumed_upstream.close_count == 1
+
+
+def test_terminal_event_prevents_resuming_after_later_transport_error(app):
+    """Do not resume or replace terminal state after completion was received."""
+    adapter = AzureAdapter()
+    adapter.inbound_model = "gpt-5.4"
+    adapter.include_usage = False
+    resume_calls = []
+    cancelled_response_ids = []
+
+    def terminal_then_interrupted():
+        yield _sse(
+            "response.completed",
+            {
+                "type": "response.completed",
+                "sequence_number": 4,
+                "response": {"id": "resp_terminal", "usage": {}},
+            },
+        )
+        raise requests.ReadTimeout("after terminal event")
+
+    def resume(response_id, sequence_number):
+        resume_calls.append((response_id, sequence_number))
+        raise requests.ConnectionError("unexpected resume")
+
+    response = adapter.response_adapter.adapt(
+        _FakeUpstreamResponse(terminal_then_interrupted()),
+        resume_stream=resume,
+        cancel_response=cancelled_response_ids.append,
+    )
+    body = b"".join(response.response)
+
+    assert resume_calls == []
+    assert cancelled_response_ids == []
+    assert b"stream_interrupted" not in body
+    assert body.endswith(b"data: [DONE]\n\n")
+
+
+def test_rate_limit_retry_resets_terminal_response_state(app, monkeypatch):
+    """A later retry stream interruption is handled as its own attempt."""
+    adapter = AzureAdapter()
+    adapter.inbound_model = "gpt-5.4"
+    adapter.include_usage = False
+    monkeypatch.setattr(
+        adapter,
+        "_retry_stream_rate_limit",
+        lambda *_args: _FakeUpstreamResponse(retry_stream()),
+    )
+    cancelled_response_ids = []
+    resume_calls = []
+
+    def rate_limited_stream():
+        yield _sse(
+            "response.failed",
+            {
+                "type": "response.failed",
+                "sequence_number": 5,
+                "response": {
+                    "id": "resp_rate_limited",
+                    "error": {"code": "rate_limit_exceeded", "status": 429},
+                },
+            },
+        )
+
+    def retry_stream():
+        yield _sse(
+            "response.created",
+            {
+                "type": "response.created",
+                "sequence_number": 0,
+                "response": {"id": "resp_retry"},
+            },
+        )
+        yield _sse(
+            "response.output_text.delta",
+            {
+                "type": "response.output_text.delta",
+                "sequence_number": 1,
+                "delta": "partial",
+            },
+        )
+        raise requests.ReadTimeout("retry stream interrupted")
+
+    def resume(response_id, sequence_number):
+        resume_calls.append((response_id, sequence_number))
+        return _FakeUpstreamResponse(
+            [
+                _sse(
+                    "response.completed",
+                    {
+                        "type": "response.completed",
+                        "sequence_number": 2,
+                        "response": {"id": response_id, "usage": {}},
+                    },
+                )
+            ]
+        )
+
+    response = adapter.response_adapter.adapt(
+        _FakeUpstreamResponse(rate_limited_stream()),
+        request_context=object(),
+        resume_stream=resume,
+        cancel_response=cancelled_response_ids.append,
+    )
+    body = b"".join(response.response)
+
+    assert resume_calls == [("resp_retry", 1)]
+    assert cancelled_response_ids == []
+    assert b"partial" in body
+    assert b"stream_interrupted" not in body
+
+
+def test_rate_limit_retry_request_failure_reports_stream_interruption(app, monkeypatch):
+    """Report a failed retry request instead of treating it as terminal success."""
+    adapter = AzureAdapter()
+    adapter.inbound_model = "gpt-5.4"
+    adapter.include_usage = False
+
+    def fail_retry(*_args):
+        raise requests.ConnectionError("retry request failed")
+
+    monkeypatch.setattr(adapter, "_retry_stream_rate_limit", fail_retry)
+    resume_calls = []
+
+    def rate_limited_stream():
+        yield _sse(
+            "response.failed",
+            {
+                "type": "response.failed",
+                "sequence_number": 5,
+                "response": {
+                    "id": "resp_rate_limited",
+                    "error": {"code": "rate_limit_exceeded", "status": 429},
+                },
+            },
+        )
+
+    response = adapter.response_adapter.adapt(
+        _FakeUpstreamResponse(rate_limited_stream()),
+        request_context=object(),
+        resume_stream=lambda *args: resume_calls.append(args),
+    )
+    body = b"".join(response.response)
+
+    assert b"stream_interrupted" in body
+    assert resume_calls == []
+
+
+def test_resume_retries_transient_reconnect_errors(app, monkeypatch):
+    """Retry transient failures from the resume request before giving up."""
+    adapter = AzureAdapter()
+    adapter.inbound_model = "gpt-5.4"
+    adapter.include_usage = False
+    monkeypatch.setattr("app.azure.response_adapter.time.sleep", lambda _delay: None)
+
+    def interrupted_stream():
+        yield _sse(
+            "response.created",
+            {
+                "type": "response.created",
+                "sequence_number": 0,
+                "response": {"id": "resp_retry"},
+            },
+        )
+        yield _sse(
+            "response.output_text.delta",
+            {
+                "type": "response.output_text.delta",
+                "sequence_number": 1,
+                "delta": "partial",
+            },
+        )
+        raise requests.ReadTimeout("temporary stream interruption")
+
+    def resumed_stream():
+        yield _sse(
+            "response.completed",
+            {
+                "type": "response.completed",
+                "sequence_number": 2,
+                "response": {"usage": {}},
+            },
+        )
+
+    resume_calls = []
+    resumed_upstream = _FakeUpstreamResponse(resumed_stream())
+
+    def resume(response_id, sequence_number):
+        resume_calls.append((response_id, sequence_number))
+        if len(resume_calls) < 3:
+            raise requests.ConnectionError("temporary reconnect failure")
+        return resumed_upstream
+
+    response = adapter.response_adapter.adapt(
+        _FakeUpstreamResponse(interrupted_stream()),
+        resume_stream=resume,
+    )
+    body = b"".join(response.response)
+
+    assert resume_calls == [("resp_retry", 1)] * 3
+    assert b"partial" in body
+    assert b"stream_interrupted" not in body
+    assert resumed_upstream.close_count == 1
+
+
+def test_cancel_response_request_failure_is_swallowed_and_logged(monkeypatch, app):
+    """Log cancellation transport errors without exposing their messages."""
+
+    def fail_post(*_args, **_kwargs):
+        raise requests.ConnectionError("cancel failed")
+
+    monkeypatch.setattr("app.azure.adapter.requests.post", fail_post)
+    adapter = AzureAdapter()
+    adapter.activity_settings = {"base_url": "https://resource.openai.azure.com"}
+    logger = Mock()
+    monkeypatch.setattr("app.azure.adapter.logger.warning", logger)
+
+    adapter._cancel_azure_response(
+        {
+            "url": "https://resource.openai.azure.com/openai/v1/responses",
+            "headers": {"api-key": "secret"},
+        },
+        "resp_123",
+    )
+
+    logger.assert_called_once()
+    message = logger.call_args.args[0]
+    assert "Azure response cancellation failed" in message
+    assert logger.call_args.args[-1] == "ConnectionError"
+    assert "cancel failed" not in str(logger.call_args)
+
+
+def test_aborted_background_stream_cancels_response(app):
+    """Cancel the stored Azure response if its downstream client disconnects."""
+    adapter = AzureAdapter()
+    adapter.inbound_model = "gpt-5.4"
+    adapter.include_usage = False
+
+    upstream = _FakeUpstreamResponse(
+        [
+            _sse(
+                "response.created",
+                {
+                    "type": "response.created",
+                    "response": {"id": "resp_cancel"},
+                },
+            ),
+            _sse(
+                "response.output_text.delta",
+                {"type": "response.output_text.delta", "delta": "partial"},
+            ),
+        ]
+    )
+    cancelled_response_ids = []
+    stream = adapter.response_adapter._adapt_stream(
+        upstream,
+        None,
+        cancel_response=cancelled_response_ids.append,
+    )
+    adapter.response_adapter._chat_completion_id = "chatcmpl-test"
+    adapter.response_adapter._reasoning_open = False
+    adapter.response_adapter._reasoning_pending_whitespace = ""
+    adapter.response_adapter._tool_calls = 0
+    adapter.response_adapter._usage = None
+
+    try:
+        first_chunk = next(stream)
+    finally:
+        stream.close()
+
+    assert first_chunk["choices"][0]["delta"]["content"] == "partial"
+    assert cancelled_response_ids == ["resp_cancel"]
+    assert upstream.close_count == 1
+
+
+def test_unpinned_stream_does_not_cancel_without_background_response_id(app):
+    """Avoid sending cancellation unless the provider supplied a response ID."""
+    adapter = AzureAdapter()
+    adapter.inbound_model = "gpt-5.4"
+    adapter.include_usage = False
+    cancelled_response_ids = []
+    upstream = _FakeUpstreamResponse(
+        [_sse("response.output_text.delta", {"delta": "partial"})]
+    )
+
+    stream = adapter.response_adapter._adapt_stream(
+        upstream,
+        None,
+        cancel_response=cancelled_response_ids.append,
+    )
+    adapter.response_adapter._chat_completion_id = "chatcmpl-test"
+    adapter.response_adapter._reasoning_open = False
+    adapter.response_adapter._reasoning_pending_whitespace = ""
+    adapter.response_adapter._tool_calls = 0
+    adapter.response_adapter._usage = None
+
+    try:
+        next(stream)
+    finally:
+        stream.close()
+
+    assert cancelled_response_ids == []
+    assert upstream.close_count == 1
+
+
+def test_failed_resume_cancels_background_response_after_retry_limit(app, monkeypatch):
+    """Cancel background generation after all transient resume attempts fail."""
+    adapter = AzureAdapter()
+    adapter.inbound_model = "gpt-5.4"
+    adapter.include_usage = False
+    monkeypatch.setattr("app.azure.response_adapter.time.sleep", lambda _delay: None)
+
+    def interrupted_stream():
+        yield _sse(
+            "response.created",
+            {
+                "type": "response.created",
+                "sequence_number": 0,
+                "response": {"id": "resp_resume_failure"},
+            },
+        )
+        yield _sse(
+            "response.output_text.delta",
+            {
+                "type": "response.output_text.delta",
+                "sequence_number": 1,
+                "delta": "partial",
+            },
+        )
+        raise requests.ReadTimeout("temporary stream interruption")
+
+    resume_calls = []
+    cancelled_response_ids = []
+
+    def resume(response_id, sequence_number):
+        resume_calls.append((response_id, sequence_number))
+        raise requests.ConnectionError("temporary reconnect failure")
+
+    response = adapter.response_adapter.adapt(
+        _FakeUpstreamResponse(interrupted_stream()),
+        resume_stream=resume,
+        cancel_response=cancelled_response_ids.append,
+    )
+    body = b"".join(response.response)
+
+    assert resume_calls == [("resp_resume_failure", 1)] * 3
+    assert cancelled_response_ids == ["resp_resume_failure"]
+    assert b"stream_interrupted" in body
 
 
 def test_resumed_stream_sanitizes_provider_error_details(app):

@@ -35,16 +35,16 @@ def downgrade() -> None:
     if op.get_context().dialect.name != "postgresql":
         raise RuntimeError("Tenant-admin migrations require PostgreSQL")
     connection = op.get_bind()
-    for table in ("inference_activity_events", "provider_attempt_events"):
+    for table_name in ("inference_activity_events", "provider_attempt_events"):
+        table = sa.table(table_name, sa.column("inbound_model", sa.String()))
         contains_long_model_ids = connection.execute(
-            sa.text(
-                f"SELECT EXISTS (SELECT 1 FROM {table} "
-                "WHERE char_length(inbound_model) > 256)"
+            sa.select(
+                sa.exists().where(sa.func.char_length(table.c.inbound_model) > 256)
             )
         ).scalar_one()
         if contains_long_model_ids:
             raise RuntimeError(
-                f"Cannot downgrade while {table} contains model IDs longer than 256 characters"
+                f"Cannot downgrade while {table_name} contains model IDs longer than 256 characters"
             )
     for table in ("inference_activity_events", "provider_attempt_events"):
         op.alter_column(

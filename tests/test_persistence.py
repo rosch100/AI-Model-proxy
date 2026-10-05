@@ -5,6 +5,8 @@ import hashlib
 from datetime import datetime, timezone
 from io import StringIO
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
 from alembic import command
@@ -206,6 +208,39 @@ def test_provider_circuit_migration_is_postgresql_only_and_has_atomic_identity(
     assert "ix_provider_circuit_tenant_probe" in generated_sql
     assert "scope_fingerprint" in generated_sql
     assert "scope_id" not in generated_sql
+
+
+def test_model_id_length_downgrade_uses_sqlalchemy_identifier_expressions(monkeypatch):
+    """Use identifier-aware SQLAlchemy expressions for static table names."""
+    project_root = Path(__file__).resolve().parents[1]
+    config = Config(str(project_root / "alembic.ini"))
+    config.set_main_option("script_location", str(project_root / "migrations"))
+    migration = (
+        ScriptDirectory.from_config(config)
+        .get_revision("20261010_model_alias_len")
+        .module
+    )
+    queries = []
+    connection = SimpleNamespace(
+        execute=lambda statement: (
+            queries.append(statement) or SimpleNamespace(scalar_one=lambda: False)
+        )
+    )
+    monkeypatch.setattr(
+        migration.op,
+        "get_context",
+        lambda: SimpleNamespace(dialect=SimpleNamespace(name="postgresql")),
+    )
+    monkeypatch.setattr(migration.op, "get_bind", lambda: connection)
+    monkeypatch.setattr(migration.op, "alter_column", Mock())
+
+    migration.downgrade()
+
+    assert len(queries) == 2
+    assert all(not isinstance(query, str) for query in queries)
+    compiled = str(queries[0].compile())
+    assert "inference_activity_events.inbound_model" in compiled
+    assert "char_length" in compiled
 
 
 def test_deepseek_profiles_and_activity_are_accepted_but_unknown_provider_is_rejected():

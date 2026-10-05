@@ -250,10 +250,10 @@ def test_http_quota_failure_is_recorded_once_and_pauses_next_request(
     assert requests_mock.call_count == 1
 
 
-def test_transient_error_is_not_replaced_by_later_blocked_provider(
+def test_transient_error_requests_retry_after_when_later_profile_is_blocked(
     routed_app, requests_mock
 ):
-    """Return the attempted provider failure when a later profile is circuit-blocked."""
+    """A later circuit-blocked profile does not hide an earlier transient failure."""
     database = routed_app.extensions["database"]
     with database.sessions.begin() as session:
         profiles = tuple(
@@ -285,8 +285,8 @@ def test_transient_error_is_not_replaced_by_later_blocked_provider(
     response = post(routed_app)
 
     assert response.status_code == 503
-    assert response.json["error"]["code"] != "provider_quota_unavailable"
-    assert "Retry-After" not in response.headers
+    assert response.json["error"]["code"] == "provider_quota_unavailable"
+    assert response.headers["Retry-After"] == "30"
     assert [request.url for request in requests_mock.request_history] == [OPENAI]
 
 
@@ -490,6 +490,42 @@ def test_openrouter_inflight_budget_returns_retry_after_to_client(
 
     response = post(routed_app)
 
+    assert response.status_code == 503
+    assert response.json["error"]["code"] == "provider_quota_unavailable"
+    assert response.headers["Retry-After"] == "120"
+    assert requests_mock.call_count == 1
+    with database.sessions() as session:
+        assert session.scalar(select(ProviderCircuitState)) is None
+
+
+def test_terminal_openrouter_402_keeps_retry_after_without_transient_failure(
+    routed_app, requests_mock
+):
+    """Keep an isolated terminal 402 distinct from route-wide overloads."""
+    database = routed_app.extensions["database"]
+    with database.sessions.begin() as session:
+        for profile in session.scalars(
+            select(ProviderProfile).where(ProviderProfile.tenant_id == "acme")
+        ):
+            profile.route_priority = None
+        session.flush()
+        profile = session.scalar(
+            select(ProviderProfile).where(
+                ProviderProfile.tenant_id == "acme",
+                ProviderProfile.provider == "openrouter",
+            )
+        )
+        profile.route_priority = 1
+
+    requests_mock.post(
+        OPENROUTER,
+        status_code=402,
+        headers={"Retry-After": "120"},
+        json={"error": {}},
+    )
+
+    response = post(routed_app)
+
     assert response.status_code == 402
     assert response.headers["Retry-After"] == "120"
     assert requests_mock.call_count == 1
@@ -587,15 +623,33 @@ def test_partial_azure_output_never_replays(routed_app, requests_mock):
     assert requests_mock.call_count == 1
 
 
-def test_exhausted_route_returns_last_status(routed_app, requests_mock):
-    """Return the final provider's status when the route is exhausted."""
+@pytest.mark.parametrize(
+    ("azure_retry_after", "openai_retry_after", "expected_retry_after"),
+    [(None, "45", "45"), (None, None, "30"), ("120", "45", "120")],
+)
+def test_exhausted_route_returns_retryable_unavailable_after_transient_failures(
+    routed_app,
+    requests_mock,
+    azure_retry_after,
+    openai_retry_after,
+    expected_retry_after,
+):
+    """A terminal final 402 must not hide earlier overloads or their backoff."""
     activate_deepseek_profile(routed_app)
-    requests_mock.post(AZURE, status_code=503)
-    requests_mock.post(OPENAI, status_code=429)
+    azure_headers = (
+        {"Retry-After": azure_retry_after} if azure_retry_after is not None else {}
+    )
+    openai_headers = (
+        {"Retry-After": openai_retry_after} if openai_retry_after is not None else {}
+    )
+    requests_mock.post(AZURE, status_code=503, headers=azure_headers)
+    requests_mock.post(OPENAI, status_code=429, headers=openai_headers)
     requests_mock.post(OPENROUTER, status_code=500)
     requests_mock.post(DEEPSEEK, status_code=402)
     response = post(routed_app)
-    assert response.status_code == 402
+    assert response.status_code == 503
+    assert response.json["error"]["code"] == "provider_quota_unavailable"
+    assert response.headers["Retry-After"] == expected_retry_after
     assert requests_mock.call_count == 4
 
 

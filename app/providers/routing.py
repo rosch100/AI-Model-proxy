@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import math
 from collections.abc import Callable
 from datetime import datetime
@@ -270,7 +271,7 @@ def forward_tenant_route(
                 "provider=%s status=%s retryable=%s error_code=%s "
                 "error_category=%s provider_error_code=%s provider_error_type=%s "
                 "provider_error_param=%s provider_limit_source=%s "
-                "provider_request_id=%s",
+                "provider_request_id=%s provider_diagnostics=%s",
                 getattr(g, "proxy_request_id", "unavailable"),
                 snapshot.id,
                 profile.profile_id,
@@ -284,6 +285,9 @@ def forward_tenant_route(
                 exc.provider_error_param or "unknown",
                 exc.provider_limit_source or "unknown",
                 exc.provider_request_id or "unknown",
+                json.dumps(
+                    exc.provider_diagnostics, sort_keys=True, ensure_ascii=False
+                ),
             )
             if circuit_update_failed:
                 continue

@@ -217,11 +217,17 @@ def test_http_quota_failure_is_recorded_once_and_pauses_next_request(
                 "message": "private provider prose and secret must not be logged",
                 "metadata": {
                     "limit_source": "openrouter_key_limit",
+                    "provider_name": "OpenAI",
+                    "is_byok": True,
+                    "is_free_tier": False,
                     "secret": "provider-secret-do-not-log",
                 },
             }
         },
-        headers={"x-request-id": "req_1234567890abcdef12345678"},
+        headers={
+            "x-request-id": "req_1234567890abcdef12345678",
+            "x-ratelimit-remaining-requests": "2",
+        },
     )
     first = post(routed_app)
 
@@ -234,6 +240,10 @@ def test_http_quota_failure_is_recorded_once_and_pauses_next_request(
     assert "provider_limit_source=openrouter_key_limit" in formatted_warning
     assert "provider_request_id=req_1234567890abcdef12345678" in formatted_warning
     assert "error_category=quota_exhausted" in formatted_warning
+    assert '"provider_name": "OpenAI"' in formatted_warning
+    assert '"is_byok": true' in formatted_warning
+    assert '"is_free_tier": false' in formatted_warning
+    assert '"x-ratelimit-remaining-requests": "2"' in formatted_warning
     assert "private provider prose" not in formatted_warning
     assert "provider-secret-do-not-log" not in formatted_warning
 

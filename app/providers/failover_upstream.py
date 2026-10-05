@@ -171,6 +171,7 @@ _SENSITIVE_DIAGNOSTIC_PATTERN = re.compile(
     re.IGNORECASE,
 )
 _URL_PATTERN = re.compile(r"https?://[^\s'\"<>]+", re.IGNORECASE)
+_SCHEMELESS_URL_PATTERN = re.compile(r"(?i)(?<![\w-])url:\s*.*\Z")
 _BEARER_CREDENTIAL_PATTERN = re.compile(r"(?i)bearer\s+\S+")
 
 
@@ -194,6 +195,7 @@ def _safe_exception_message(exc: BaseException) -> str | None:
         return f"{parsed.scheme}://{host}"
 
     message = _URL_PATTERN.sub(strip_url, message)
+    message = _SCHEMELESS_URL_PATTERN.sub("url: <path>", message)
     message = _BEARER_CREDENTIAL_PATTERN.sub("Bearer <redacted>", message)
     if _SENSITIVE_DIAGNOSTIC_PATTERN.search(message):
         return "<redacted-sensitive-transport-detail>"

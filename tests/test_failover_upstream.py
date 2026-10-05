@@ -375,6 +375,41 @@ def test_transport_failure_keeps_safe_reason_without_url_or_credentials():
     assert "/v1/chat" not in repr(failure.provider_diagnostics)
 
 
+def test_transport_failure_redacts_scheme_less_url_paths_and_credentials():
+    """Redact path and query values in scheme-less transport URLs."""
+    error = requests.ReadTimeout(
+        "Read timed out url: /v1/responses?sig=signature-value&code=authorization-value"
+    )
+
+    failure = failover_upstream.transport_failure(error)
+    message = failure.provider_diagnostics["message"]
+
+    assert message == "Read timed out url: <path>"
+    assert "/v1/responses" not in message
+    assert "signature-value" not in message
+    assert "authorization-value" not in message
+
+
+def test_transport_failure_redacts_complete_scheme_less_url_value():
+    """Redact whitespace-separated text after a scheme-less URL label."""
+    error = requests.ReadTimeout(
+        "Read timed out url: /v1/responses?sig=signature-value extra details"
+    )
+
+    failure = failover_upstream.transport_failure(error)
+
+    assert failure.provider_diagnostics["message"] == "Read timed out url: <path>"
+    assert "signature-value" not in repr(failure.provider_diagnostics)
+    assert "extra details" not in repr(failure.provider_diagnostics)
+
+
+def test_transport_failure_does_not_redact_curl_diagnostics():
+    """A curl diagnostic is not a scheme-less URL label."""
+    failure = failover_upstream.transport_failure(requests.ReadTimeout("curl: /path"))
+
+    assert failure.provider_diagnostics["message"] == "curl: /path"
+
+
 def test_transport_failure_handles_malformed_urls_without_raising():
     """Malformed URLs in transport text must not interrupt error handling."""
     failure = failover_upstream.transport_failure(

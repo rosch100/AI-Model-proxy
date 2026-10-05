@@ -31,6 +31,6 @@ cryptography==50.0.2
 
 # Admin UI auth (CSRF, Argon2 passwords, WebAuthn passkeys)
 Flask-WTF==1.2.2
-WTForms==3.2.1
+WTForms==3.2.2
 argon2-cffi==25.1.0
 webauthn==3.0.1

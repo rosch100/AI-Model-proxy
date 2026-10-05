@@ -250,10 +250,21 @@ def test_http_quota_failure_is_recorded_once_and_pauses_next_request(
     assert requests_mock.call_count == 1
 
 
-def test_transient_error_requests_retry_after_when_later_profile_is_blocked(
-    routed_app, requests_mock
+@pytest.mark.parametrize("blocked_first", [False, True])
+@pytest.mark.parametrize(
+    ("transient_retry_after", "cooldown_seconds", "expected_retry_after"),
+    [(None, 90.1, "91"), ("120", 90.1, "120"), (None, 10, "30"), ("5", 10.1, "11")],
+)
+def test_transient_error_retry_after_respects_blocked_profile_cooldown(
+    routed_app,
+    requests_mock,
+    mocker,
+    blocked_first,
+    transient_retry_after,
+    cooldown_seconds,
+    expected_retry_after,
 ):
-    """A later circuit-blocked profile does not hide an earlier transient failure."""
+    """Honor both transient retry guidance and a blocked profile's cooldown."""
     database = routed_app.extensions["database"]
     with database.sessions.begin() as session:
         profiles = tuple(
@@ -270,23 +281,35 @@ def test_transient_error_requests_retry_after_when_later_profile_is_blocked(
         openrouter_profile = next(
             profile for profile in profiles if profile.provider == "openrouter"
         )
-        openai_profile.route_priority = 1
-        openrouter_profile.route_priority = 2
+        openai_profile.route_priority = 2 if blocked_first else 1
+        openrouter_profile.route_priority = 1 if blocked_first else 2
 
     snapshot = database.get_proxy_snapshot_by_api_key("cursor-key")
     breaker = ProviderCircuitBreakerStore(database.sessions, database.secret_cipher)
+    now = datetime.now(timezone.utc)
+    clock = mocker.patch("app.providers.circuit_breaker.datetime", wraps=datetime)
+    clock.now.return_value = now
     breaker.open_quota(
-        breaker.scope(snapshot.id, "openrouter", "profile", openrouter_profile.id)
+        breaker.scope(snapshot.id, "openrouter", "profile", openrouter_profile.id),
+        now=now - timedelta(hours=1) + timedelta(seconds=cooldown_seconds),
+    )
+    headers = (
+        {"Retry-After": transient_retry_after}
+        if transient_retry_after is not None
+        else {}
     )
     requests_mock.post(
-        OPENAI, status_code=503, json={"error": {"code": "server_error"}}
+        OPENAI,
+        status_code=503,
+        json={"error": {"code": "server_error"}},
+        headers=headers,
     )
 
     response = post(routed_app)
 
     assert response.status_code == 503
     assert response.json["error"]["code"] == "provider_quota_unavailable"
-    assert response.headers["Retry-After"] == "30"
+    assert response.headers["Retry-After"] == expected_retry_after
     assert [request.url for request in requests_mock.request_history] == [OPENAI]
 
 

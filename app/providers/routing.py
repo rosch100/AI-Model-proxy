@@ -312,7 +312,12 @@ def forward_tenant_route(
             if transient_retry_after is not None
             else 30
         )
-        retry_after = str(retry_after_seconds)
+        cooldown_seconds = (
+            int(retry_after_header(retry_at))
+            for retry_at in blocked_until
+            if retry_at is not None
+        )
+        retry_after = str(max(retry_after_seconds, max(cooldown_seconds, default=0)))
         return _service_unavailable(
             "provider_quota_unavailable",
             "All configured providers are temporarily unavailable.",

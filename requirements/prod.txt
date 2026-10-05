@@ -30,7 +30,7 @@ psycopg[binary]==3.3.6
 cryptography==50.0.2
 
 # Admin UI auth (CSRF, Argon2 passwords, WebAuthn passkeys)
-Flask-WTF==1.2.2
+Flask-WTF==1.3.0
 WTForms==3.2.2
 argon2-cffi==25.1.0
 webauthn==3.0.1

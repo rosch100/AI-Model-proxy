@@ -137,13 +137,22 @@ In **Verbindung**, add provider accounts, refresh their catalogs and select a
 catalog-backed standard model per account. Activate multiple accounts and use
 **Nach oben / Nach unten** to set the root inference failover order. Cursor keeps
 one stable tenant model ID; each profile maps it explicitly to its standard model.
-Unknown model IDs are rejected rather than forwarded unchanged.
+The model list also exposes each catalog's native IDs, which route only across
+accounts that advertise that exact model (in route-priority order). To select a
+specific account with a unique name, use `Account Name/model-id`, for example
+`Research Team/deepseek-flash`. If account names are duplicated, use
+`provider:Account Name/model-id`, such as
+`deepseek:Research Team/deepseek-flash`; spaces remain readable, and reserved
+characters in account names are percent-encoded. An explicit account/model ID
+is pinned to that account and never falls back to a different account. Unknown
+model IDs are rejected rather than forwarded unchanged.
 
-Root requests try the next account on HTTP 408/429/5xx, safe connection failures,
-or recognized early SSE errors, but never after stream output begins. Other 4xx
-and ambiguous read failures are final. Switching is best effort and may incur
-additional processing/costs. `/azure` stays pinned to the first active Azure
-account; `/codex` and single/environment-tenant mode keep their existing behavior.
+Root requests using the tenant model ID try the next account on HTTP 408/429/5xx,
+safe connection failures, or recognized early SSE errors, but never after stream
+output begins. Other 4xx and ambiguous read failures are final. Switching is best
+effort and may incur additional processing/costs. `/azure` stays scoped to active
+Azure accounts; `/codex` and single/environment-tenant mode keep their existing
+behavior.
 Run `flask db upgrade` before deploying the new route schema. See the
 [routing decision](docs/adr/0001-azure-rooted-multi-provider-proxy.md).
 

@@ -202,7 +202,10 @@ def test_database_tenant_api_key_authenticates_against_persisted_profile(monkeyp
     )
 
     assert response.status_code == 200
-    assert [item["id"] for item in response.json["data"]] == ["cursor-persisted-model"]
+    assert [item["id"] for item in response.json["data"]] == [
+        "cursor-persisted-model",
+        "gpt-5.4",
+    ]
     engine.dispose()
 
 
@@ -371,7 +374,10 @@ def test_database_openai_provider_forwards_to_openai_compatible(monkeypatch):
         "/v1/models", headers={"Authorization": f"Bearer {api_key}"}
     )
     assert models.status_code == 200
-    assert [item["id"] for item in models.json["data"]] == ["cursor-openai-model"]
+    assert [item["id"] for item in models.json["data"]] == [
+        "cursor-openai-model",
+        "gpt-5.4",
+    ]
 
     azure = app.test_client().post(
         "/azure/v1/chat/completions",

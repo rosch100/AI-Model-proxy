@@ -25,6 +25,7 @@ from app.persistence.provider_circuit_breaker import (
     ProviderCircuitBreakerStore,
     ProviderCircuitStoreError,
 )
+from app.providers.model_ids import qualified_model_id
 from app.providers.routing import forward_tenant_route
 
 AUTH = {"Authorization": "Bearer cursor-key"}
@@ -341,6 +342,47 @@ def test_circuit_store_failure_fails_closed_with_service_unavailable(
     assert requests_mock.call_count == 0
     with routed_app.extensions["database"].sessions() as session:
         assert session.scalar(select(ProviderAttemptEvent)) is None
+
+
+def test_http_provider_failure_persists_allowlisted_diagnostics(
+    routed_app, requests_mock
+):
+    """Persist safe structured diagnostics from a non-retryable HTTP failure."""
+    requests_mock.post(
+        AZURE,
+        status_code=401,
+        json={
+            "error": {
+                "code": "invalid_api_key",
+                "type": "authentication_error",
+                "param": "model",
+                "message": "private provider prose must not be stored",
+            }
+        },
+        headers={"x-request-id": "req_1234567890abcdef12345678"},
+    )
+
+    response = post(routed_app)
+
+    assert response.status_code == 401
+    with routed_app.extensions["database"].sessions() as session:
+        attempt = session.scalar(select(ProviderAttemptEvent))
+
+    assert attempt.outcome == "failure"
+    assert attempt.failure_details == {
+        "error_code": "invalid_api_key",
+        "provider_error_code": "invalid_api_key",
+        "provider_error_type": "authentication_error",
+        "provider_error_param": "model",
+        "provider_request_id": "req_1234567890abcdef12345678",
+        "provider_diagnostics": {
+            "provider_error_code": "invalid_api_key",
+            "provider_error_type": "authentication_error",
+            "provider_error_param": "model",
+            "provider_request_id": "req_1234567890abcdef12345678",
+        },
+    }
+    assert "private provider prose" not in str(attempt.failure_details)
 
 
 def test_unexpected_forwarder_exception_releases_probe_and_completes_attempt(
@@ -909,6 +951,61 @@ def test_deepseek_chat_completion_records_final_usage_before_done(
     assert activity.total_tokens == 22
 
 
+def test_azure_stream_uses_long_finite_read_timeout(
+    routed_app, requests_mock, monkeypatch
+):
+    """Allow long Azure reasoning pauses while retaining a finite timeout."""
+    requests_mock.post(
+        AZURE,
+        content=(
+            event(
+                {"type": "response.output_text.delta", "delta": "answer"},
+                "response.output_text.delta",
+            )
+            + event(
+                {"type": "response.completed", "response": {"usage": {}}},
+                "response.completed",
+            )
+        ),
+        headers={"Content-Type": "text/event-stream"},
+    )
+    seen_timeouts = []
+    request = requests.request
+
+    def capture_timeout(**kwargs):
+        seen_timeouts.append(kwargs.get("timeout"))
+        return request(**kwargs)
+
+    monkeypatch.setattr("app.azure.adapter.requests.request", capture_timeout)
+
+    response = post(routed_app)
+
+    assert response.status_code == 200
+    assert seen_timeouts == [(10.0, 300.0)]
+    assert b"Provider stream interrupted" not in response.data
+
+
+def test_openai_stream_keeps_provider_read_timeout(
+    routed_app, requests_mock, monkeypatch
+):
+    """Keep the Azure-specific long timeout off OpenAI-compatible providers."""
+    requests_mock.post(AZURE, status_code=503)
+    requests_mock.post(OPENAI, content=successful_chat("gpt-5.4"))
+    seen_timeouts = []
+    request = requests.post
+
+    def capture_timeout(*args, **kwargs):
+        seen_timeouts.append(kwargs.get("timeout"))
+        return request(*args, **kwargs)
+
+    monkeypatch.setattr("app.providers.openai_compat.requests.post", capture_timeout)
+
+    response = post(routed_app, model="openai/gpt-5.4")
+
+    assert response.status_code == 200
+    assert seen_timeouts == [(10.0, 30.0)]
+
+
 def test_connect_timeout_is_retryable_but_read_timeout_is_not(
     routed_app, requests_mock
 ):
@@ -920,6 +1017,62 @@ def test_connect_timeout_is_retryable_but_read_timeout_is_not(
     assert requests_mock.call_count == 2
 
 
+def test_native_model_routes_to_provider_that_lists_it_without_default_fallback(
+    routed_app, requests_mock
+):
+    """Route a provider-native model ID directly to its catalog owner."""
+    with routed_app.extensions["database"].sessions.begin() as session:
+        for profile in session.scalars(
+            select(ProviderProfile).where(ProviderProfile.tenant_id == "acme")
+        ):
+            if profile.provider != "deepseek":
+                profile.route_priority = None
+        deepseek = session.scalar(
+            select(ProviderProfile).where(ProviderProfile.provider == "deepseek")
+        )
+        deepseek.route_priority = 1
+        deepseek.display_name = "Research Team"
+        deepseek.default_model = "deepseek-flash"
+        replace_catalog_entries(session, deepseek, [("deepseek-flash", None)], None)
+
+    requests_mock.post(
+        DEEPSEEK,
+        content=successful_chat("deepseek-flash"),
+        headers={"Content-Type": "text/event-stream"},
+    )
+
+    response = post(routed_app, model="deepseek-flash")
+
+    assert response.status_code == 200, response.get_data(as_text=True)
+    assert [request.url for request in requests_mock.request_history] == [DEEPSEEK]
+    assert requests_mock.request_history[0].json()["model"] == "deepseek-flash"
+
+
+def test_qualified_account_model_pins_provider_and_forwards_native_model(
+    routed_app, requests_mock
+):
+    """An explicit account alias selects one profile without cross-provider failover."""
+    with routed_app.extensions["database"].sessions.begin() as session:
+        openrouter_profile = session.scalar(
+            select(ProviderProfile).where(ProviderProfile.provider == "openrouter")
+        )
+        openrouter_profile.display_name = "Research Team"
+        openrouter_profile.default_model = "anthropic/model-x"
+        replace_catalog_entries(
+            session, openrouter_profile, [("anthropic/model-x", None)], None
+        )
+
+    requests_mock.post(OPENROUTER, status_code=503)
+    requests_mock.post(OPENAI, content=successful_chat("gpt-5.4"))
+    model_id = qualified_model_id("openrouter", "Research Team", "anthropic/model-x")
+
+    response = post(routed_app, model=model_id)
+
+    assert response.status_code == 503
+    assert [request.url for request in requests_mock.request_history] == [OPENROUTER]
+    assert requests_mock.request_history[0].json()["model"] == "anthropic/model-x"
+
+
 def test_unknown_model_rejected_before_upstream(routed_app, requests_mock):
     """Reject unmapped models without contacting any provider."""
     response = post(routed_app, model="unmapped-model")
@@ -927,17 +1080,12 @@ def test_unknown_model_rejected_before_upstream(routed_app, requests_mock):
     assert requests_mock.call_count == 0
 
 
-def test_azure_catalog_model_uses_provider_cascade_after_rate_limit(
+def test_native_azure_model_does_not_fall_back_to_other_profiles_defaults(
     routed_app, requests_mock
 ):
-    """Fail over from a native Azure catalog ID using each provider's model."""
-    requests_mock.post(AZURE, status_code=429)
+    """A failed native model is not replaced with another provider's default."""
+    requests_mock.post(AZURE, status_code=401)
     requests_mock.post(OPENAI, status_code=429)
-    requests_mock.post(
-        OPENROUTER,
-        content=successful_chat("openrouter-configured-model"),
-        headers={"Content-Type": "text/event-stream"},
-    )
     with routed_app.extensions["database"].sessions.begin() as session:
         openai_profile = session.scalar(
             select(ProviderProfile).where(ProviderProfile.provider == "openai")
@@ -956,24 +1104,15 @@ def test_azure_catalog_model_uses_provider_cascade_after_rate_limit(
 
     response = post(routed_app, model="gpt-5.4")
 
-    assert response.status_code == 200
-    assert b"success" in response.data
-    assert [r.url for r in requests_mock.request_history] == [
-        AZURE,
-        OPENAI,
-        OPENROUTER,
-    ]
-    assert [r.json()["model"] for r in requests_mock.request_history] == [
-        "azure-deployment",
-        "openai-configured-model",
-        "openrouter-configured-model",
-    ]
+    assert response.status_code == 401
+    assert [request.url for request in requests_mock.request_history] == [AZURE]
+    assert requests_mock.request_history[0].json()["model"] == "azure-deployment"
 
 
-def test_native_model_does_not_bypass_higher_priority_provider(
+def test_native_model_routes_only_to_profiles_listing_that_model(
     routed_app, requests_mock
 ):
-    """Keep configured provider order even when a later catalog has the model."""
+    """A native model bypasses profiles whose catalogs do not list the model."""
     with routed_app.extensions["database"].sessions.begin() as session:
         openai_profile = session.scalar(
             select(ProviderProfile).where(ProviderProfile.provider == "openai")
@@ -995,15 +1134,14 @@ def test_native_model_does_not_bypass_higher_priority_provider(
     response = post(routed_app, model="openai-native-model")
 
     assert response.status_code == 200
-    assert [request.url for request in requests_mock.request_history] == [AZURE, OPENAI]
-    assert requests_mock.request_history[0].json()["model"] == "azure-deployment"
-    assert requests_mock.request_history[1].json()["model"] == "openai-native-model"
+    assert [request.url for request in requests_mock.request_history] == [OPENAI]
+    assert requests_mock.request_history[0].json()["model"] == "openai-native-model"
 
 
-def test_native_openrouter_model_does_not_bypass_higher_priority_providers(
+def test_native_openrouter_model_routes_only_to_profiles_listing_that_model(
     routed_app, requests_mock
 ):
-    """A later provider's native model must not override route priority."""
+    """A native model only tries providers whose catalogs expose that ID."""
     with routed_app.extensions["database"].sessions.begin() as session:
         openrouter_profile = session.scalar(
             select(ProviderProfile).where(ProviderProfile.provider == "openrouter")
@@ -1026,56 +1164,68 @@ def test_native_openrouter_model_does_not_bypass_higher_priority_providers(
     response = post(routed_app, model="native-openrouter-model")
 
     assert response.status_code == 200
-    assert [request.url for request in requests_mock.request_history] == [
-        AZURE,
-        OPENAI,
-        OPENROUTER,
-    ]
-    assert requests_mock.request_history[0].json()["model"] == "azure-deployment"
-    assert requests_mock.request_history[1].json()["model"] == "gpt-5.4"
-    assert requests_mock.request_history[2].json()["model"] == "native-openrouter-model"
+    assert [request.url for request in requests_mock.request_history] == [OPENROUTER]
+    assert requests_mock.request_history[0].json()["model"] == "native-openrouter-model"
 
 
-def test_native_openrouter_model_falls_back_after_higher_priority_attempts_fail(
+def test_native_model_fails_over_only_between_matching_profiles(
     routed_app, requests_mock
 ):
-    """Preserve native-model selection and continue the ordered cascade on errors."""
-    activate_deepseek_profile(routed_app)
-    with routed_app.extensions["database"].sessions.begin() as session:
-        openrouter_profile = session.scalar(
+    """A native ID retries matching profiles, never unrelated profile defaults."""
+    database = routed_app.extensions["database"]
+    with database.sessions.begin() as session:
+        tenant = session.get(Tenant, "acme")
+        primary = session.scalar(
             select(ProviderProfile).where(ProviderProfile.provider == "openrouter")
         )
         replace_catalog_entries(
             session,
-            openrouter_profile,
+            primary,
             [("anthropic/claude-sonnet-4", None), ("native-openrouter-model", None)],
             None,
         )
+        secondary = create_provider_profile(
+            session,
+            database.secret_cipher,
+            "acme",
+            "openrouter",
+            "OpenRouter Backup",
+            {},
+            "native-openrouter-model",
+            "openrouter-backup-secret",
+            "ada",
+        )
+        replace_catalog_entries(
+            session, secondary, [("native-openrouter-model", None)], None
+        )
+        activate_provider_profile(session, tenant, secondary.id, "ada")
 
-    requests_mock.post(AZURE, status_code=429)
-    requests_mock.post(OPENAI, status_code=503)
-    requests_mock.post(OPENROUTER, status_code=429)
     requests_mock.post(
-        DEEPSEEK,
-        content=successful_chat("deepseek-v4-flash"),
-        headers={"Content-Type": "text/event-stream"},
+        OPENROUTER,
+        response_list=[
+            {"status_code": 429},
+            {
+                "status_code": 200,
+                "headers": {"Content-Type": "text/event-stream"},
+                "content": successful_chat("native-openrouter-model"),
+            },
+        ],
     )
 
     response = post(routed_app, model="native-openrouter-model")
 
     assert response.status_code == 200
     assert [request.url for request in requests_mock.request_history] == [
-        AZURE,
-        OPENAI,
         OPENROUTER,
-        DEEPSEEK,
+        OPENROUTER,
     ]
     assert [request.json()["model"] for request in requests_mock.request_history] == [
-        "azure-deployment",
-        "gpt-5.4",
         "native-openrouter-model",
-        "deepseek-v4-flash",
+        "native-openrouter-model",
     ]
+    assert requests_mock.request_history[1].headers["Authorization"] == (
+        "Bearer openrouter-backup-secret"
+    )
 
 
 def test_azure_only_route_rejects_other_provider_catalog_model(
@@ -1326,9 +1476,23 @@ def test_same_provider_profiles_are_independent_failover_candidates(
     assert requests_mock.request_history[-1].json()["model"] == model
 
 
-def test_models_route_does_not_call_upstream(routed_app, requests_mock):
-    """List the logical tenant model without upstream requests."""
+def test_models_route_lists_native_and_qualified_ids_without_upstream(
+    routed_app, requests_mock
+):
+    """List selectable catalog IDs and account aliases without upstream requests."""
     response = routed_app.test_client().get("/v1/models", headers=AUTH)
+    model_ids = [model["id"] for model in response.json["data"]]
+
     assert response.status_code == 200
-    assert response.json["data"][0]["id"] == "cursor-acme-model"
+    assert model_ids[0] == "cursor-acme-model"
+    assert "gpt-5.4" in model_ids
+    assert "openrouter:openrouter/anthropic/claude-sonnet-4" in model_ids
+    azure_response = routed_app.test_client().get("/azure/v1/models", headers=AUTH)
+    azure_ids = [model["id"] for model in azure_response.json["data"]]
+    assert azure_ids == [
+        "cursor-acme-model",
+        "gpt-5.4",
+        "azure/gpt-5.4",
+        "azure:azure/gpt-5.4",
+    ]
     assert requests_mock.call_count == 0

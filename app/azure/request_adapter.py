@@ -361,6 +361,7 @@ class RequestAdapter:
         self.adapter.activity_provider = None
         self.adapter.activity_profile_id = None
         self.adapter.activity_routed_model = None
+        self.adapter.resume_stream = False
 
         # Parse request body (Cursor sometimes sends malformed payloads)
         payload = req.get_json(silent=True, force=False)
@@ -514,6 +515,13 @@ class RequestAdapter:
         # Matching Codex CLI: store=True for Azure enables server-side
         # response storage which is used for prompt caching.
         responses_body["store"] = True
+        resume_stream = (
+            isinstance(tenant, DatabaseTenantSnapshot)
+            and tenant.provider_settings.get("resume_streams") is True
+        )
+        if resume_stream:
+            responses_body["background"] = True
+        self.adapter.resume_stream = resume_stream
 
         # Forward the include field (e.g. ["reasoning.encrypted_content"])
         # so Azure returns all the data Cursor expects.

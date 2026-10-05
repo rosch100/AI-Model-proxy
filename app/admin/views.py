@@ -1752,6 +1752,7 @@ def _profile_form(
         provider=profile.provider,
         display_name=profile.display_name or "",
         base_url=str(profile.settings.get("base_url", "")),
+        resume_streams=profile.settings.get("resume_streams") is True,
         default_model=profile.default_model or "",
         organization=str(profile.settings.get("organization", "")),
         project=str(profile.settings.get("project", "")),
@@ -1782,7 +1783,10 @@ def _provider_settings(form: ProviderProfileForm) -> dict[str, object]:
     """Extract only fields belonging to the chosen provider."""
     provider = form.provider.data
     if provider == "azure":
-        return {"base_url": validate_azure_base_url(form.base_url.data)}
+        return {
+            "base_url": validate_azure_base_url(form.base_url.data),
+            "resume_streams": bool(form.resume_streams.data),
+        }
     if provider == "openai":
         return {
             "organization": form.organization.data or "",

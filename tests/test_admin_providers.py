@@ -633,6 +633,75 @@ def test_older_catalog_refresh_cannot_overwrite_newer_refresh(admin_app, monkeyp
         )
 
 
+def test_azure_profile_editor_exposes_opt_in_and_persists_it(admin_app):
+    """Render the Azure resume setting and preserve it when editing the profile."""
+    database = admin_app.extensions["database"]
+    with database.sessions.begin() as session:
+        account = authenticate_admin(session, "ada", "correct-horse-battery")
+        insert_passkey(
+            session,
+            account_id=account.id,
+            credential_id=secrets.token_bytes(32),
+            public_key=secrets.token_bytes(64),
+            sign_count=0,
+            user_handle=secrets.token_bytes(32),
+            label="Primary",
+            aaguid=None,
+            backed_up=False,
+        )
+        principal = create_admin_session(session, account, enrollment_only=False)
+        profile = ProviderProfile(
+            id="azure-resume-setting",
+            tenant_id="acme",
+            provider="azure",
+            display_name="Azure Production",
+            settings={
+                "base_url": "https://resource.openai.azure.com",
+                "model_deployments": {"gpt-5.4": "gpt-5.4"},
+                "resume_streams": True,
+            },
+            default_model="gpt-5.4",
+            inference_secret_ciphertext=database.secret_cipher.encrypt("azure-key"),
+        )
+        session.add(profile)
+        profile_id = profile.id
+
+    client = admin_app.test_client()
+    client.set_cookie(ADMIN_COOKIE_NAME, principal.token, path="/admin")
+    response = client.get(f"/admin/settings/connection/{profile_id}/edit")
+    body = response.get_data(as_text=True)
+
+    assert response.status_code == 200
+    assert "Azure-Streams bei Verbindungsabbruch fortsetzen" in body
+    assert "höhere First-Token-Latenz" in body
+    assert re.search(
+        r'<input(?=[^>]*name="resume_streams")(?=[^>]*type="checkbox")'
+        r"(?=[^>]*checked)[^>]*>",
+        body,
+    )
+
+    csrf_token = re.search(
+        r'name="csrf_token" type="hidden" value="([^\"]+)"', body
+    ).group(1)
+    updated = client.post(
+        f"/admin/settings/connection/{profile_id}/edit",
+        data={
+            "csrf_token": csrf_token,
+            "provider": "azure",
+            "display_name": "Azure Production",
+            "base_url": "https://resource.openai.azure.com",
+            "resume_streams": "y",
+            "default_model": "gpt-5.4",
+            "api_key": "",
+        },
+    )
+
+    assert updated.status_code == 302
+    with database.sessions() as session:
+        saved_profile = session.get(ProviderProfile, profile_id)
+        assert saved_profile.settings["resume_streams"] is True
+
+
 def test_provider_profile_form_requires_azure_base_url_but_not_for_openrouter(
     admin_app,
 ):

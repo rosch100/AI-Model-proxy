@@ -26,6 +26,7 @@ from app.providers.circuit_breaker import (
     retry_after_header,
 )
 from app.providers.failover_upstream import UpstreamError
+from app.providers.model_ids import account_model_id, qualified_model_id
 from app.providers.openai_compat import forward_openai_compatible
 from app.tenants import DatabaseTenantRoutingSnapshot, DatabaseTenantSnapshot
 
@@ -102,34 +103,58 @@ def _route_targets(
         raise ServiceConfigurationError(
             "Request model must match the tenant's Cursor model ID."
         )
-    requested_model = (
-        inbound_model.casefold() if inbound_model != custom_model_id else None
-    )
-    if requested_model is not None and not any(
-        requested_model == model.casefold()
+    if inbound_model == custom_model_id:
+        route_targets = []
+        for profile in profiles:
+            if profile.default_model is None:
+                raise ServiceConfigurationError(
+                    "The active provider profile has no default model configured."
+                )
+            route_targets.append((profile, profile.default_model))
+        return tuple(route_targets)
+
+    requested_model = inbound_model.casefold()
+    native_targets = [
+        (profile, model)
         for profile in profiles
         for model in profile.catalog_model_ids
-    ):
+        if model.casefold() == requested_model
+    ]
+    if native_targets:
+        return tuple(native_targets)
+
+    qualified_targets = [
+        (profile, model)
+        for profile in profiles
+        if profile.provider is not None and profile.profile_name is not None
+        for model in profile.catalog_model_ids
+        if qualified_model_id(profile.provider, profile.profile_name, model).casefold()
+        == requested_model
+    ]
+    if len(qualified_targets) == 1:
+        return (qualified_targets[0],)
+    if len(qualified_targets) > 1:
         raise ServiceConfigurationError(
-            "Request model must match the tenant's Cursor model ID."
+            "Provider-qualified model ID is ambiguous; check provider account names."
         )
 
-    targets = []
-    for profile in profiles:
-        target = next(
-            (
-                model
-                for model in profile.catalog_model_ids
-                if requested_model is not None and model.casefold() == requested_model
-            ),
-            profile.default_model,
+    account_targets = [
+        (profile, model)
+        for profile in profiles
+        if profile.profile_name is not None
+        for model in profile.catalog_model_ids
+        if account_model_id(profile.profile_name, model).casefold() == requested_model
+    ]
+    if len(account_targets) == 1:
+        return (account_targets[0],)
+    if len(account_targets) > 1:
+        raise ServiceConfigurationError(
+            "Account-qualified model ID is ambiguous; include its provider name."
         )
-        if target is None:
-            raise ServiceConfigurationError(
-                "The active provider profile has no default model configured."
-            )
-        targets.append((profile, target))
-    return tuple(targets)
+
+    raise ServiceConfigurationError(
+        "Request model must match the tenant's Cursor model ID."
+    )
 
 
 def _forward_profile(
@@ -146,6 +171,25 @@ def _forward_profile(
     if forwarder is None:
         raise ServiceConfigurationError(f"Unsupported provider {profile.provider!r}.")
     return forwarder(req, profile, target_model, attempt_id, circuit_attempt)
+
+
+def _provider_failure_details(error: UpstreamError) -> dict[str, object]:
+    """Return only the classified and allowlisted fields for attempt storage."""
+    details: dict[str, object] = {"error_code": error.code}
+    for key in (
+        "provider_error_code",
+        "provider_error_type",
+        "provider_error_param",
+        "provider_limit_source",
+        "provider_request_id",
+    ):
+        value = getattr(error, key)
+        if value is not None:
+            details[key] = value
+    provider_diagnostics = getattr(error, "provider_diagnostics", None)
+    if isinstance(provider_diagnostics, dict) and provider_diagnostics:
+        details["provider_diagnostics"] = provider_diagnostics
+    return details
 
 
 def _service_unavailable(code: str, message: str, retry_after: str) -> Response:
@@ -258,7 +302,10 @@ def forward_tenant_route(
                         profile.profile_id,
                     )
             complete_provider_attempt(
-                attempt_id, outcome="failure", status_code=exc.status
+                attempt_id,
+                outcome="failure",
+                status_code=exc.status,
+                failure_details=_provider_failure_details(exc),
             )
             last_retryable_error = exc
             if exc.classification.category == "transient":

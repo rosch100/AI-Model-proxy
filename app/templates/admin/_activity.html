@@ -82,6 +82,9 @@
                 <td class="activity-token-cell">
                   {% if row.kind == "failure" %}
                     <strong>{{ row.outcome_label }}</strong>
+                    {% if row.failure_details_label %}
+                      <span class="activity-provider-label">{{ row.failure_details_label }}</span>
+                    {% endif %}
                   {% elif row.total_tokens_label %}
                     <strong>{{ row.total_tokens_label }}</strong>
                     <span class="activity-token-breakdown">Eingabe: {{ row.input_tokens_label }} · Ausgabe: {{ row.output_tokens_label }}</span>

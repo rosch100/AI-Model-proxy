@@ -19,6 +19,7 @@ from .common.recording import (
     record_payload,
 )
 from .exceptions import ConfigurationError, ServiceConfigurationError
+from .providers.model_ids import tenant_catalog_model_ids
 from .providers.routing import forward_tenant_route, routed_profiles
 from .tenants import (
     AUTH_MODE_TENANT,
@@ -106,7 +107,11 @@ def _azure_model_ids() -> list[str]:
         profiles = routed_profiles(
             tenant, azure_only=_is_explicit_azure_path(request.path)
         )
-        return [tenant.custom_model_id] if profiles else []
+        return list(
+            tenant_catalog_model_ids(
+                profiles, azure_only=_is_explicit_azure_path(request.path)
+            )
+        )
     if tenant is not None:
         return list(tenant.azure_model_deployments)
     if current_app.config.get("AUTH_MODE") == AUTH_MODE_TENANT:

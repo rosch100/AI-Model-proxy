@@ -107,6 +107,7 @@ class ProviderProfileForm(FlaskForm):
         "Name des Kontos *", validators=[DataRequired(), Length(max=128)]
     )
     base_url = StringField("Azure-Adresse *")
+    resume_streams = BooleanField("Azure-Streams bei Verbindungsabbruch fortsetzen")
     default_model = SelectField(
         "Standardmodell",
         validators=[Optional(), Length(max=256)],

@@ -541,10 +541,13 @@ class ProviderAttemptEvent(Base):
     profile_id: Mapped[str] = mapped_column(
         ForeignKey("provider_profiles.id", ondelete="CASCADE"), nullable=False
     )
-    inbound_model: Mapped[str] = mapped_column(String(256), nullable=False)
+    inbound_model: Mapped[str] = mapped_column(String(2048), nullable=False)
     routed_model: Mapped[str] = mapped_column(String(256), nullable=False)
     outcome: Mapped[str] = mapped_column(String(16), nullable=False)
     status_code: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    failure_details: Mapped[dict[str, object] | None] = mapped_column(
+        JSON, nullable=True
+    )
     occurred_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False
     )
@@ -641,7 +644,7 @@ class InferenceActivityEvent(Base):
     profile_id: Mapped[str | None] = mapped_column(
         ForeignKey("provider_profiles.id", ondelete="SET NULL"), nullable=True
     )
-    inbound_model: Mapped[str] = mapped_column(String(256), nullable=False)
+    inbound_model: Mapped[str] = mapped_column(String(2048), nullable=False)
     routed_model: Mapped[str | None] = mapped_column(String(256), nullable=True)
     input_tokens: Mapped[int | None] = mapped_column(Integer, nullable=True)
     output_tokens: Mapped[int | None] = mapped_column(Integer, nullable=True)

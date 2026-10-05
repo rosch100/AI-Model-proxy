@@ -3,12 +3,15 @@
 from __future__ import annotations
 
 import json
+import logging
 import math
 import random
 import re
 import time
 from dataclasses import dataclass
+from functools import partial
 from typing import Any, Optional
+from urllib.parse import quote
 
 import requests
 from flask import Request, Response
@@ -17,7 +20,6 @@ from ..common.logging import console
 from ..common.recording import record_payload
 from ..providers.circuit_breaker import ProviderCircuitAttempt
 from ..providers.failover_upstream import (
-    ROUTED_READ_TIMEOUT_SECONDS,
     prepare_upstream,
     transport_failure,
 )
@@ -27,12 +29,14 @@ from ..tenants import DatabaseTenantSnapshot
 from .request_adapter import RequestAdapter
 from .response_adapter import ResponseAdapter
 
+AZURE_ROUTED_READ_TIMEOUT_SECONDS = 300.0
 MAX_AZURE_RETRY_DELAY_SECONDS = 60.0
 MIN_AZURE_RATE_LIMIT_DELAY_SECONDS = 15.0
 
 # Shared per-deployment cooldown so concurrent Cursor streams do not retry
 # into an already exhausted Azure token window.
 _rate_limit_not_before: dict[str, float] = {}
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -71,6 +75,7 @@ class AzureAdapter:
         self.activity_profile_id: str | None = None
         self.activity_routed_model: str | None = None
         self.activity_settings: dict[str, Any] = {}
+        self.resume_stream = False
 
     # Public API
     def forward(
@@ -111,7 +116,7 @@ class AzureAdapter:
         request_kwargs = self.request_adapter.adapt(
             req, snapshot, target_model=target_model
         )
-        request_kwargs["timeout"] = (10.0, ROUTED_READ_TIMEOUT_SECONDS)
+        request_kwargs["timeout"] = (10.0, AZURE_ROUTED_READ_TIMEOUT_SECONDS)
         try:
             upstream = requests.request(**request_kwargs)
         except requests.RequestException as exc:
@@ -133,9 +138,70 @@ class AzureAdapter:
             prepared,
             activity_attempt_id=attempt_id,
             circuit_attempt=circuit_attempt,
+            resume_stream=(
+                partial(self._resume_azure_response, request_kwargs)
+                if self.resume_stream
+                else None
+            ),
+            cancel_response=(
+                partial(self._cancel_azure_response, request_kwargs)
+                if self.resume_stream
+                else None
+            ),
         )
         response.call_on_close(prepared.close)
         return response
+
+    @staticmethod
+    def _resume_azure_response(
+        request_kwargs: dict[str, Any], response_id: str, sequence_number: int
+    ) -> requests.Response:
+        """Resume one stored Azure response after its last delivered event."""
+        url = f"{request_kwargs['url'].rstrip('/')}/{quote(response_id, safe='')}"
+        headers = {
+            key: value
+            for key, value in request_kwargs["headers"].items()
+            if key.casefold()
+            not in {"content-length", "content-type", "transfer-encoding", "expect"}
+        }
+        return requests.get(
+            url,
+            headers=headers,
+            params={"stream": "true", "starting_after": sequence_number},
+            stream=True,
+            timeout=(10.0, AZURE_ROUTED_READ_TIMEOUT_SECONDS),
+        )
+
+    @staticmethod
+    def _cancel_azure_response(
+        request_kwargs: dict[str, Any], response_id: str
+    ) -> None:
+        """Cancel a stored Azure response after streaming cannot continue."""
+        url = (
+            f"{request_kwargs['url'].rstrip('/')}"
+            f"/{quote(response_id, safe='')}/cancel"
+        )
+        headers = {
+            key: value
+            for key, value in request_kwargs["headers"].items()
+            if key.casefold() not in {"content-length", "transfer-encoding", "expect"}
+        }
+        try:
+            response = requests.post(
+                url,
+                headers=headers,
+                timeout=(10.0, 10.0),
+            )
+            try:
+                response.raise_for_status()
+            finally:
+                response.close()
+        except requests.RequestException as exc:
+            logger.warning(
+                "Azure response cancellation failed: response_id=%s error_type=%s",
+                response_id,
+                type(exc).__name__,
+            )
 
     def _request_upstream(
         self, request_context: AzureRequestContext

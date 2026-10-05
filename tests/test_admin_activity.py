@@ -338,7 +338,11 @@ def test_dashboard_lists_failures_with_requests_in_selected_period(admin_app):
                 inbound_model="gpt-6-luna",
                 routed_model="openai/gpt-6-luna",
                 outcome="failure",
-                status_code=402,
+                status_code=200,
+                failure_details={
+                    "error_code": "stream_interrupted",
+                    "exception_type": "ReadTimeout",
+                },
                 occurred_at=occurred_at,
                 completed_at=occurred_at + timedelta(seconds=1),
             )
@@ -350,7 +354,9 @@ def test_dashboard_lists_failures_with_requests_in_selected_period(admin_app):
     assert "OpenRouter · Altanis Proxy" in body
     assert "Angefragt: gpt-6-luna" in body
     assert "An Provider gesendet: <code>openai/gpt-6-luna</code>" in body
-    assert "Provider-Versuch fehlgeschlagen · HTTP 402" in body
+    assert "Provider-Versuch fehlgeschlagen · HTTP 200" in body
+    assert "stream_interrupted" in body
+    assert "ReadTimeout" in body
     assert "Neueste Einträge zuerst · 2 Einträge" in body
     assert body.index("Fehlgeschlagener Provider-Versuch") < body.index(
         "<strong>gpt-6-luna</strong>"

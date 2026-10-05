@@ -4,7 +4,9 @@ This module defines the application blueprint, configures logging, and
 forwards incoming HTTP requests to the configured backend implementation.
 """
 
-from flask import Blueprint, current_app, jsonify, request
+import uuid
+
+from flask import Blueprint, current_app, g, jsonify, request
 
 from .auth import current_tenant, is_tenant_auth_mode, require_auth
 from .azure.adapter import AzureAdapter
@@ -24,6 +26,22 @@ from .tenants import (
 )
 
 blueprint = Blueprint("blueprint", __name__)
+
+
+@blueprint.before_app_request
+def assign_proxy_request_id() -> None:
+    """Assign a server-generated correlation ID to every incoming request."""
+    g.proxy_request_id = uuid.uuid4().hex
+
+
+@blueprint.after_app_request
+def expose_proxy_request_id(response):
+    """Return the correlation ID for matching a client report to server logs."""
+    request_id = getattr(g, "proxy_request_id", None)
+    if request_id is not None:
+        response.headers["X-Proxy-Request-ID"] = request_id
+    return response
+
 
 ALL_METHODS = [
     "GET",

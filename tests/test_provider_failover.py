@@ -186,7 +186,7 @@ def test_quota_paused_profile_is_skipped_before_attempt_and_uses_fallback(
 
 
 def test_http_quota_failure_is_recorded_once_and_pauses_next_request(
-    routed_app, requests_mock
+    routed_app, requests_mock, mocker
 ):
     """One upstream quota response advances backoff once and blocks its retry."""
     database = routed_app.extensions["database"]
@@ -205,12 +205,37 @@ def test_http_quota_failure_is_recorded_once_and_pauses_next_request(
         )
         openai_profile.route_priority = 1
 
+    warning = mocker.patch.object(routed_app.logger, "warning")
     requests_mock.post(
         OPENAI,
         status_code=429,
-        json={"error": {"code": "insufficient_quota", "message": "private"}},
+        json={
+            "error": {
+                "code": "insufficient_quota",
+                "type": "insufficient_quota",
+                "param": "model",
+                "message": "private provider prose and secret must not be logged",
+                "metadata": {
+                    "limit_source": "openrouter_key_limit",
+                    "secret": "provider-secret-do-not-log",
+                },
+            }
+        },
+        headers={"x-request-id": "req_1234567890abcdef12345678"},
     )
     first = post(routed_app)
+
+    assert warning.call_count == 1
+    template, *arguments = warning.call_args.args
+    formatted_warning = template % tuple(arguments)
+    assert "provider_error_code=insufficient_quota" in formatted_warning
+    assert "provider_error_type=insufficient_quota" in formatted_warning
+    assert "provider_error_param=model" in formatted_warning
+    assert "provider_limit_source=openrouter_key_limit" in formatted_warning
+    assert "provider_request_id=req_1234567890abcdef12345678" in formatted_warning
+    assert "error_category=quota_exhausted" in formatted_warning
+    assert "private provider prose" not in formatted_warning
+    assert "provider-secret-do-not-log" not in formatted_warning
 
     snapshot = database.get_proxy_snapshot_by_api_key("cursor-key")
     profile = snapshot.profiles[0]

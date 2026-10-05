@@ -5,6 +5,7 @@ from unittest.mock import Mock
 
 import pytest
 import requests
+from flask import g
 from urllib3.exceptions import MaxRetryError, NewConnectionError, ReadTimeoutError
 
 from app.providers import failover_upstream
@@ -94,6 +95,180 @@ def test_http_error_retains_classification(status, retryable):
     assert caught.value.status == status
     assert caught.value.retryable is retryable
     response.close.assert_called_once()
+
+
+def test_http_failure_keeps_safe_structured_diagnostics_without_provider_text():
+    """Retain exact structured error identifiers but never raw error payloads."""
+    response = upstream(
+        [
+            json.dumps(
+                {
+                    "error": {
+                        "code": "invalid_request_error",
+                        "type": "invalid_request_error",
+                        "param": "messages[0].content",
+                        "message": "private prompt fragment must not be logged",
+                        "metadata": {
+                            "limit_source": "openrouter_key_limit",
+                            "raw": "secret raw vendor payload",
+                        },
+                    }
+                }
+            ).encode()
+        ],
+        status=400,
+    )
+    response.headers["x-request-id"] = "req_1234567890abcdef12345678"
+
+    with pytest.raises(failover_upstream.UpstreamError) as caught:
+        failover_upstream.prepare_upstream(response, provider="openrouter")
+
+    failure = caught.value
+    assert failure.provider_error_code == "invalid_request_error"
+    assert failure.provider_error_type == "invalid_request_error"
+    assert failure.provider_error_param == "messages[0].content"
+    assert failure.provider_limit_source == "openrouter_key_limit"
+    assert failure.provider_request_id == "req_1234567890abcdef12345678"
+    assert "private prompt fragment" not in repr(failure)
+    assert "secret raw vendor payload" not in repr(failure)
+
+
+def test_indexed_provider_parameter_path_is_retained():
+    """Retain recognized parameter paths with valid message indexes."""
+    response = upstream(
+        [
+            json.dumps(
+                {
+                    "error": {
+                        "code": "invalid_request_error",
+                        "param": "messages[7].content",
+                    }
+                }
+            ).encode()
+        ],
+        status=400,
+    )
+
+    with pytest.raises(failover_upstream.UpstreamError) as caught:
+        failover_upstream.prepare_upstream(response, provider="openai")
+
+    assert caught.value.provider_error_param == "messages[7].content"
+
+
+def test_sensitive_shaped_provider_error_identifiers_are_not_retained():
+    """Do not log arbitrary token-like values merely because their charset is safe."""
+    response = upstream(
+        [
+            json.dumps(
+                {
+                    "error": {
+                        "code": "sk-secret-credential",
+                        "type": "sk-secret-credential",
+                        "param": "model.sk-secret-credential",
+                    }
+                }
+            ).encode()
+        ],
+        status=400,
+    )
+    response.headers["x-request-id"] = "sk-secret-credential"
+
+    with pytest.raises(failover_upstream.UpstreamError) as caught:
+        failover_upstream.prepare_upstream(response, provider="openai")
+
+    failure = caught.value
+    assert failure.provider_error_code is None
+    assert failure.provider_error_type is None
+    assert failure.provider_error_param is None
+    assert failure.provider_request_id is None
+    assert "sk-secret-credential" not in repr(failure)
+
+
+@pytest.mark.parametrize("header", ["apim-request-id", "x-ms-request-id"])
+def test_azure_request_id_header_is_captured(header):
+    """Retain Azure's support correlation header in safe diagnostics."""
+    response = upstream(
+        [json.dumps({"error": {"code": "invalid_request_error"}}).encode()],
+        status=400,
+    )
+    response.headers[header] = "123e4567-e89b-12d3-a456-426614174000"
+
+    with pytest.raises(failover_upstream.UpstreamError) as caught:
+        failover_upstream.prepare_upstream(response, provider="azure")
+
+    assert caught.value.provider_request_id == "123e4567-e89b-12d3-a456-426614174000"
+
+
+def test_sse_failure_logs_safe_provider_diagnostics(app, mocker):
+    """Log structured failure identifiers discovered in a streamed SSE error."""
+    response = upstream(
+        [
+            event({"choices": [{"delta": {"content": "partial"}}]}),
+            event(
+                {
+                    "error": {
+                        "code": "rate_limit_exceeded",
+                        "message": "private provider prose",
+                        "metadata": {"limit_source": "openrouter_in_flight_budget"},
+                    }
+                },
+                "error",
+            ),
+        ]
+    )
+    warning = mocker.patch.object(app.logger, "warning")
+
+    with app.test_request_context("/v1/chat/completions"):
+        g.proxy_request_id = "proxy-correlation-1"
+        body = b"".join(
+            failover_upstream.chat_stream(
+                failover_upstream.prepare_upstream(response),
+                "cursor-model",
+                provider="openrouter",
+            )
+        )
+
+    assert warning.call_count == 1
+    template, *arguments = warning.call_args.args
+    formatted_warning = template % tuple(arguments)
+    assert "request_id=proxy-correlation-1" in formatted_warning
+    assert "provider_error_code=rate_limit_exceeded" in formatted_warning
+    assert "provider_limit_source=openrouter_in_flight_budget" in formatted_warning
+    assert "private provider prose" not in formatted_warning
+    assert b"private provider prose" not in body
+
+
+def test_stream_transport_failure_logs_exception_type_without_exception_text(
+    app, mocker
+):
+    """Log the transport failure class without exposing URLs or exception text."""
+    response = upstream([])
+
+    def interrupted_stream():
+        yield event({"choices": [{"delta": {"content": "partial"}}]})
+        raise requests.ReadTimeout("secret-upstream-url-and-token")
+
+    response.iter_content.return_value = interrupted_stream()
+    warning = mocker.patch.object(app.logger, "warning")
+
+    with app.test_request_context("/v1/chat/completions"):
+        g.proxy_request_id = "proxy-correlation-2"
+        body = b"".join(
+            failover_upstream.chat_stream(
+                failover_upstream.prepare_upstream(response),
+                "cursor-model",
+                provider="openai",
+            )
+        )
+
+    assert warning.call_count == 1
+    template, *arguments = warning.call_args.args
+    formatted_warning = template % tuple(arguments)
+    assert "request_id=proxy-correlation-2" in formatted_warning
+    assert "provider=openai" in formatted_warning
+    assert "error_type=ReadTimeout" in formatted_warning
+    assert "secret-upstream-url-and-token" not in formatted_warning
+    assert b"stream_interrupted" in body
 
 
 def test_payment_required_sse_error_is_retryable_without_opening_quota_breaker():

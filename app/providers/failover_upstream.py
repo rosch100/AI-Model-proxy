@@ -4,8 +4,9 @@ from __future__ import annotations
 
 import json
 import math
+import re
 import time
-from collections.abc import Iterator
+from collections.abc import Iterator, Mapping
 from concurrent.futures import Future, ThreadPoolExecutor
 from concurrent.futures import TimeoutError as FutureTimeoutError
 from dataclasses import dataclass, field
@@ -13,7 +14,7 @@ from itertools import chain
 from typing import Any
 
 import requests
-from flask import Response, jsonify
+from flask import Response, current_app, g, has_request_context, jsonify
 from urllib3.exceptions import MaxRetryError, NewConnectionError
 
 from app.common.sse import SSEDecoder, SSEEvent
@@ -101,6 +102,109 @@ _LIFECYCLE_EVENTS = frozenset(
 )
 
 
+_SAFE_PROVIDER_ERROR_CODES = frozenset(_ERROR_CODE_STATUSES)
+_SAFE_PROVIDER_ERROR_TYPES = _SAFE_PROVIDER_ERROR_CODES | frozenset(
+    {"provider_error", "error", "too_many_requests", "rate_limited"}
+)
+_SAFE_PROVIDER_ERROR_PARAMS = frozenset(
+    {
+        "model",
+        "messages",
+        "input",
+        "max_tokens",
+        "max_completion_tokens",
+        "temperature",
+        "top_p",
+        "stream",
+        "tools",
+        "tool_choice",
+        "response_format",
+        "reasoning_effort",
+    }
+)
+_PROVIDER_PARAMETER_PATH = re.compile(
+    r"(?:messages|input)\[\d{1,4}\]\.(?:content|role)\Z"
+)
+_PROVIDER_REQUEST_ID_PATTERNS = (
+    re.compile(r"req_[0-9a-f]{24,64}\Z", re.IGNORECASE),
+    re.compile(r"gen-[0-9a-f-]{32,36}\Z", re.IGNORECASE),
+    re.compile(r"[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}\Z", re.IGNORECASE),
+)
+_OPENROUTER_LIMIT_SOURCES = frozenset(
+    {"openrouter_key_limit", "openrouter_in_flight_budget"}
+)
+_PROVIDER_REQUEST_ID_HEADERS = (
+    "x-request-id",
+    "request-id",
+    "openai-request-id",
+    "x-openrouter-request-id",
+    "apim-request-id",
+    "x-ms-request-id",
+)
+
+
+def _recognized_provider_request_id(headers: Mapping[str, Any]) -> str | None:
+    """Retain a provider correlation ID only when it matches a known format."""
+    for header in _PROVIDER_REQUEST_ID_HEADERS:
+        value = headers.get(header)
+        if isinstance(value, str) and any(
+            pattern.fullmatch(value.strip())
+            for pattern in _PROVIDER_REQUEST_ID_PATTERNS
+        ):
+            return value.strip()
+    return None
+
+
+def _recognized_error_value(
+    value: object, allowed_values: frozenset[str]
+) -> str | None:
+    """Retain only known provider error codes or types."""
+    if not isinstance(value, str):
+        return None
+    normalized = value.strip().casefold()
+    return normalized if normalized in allowed_values else None
+
+
+def _recognized_error_parameter(value: object) -> str | None:
+    """Retain known field names and bounded indexed message/input paths."""
+    if not isinstance(value, str):
+        return None
+    normalized = value.strip().casefold()
+    if normalized in _SAFE_PROVIDER_ERROR_PARAMS:
+        return normalized
+    return normalized if _PROVIDER_PARAMETER_PATH.fullmatch(normalized) else None
+
+
+def _provider_error_details(
+    error: dict[str, Any], headers: Any
+) -> dict[str, str | None]:
+    """Extract only allowlisted scalar diagnostic fields from an upstream error."""
+    metadata = error.get("metadata")
+    limit_source = metadata.get("limit_source") if isinstance(metadata, dict) else None
+    normalized_headers = (
+        {str(key).casefold(): value for key, value in headers.items()}
+        if isinstance(headers, Mapping)
+        else {}
+    )
+    request_id = _recognized_provider_request_id(normalized_headers)
+    safe_limit_source = (
+        limit_source
+        if isinstance(limit_source, str) and limit_source in _OPENROUTER_LIMIT_SOURCES
+        else None
+    )
+    return {
+        "provider_error_code": _recognized_error_value(
+            error.get("code"), _SAFE_PROVIDER_ERROR_CODES
+        ),
+        "provider_error_type": _recognized_error_value(
+            error.get("type"), _SAFE_PROVIDER_ERROR_TYPES
+        ),
+        "provider_error_param": _recognized_error_parameter(error.get("param")),
+        "provider_limit_source": safe_limit_source,
+        "provider_request_id": request_id,
+    }
+
+
 @dataclass
 class UpstreamError(Exception):
     """An explicit attempt failure, never a successful dummy response."""
@@ -112,6 +216,11 @@ class UpstreamError(Exception):
     classification: UpstreamErrorClassification = field(
         default_factory=lambda: UpstreamErrorClassification("unknown")
     )
+    provider_error_code: str | None = None
+    provider_error_type: str | None = None
+    provider_error_param: str | None = None
+    provider_limit_source: str | None = None
+    provider_request_id: str | None = None
 
     def response(self) -> Response:
         """Return a safe JSON error before any SSE headers have been committed."""
@@ -168,6 +277,7 @@ def transport_failure(exc: requests.RequestException) -> UpstreamError:
         "upstream_connection_failed",
         "Provider connection failed. The request was not replayed if its outcome was uncertain.",
         safe_connection_failure,
+        provider_error_type=type(exc).__name__,
     )
 
 
@@ -179,6 +289,7 @@ def _error_failure(
     headers: Any = None,
     settings: Any = None,
 ) -> UpstreamError:
+    diagnostics = _provider_error_details(error, headers)
     raw_code = str(error.get("code") or error.get("type") or "upstream_error")
     metadata = error.get("metadata")
     limit_source = metadata.get("limit_source") if isinstance(metadata, dict) else None
@@ -210,6 +321,7 @@ def _error_failure(
                     "upstream_error",
                     "Provider returned a streaming error.",
                     False,
+                    **diagnostics,
                 )
     classification = classify_upstream_error(
         provider or "unknown", status, error, headers, settings
@@ -222,6 +334,7 @@ def _error_failure(
         or status == 402
         or classification.category in {"quota_exhausted", "transient"},
         classification,
+        **diagnostics,
     )
 
 
@@ -489,6 +602,24 @@ def chat_stream(
                     status_code = failure.status
                     if circuit_attempt is not None:
                         circuit_attempt.failed(failure.classification)
+                    if has_request_context():
+                        current_app.logger.warning(
+                            "Provider stream failed: request_id=%s provider=%s "
+                            "status=%s error_code=%s error_category=%s "
+                            "provider_error_code=%s provider_error_type=%s "
+                            "provider_error_param=%s provider_limit_source=%s "
+                            "provider_request_id=%s",
+                            getattr(g, "proxy_request_id", "unavailable"),
+                            provider or "unknown",
+                            failure.status,
+                            failure.code,
+                            failure.classification.category,
+                            failure.provider_error_code or "unknown",
+                            failure.provider_error_type or "unknown",
+                            failure.provider_error_param or "unknown",
+                            failure.provider_limit_source or "unknown",
+                            failure.provider_request_id or "unknown",
+                        )
                 if isinstance(data, dict):
                     parsed_usage = parse_provider_usage(data.get("usage"))
                     if parsed_usage is not None:
@@ -500,8 +631,15 @@ def chat_stream(
                     + json.dumps(data, separators=(",", ":"), ensure_ascii=False)
                     + "\n\n"
                 ).encode("utf-8")
-    except requests.RequestException:
+    except requests.RequestException as exc:
         outcome = "failure"
+        if has_request_context():
+            current_app.logger.warning(
+                "Provider stream interrupted: request_id=%s provider=%s error_type=%s",
+                getattr(g, "proxy_request_id", "unavailable"),
+                provider or "unknown",
+                type(exc).__name__,
+            )
         yield (
             b'data: {"error":{"code":"stream_interrupted",'
             b'"message":"Provider stream interrupted; not replayed."}}\n\n'

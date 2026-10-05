@@ -6,6 +6,7 @@ from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
+from typing import Literal
 
 from app.persistence.inference_activity import (
     ACTIVITY_LOOKBACK_HOURS,
@@ -117,11 +118,12 @@ class ActivityRequestRow:
     total_tokens_label: str | None
     input_tokens_label: str | None
     output_tokens_label: str | None
+    kind: Literal["request"] = "request"
 
 
 @dataclass(frozen=True)
 class FailedProviderAttemptRow:
-    """One failed upstream attempt, separate from completed user requests."""
+    """One failed upstream attempt included in the activity list."""
 
     provider_label: str
     profile_name: str | None
@@ -131,6 +133,7 @@ class FailedProviderAttemptRow:
     time_label: str
     status_code: int | None
     outcome_label: str
+    kind: Literal["failure"] = "failure"
 
 
 @dataclass(frozen=True)
@@ -161,6 +164,7 @@ class ActivityBoard:
     providers: tuple[ProviderActivityGroup, ...]
     request_period_hours: int
     failed_attempts: tuple[FailedProviderAttemptRow, ...] = ()
+    entries: tuple[ActivityRequestRow | FailedProviderAttemptRow, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -955,8 +959,21 @@ def activity_board(
     prepared_failures = tuple(
         _failed_provider_attempt_row(attempt, profile_name)
         for attempt, profile_name in sorted(
-            failed_attempts,
+            (
+                item
+                for item in failed_attempts
+                if request_start
+                <= _aware_utc(item[0].completed_at or item[0].occurred_at)
+                <= clock
+            ),
             key=lambda item: _aware_utc(item[0].completed_at or item[0].occurred_at),
+            reverse=True,
+        )[:_ACTIVITY_REQUEST_LIST_LIMIT]
+    )
+    entries = tuple(
+        sorted(
+            (*request_rows, *prepared_failures),
+            key=lambda row: row.occurred_at,
             reverse=True,
         )[:_ACTIVITY_REQUEST_LIST_LIMIT]
     )
@@ -985,4 +1002,5 @@ def activity_board(
         providers=tuple(providers),
         request_period_hours=request_period_hours,
         failed_attempts=prepared_failures,
+        entries=entries,
     )

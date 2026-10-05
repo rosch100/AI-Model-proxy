@@ -56,5 +56,8 @@ class TestModels:
         ]
 
     def test_health_endpoint_returns_200(self, testapp):
-        """Ensure /health endpoint returns HTTP 200 without auth."""
-        testapp.get("/health", status=200)
+        """Ensure /health endpoint returns a server-generated request ID."""
+        response = testapp.get("/health", status=200)
+        request_id = response.headers["X-Proxy-Request-ID"]
+        assert len(request_id) == 32
+        assert all(character in "0123456789abcdef" for character in request_id)

@@ -327,11 +327,15 @@ def test_openrouter_catalog_parses_decimal_json_without_float_rounding(requests_
         "https://openrouter.ai/api/v1/models",
         text=(
             '{"data":[{"id":"precise","pricing":{"prompt":0.000000123456789123,'
-            '"completion":0.000000000000001,"input_cache_read":0.0000005}}]}'
+            '"completion":0.000000000000001,"input_cache_read":0.0000005}},'
+            '{"id":"too-precise","pricing":{"prompt":1e-70,'
+            '"completion":1e-70,"input_cache_read":1e-70}}]}'
         ),
     )
 
-    _, pricing = refresh_provider_catalog_with_pricing("openrouter", {}, "secret")
+    entries, pricing = refresh_provider_catalog_with_pricing("openrouter", {}, "secret")
+    assert entries == [("precise", None), ("too-precise", None)]
+    assert set(pricing) == {"precise"}
     assert pricing["precise"]["input_per_1m_tokens"] == "0.123456789123"
     assert pricing["precise"]["output_per_1m_tokens"] == "0.000000001"
     assert pricing["precise"]["cache_per_1m_tokens"] == "0.5"

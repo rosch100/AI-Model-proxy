@@ -128,7 +128,7 @@ from app.providers.azure_url import validate_azure_base_url
 from app.providers.catalog import (
     CatalogRefreshError,
     azure_deployments_from_catalog,
-    refresh_provider_catalog,
+    refresh_provider_catalog_with_pricing,
     selectable_catalog_models,
 )
 from app.providers.cost_jobs import (
@@ -612,6 +612,37 @@ def _failed_provider_attempts(
     return tuple(session.execute(statement).all())
 
 
+def _catalog_model_ids_by_profile(
+    session, profiles: tuple[ProviderProfile, ...]
+) -> dict[str, tuple[str, ...]]:
+    """Load each profile's selectable model IDs for readiness status."""
+    profile_by_id = {profile.id: profile for profile in profiles}
+    if not profile_by_id:
+        return {}
+    rows = session.execute(
+        select(
+            ProviderCatalogEntry.profile_id,
+            ProviderCatalogEntry.model_id,
+            ProviderCatalogEntry.deployment_id,
+        )
+        .where(ProviderCatalogEntry.profile_id.in_(profile_by_id))
+        .order_by(ProviderCatalogEntry.model_id)
+    )
+    entries_by_profile: dict[str, list[tuple[str, str | None]]] = {}
+    for profile_id, model_id, deployment_id in rows:
+        entries_by_profile.setdefault(profile_id, []).append((model_id, deployment_id))
+    return {
+        profile_id: tuple(
+            model_id
+            for model_id, _deployment_id in selectable_catalog_models(
+                profile_by_id[profile_id].provider,
+                entries_by_profile.get(profile_id, ()),
+            )
+        )
+        for profile_id in profile_by_id
+    }
+
+
 def _activity_events(
     session, tenant_id: str, lookback_hours: int, *, limit: int | None = None
 ):
@@ -651,6 +682,7 @@ def dashboard():
                 .order_by(ProviderProfile.provider, ProviderProfile.display_name)
             )
         )
+        catalog_model_ids_by_profile = _catalog_model_ids_by_profile(session, profiles)
         bindings = tuple(
             session.execute(
                 select(ProviderProfile, ProviderScopeBinding, ProviderScopeNode)
@@ -763,6 +795,7 @@ def dashboard():
             request_period_hours=activity_hours,
             provider_attempts=provider_attempts,
             failed_attempts=failed_attempts,
+            catalog_model_ids_by_profile=catalog_model_ids_by_profile,
         )
         session.expunge_all()
     return render_template(
@@ -790,6 +823,7 @@ def dashboard_provider_status():
                 .order_by(ProviderProfile.provider, ProviderProfile.display_name)
             )
         )
+        catalog_model_ids_by_profile = _catalog_model_ids_by_profile(session, profiles)
         activity_events = _latest_provider_activity_events(session, tenant.id)
         provider_attempts = _provider_attempt_events(session, tenant.id)
         circuit_scopes_by_profile = _provider_circuit_scopes_by_profile(
@@ -802,6 +836,7 @@ def dashboard_provider_status():
             provider_attempts=provider_attempts,
             circuit_scopes_by_profile=circuit_scopes_by_profile,
             include_activity_board=False,
+            catalog_model_ids_by_profile=catalog_model_ids_by_profile,
         )
         session.expunge_all()
     return render_template("admin/_provider_status.html", view=view)
@@ -980,7 +1015,12 @@ def create_connection():
             ),
             400,
         )
-    flash("Konto gespeichert. Es ist noch nicht für Anfragen aktiviert.", "info")
+    flash(
+        "Konto gespeichert. Es ist noch nicht in der Standardkaskade; "
+        "nach dem Laden der Modellliste kann es direkt per Modellkennung "
+        "verwendet oder der Kaskade hinzugefügt werden.",
+        "info",
+    )
     return redirect(url_for("admin.settings_connection"))
 
 
@@ -1106,14 +1146,14 @@ def activate_connection(profile_id: str):
             "error",
         )
         return redirect(url_for("admin.settings_connection"))
-    flash("Konto für Anfragen aktiviert.", "info")
+    flash("Konto zur Standardkaskade hinzugefügt.", "info")
     return redirect(url_for("admin.settings_connection"))
 
 
 @admin_bp.post("/settings/connection/deactivate")
 @login_required
 def deactivate_connection():
-    """Explicitly disable proxy forwarding by clearing the active profile."""
+    """Clear the default route while preserving direct catalog-model routing."""
     form = DeactivateProviderForm()
     if not form.validate_on_submit():
         return "Bad Request", 400
@@ -1136,8 +1176,8 @@ def deactivate_connection():
         for profile_id in profile_ids:
             deactivate_provider_profile(session, tenant, profile_id, g.admin.username)
     flash(
-        "Kein Konto ist aktiv. Anfragen über den Proxy sind erst wieder möglich, "
-        "wenn du ein Konto aktivierst.",
+        "Die Standardkaskade ist leer. Konten bleiben gespeichert und können "
+        "weiterhin direkt über ihre Modellkennung angesprochen werden.",
         "warning",
     )
     return redirect(url_for("admin.settings_connection"))
@@ -1156,7 +1196,11 @@ def deactivate_connection_profile(profile_id: str):
             deactivate_provider_profile(session, tenant, profile_id, g.admin.username)
         except LookupError:
             return "Not Found", 404
-    flash("Konto aus der Reihenfolge entfernt.", "info")
+    flash(
+        "Konto aus der Standardkaskade entfernt. Es bleibt gespeichert und "
+        "über seine Modellkennung direkt nutzbar.",
+        "info",
+    )
     return redirect(url_for("admin.settings_connection"))
 
 
@@ -1211,10 +1255,13 @@ def refresh_catalog(profile_id: str):
         profile.catalog_generation += 1
         catalog_generation = profile.catalog_generation
     try:
-        entries = refresh_provider_catalog(provider, settings, secret)
+        entries, pricing = refresh_provider_catalog_with_pricing(
+            provider, settings, secret
+        )
         error = None
     except CatalogRefreshError as exc:
         entries = []
+        pricing = {}
         error = str(exc)
     with database.sessions.begin() as session:
         tenant = session.scalar(
@@ -1246,7 +1293,7 @@ def refresh_catalog(profile_id: str):
             )
             return redirect(url_for("admin.settings_connection"))
         was_routed = profile.route_priority is not None
-        replace_catalog_entries(session, profile, entries, error)
+        replace_catalog_entries(session, profile, entries, error, pricing)
         if error is None and provider == "azure":
             deployments = azure_deployments_from_catalog(entries)
             profile.settings = {**profile.settings, "model_deployments": deployments}

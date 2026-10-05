@@ -156,6 +156,190 @@ def test_azure_error_immediately_uses_second_provider(
     ]
 
 
+def test_transient_rate_limit_retries_same_provider_before_returning_503(
+    routed_app, requests_mock, mocker
+):
+    """Recover a one-profile route when a transient rate limit clears shortly."""
+    with routed_app.extensions["database"].sessions.begin() as session:
+        profiles = tuple(
+            session.scalars(
+                select(ProviderProfile).where(ProviderProfile.tenant_id == "acme")
+            )
+        )
+        for profile in profiles:
+            profile.route_priority = None
+        session.flush()
+        openai_profile = next(
+            profile for profile in profiles if profile.provider == "openai"
+        )
+        openai_profile.route_priority = 1
+
+    requests_mock.post(
+        OPENAI,
+        [
+            {
+                "status_code": 429,
+                "headers": {"Retry-After": "1"},
+                "json": {"error": {"code": "rate_limit_exceeded"}},
+            },
+            {
+                "content": successful_chat("gpt-5.4"),
+                "headers": {"Content-Type": "text/event-stream"},
+            },
+        ],
+    )
+    sleep = mocker.patch("app.providers.routing.cooperative_sleep")
+
+    response = post(routed_app)
+
+    assert response.status_code == 200
+    assert b'"model":"cursor-acme-model"' in response.data
+    assert [request.url for request in requests_mock.request_history] == [
+        OPENAI,
+        OPENAI,
+    ]
+    sleep.assert_called_once_with(pytest.approx(1.0, abs=0.01))
+
+
+def test_transient_rate_limit_without_retry_after_uses_default_delay(
+    routed_app, requests_mock, mocker
+):
+    """Use a short default delay when a transient 429 omits Retry-After."""
+    with routed_app.extensions["database"].sessions.begin() as session:
+        profiles = tuple(
+            session.scalars(
+                select(ProviderProfile).where(ProviderProfile.tenant_id == "acme")
+            )
+        )
+        for profile in profiles:
+            profile.route_priority = None
+        session.flush()
+        openai_profile = next(
+            profile for profile in profiles if profile.provider == "openai"
+        )
+        openai_profile.route_priority = 1
+
+    requests_mock.post(
+        OPENAI,
+        [
+            {"status_code": 429, "json": {"error": {"code": "rate_limit_exceeded"}}},
+            {
+                "content": successful_chat("gpt-5.4"),
+                "headers": {"Content-Type": "text/event-stream"},
+            },
+        ],
+    )
+    sleep = mocker.patch("app.providers.routing.cooperative_sleep")
+
+    response = post(routed_app)
+
+    assert response.status_code == 200
+    assert requests_mock.call_count == 2
+    sleep.assert_called_once_with(pytest.approx(1.0, abs=0.01))
+
+
+def test_transient_rate_limit_retries_once_then_returns_temporary_unavailable(
+    routed_app, requests_mock, mocker
+):
+    """Bound same-provider retries and report transient exhaustion accurately."""
+    with routed_app.extensions["database"].sessions.begin() as session:
+        profiles = tuple(
+            session.scalars(
+                select(ProviderProfile).where(ProviderProfile.tenant_id == "acme")
+            )
+        )
+        for profile in profiles:
+            profile.route_priority = None
+        session.flush()
+        openai_profile = next(
+            profile for profile in profiles if profile.provider == "openai"
+        )
+        openai_profile.route_priority = 1
+
+    rate_limited = {
+        "status_code": 429,
+        "headers": {"Retry-After": "1"},
+        "json": {"error": {"code": "rate_limit_exceeded"}},
+    }
+    requests_mock.post(OPENAI, [rate_limited, rate_limited])
+    sleep = mocker.patch("app.providers.routing.cooperative_sleep")
+
+    response = post(routed_app)
+
+    assert response.status_code == 503
+    assert response.json["error"]["code"] == "provider_temporarily_unavailable"
+    assert response.headers["Retry-After"] == "1"
+    assert len(requests_mock.request_history) == 2
+    sleep.assert_called_once()
+
+
+def test_rate_limit_retry_after_beyond_budget_does_not_hold_request(
+    routed_app, requests_mock, mocker
+):
+    """Do not hold a synchronous request beyond the bounded retry budget."""
+    with routed_app.extensions["database"].sessions.begin() as session:
+        profiles = tuple(
+            session.scalars(
+                select(ProviderProfile).where(ProviderProfile.tenant_id == "acme")
+            )
+        )
+        for profile in profiles:
+            profile.route_priority = None
+        session.flush()
+        openai_profile = next(
+            profile for profile in profiles if profile.provider == "openai"
+        )
+        openai_profile.route_priority = 1
+
+    requests_mock.post(
+        OPENAI,
+        status_code=429,
+        headers={"Retry-After": "31"},
+        json={"error": {"code": "rate_limit_exceeded"}},
+    )
+    sleep = mocker.patch("app.providers.routing.cooperative_sleep")
+
+    response = post(routed_app)
+
+    assert response.status_code == 503
+    assert response.json["error"]["code"] == "provider_temporarily_unavailable"
+    assert response.headers["Retry-After"] == "31"
+    assert requests_mock.call_count == 1
+    sleep.assert_not_called()
+
+
+def test_hard_quota_exhaustion_is_not_retried_on_same_profile(
+    routed_app, requests_mock, mocker
+):
+    """A structured exhausted quota opens its breaker instead of being replayed."""
+    with routed_app.extensions["database"].sessions.begin() as session:
+        profiles = tuple(
+            session.scalars(
+                select(ProviderProfile).where(ProviderProfile.tenant_id == "acme")
+            )
+        )
+        for profile in profiles:
+            profile.route_priority = None
+        session.flush()
+        openai_profile = next(
+            profile for profile in profiles if profile.provider == "openai"
+        )
+        openai_profile.route_priority = 1
+
+    requests_mock.post(
+        OPENAI,
+        status_code=429,
+        json={"error": {"code": "insufficient_quota"}},
+    )
+    sleep = mocker.patch("app.providers.routing.cooperative_sleep")
+
+    response = post(routed_app)
+
+    assert response.status_code == 429
+    assert requests_mock.call_count == 1
+    sleep.assert_not_called()
+
+
 def test_quota_paused_profile_is_skipped_before_attempt_and_uses_fallback(
     routed_app, requests_mock
 ):
@@ -319,7 +503,7 @@ def test_transient_error_retry_after_respects_blocked_profile_cooldown(
     response = post(routed_app)
 
     assert response.status_code == 503
-    assert response.json["error"]["code"] == "provider_quota_unavailable"
+    assert response.json["error"]["code"] == "provider_temporarily_unavailable"
     assert response.headers["Retry-After"] == expected_retry_after
     assert [request.url for request in requests_mock.request_history] == [OPENAI]
 
@@ -566,7 +750,7 @@ def test_openrouter_inflight_budget_returns_retry_after_to_client(
     response = post(routed_app)
 
     assert response.status_code == 503
-    assert response.json["error"]["code"] == "provider_quota_unavailable"
+    assert response.json["error"]["code"] == "provider_temporarily_unavailable"
     assert response.headers["Retry-After"] == "120"
     assert requests_mock.call_count == 1
     with database.sessions() as session:
@@ -606,6 +790,75 @@ def test_terminal_openrouter_402_keeps_retry_after_without_transient_failure(
     assert requests_mock.call_count == 1
     with database.sessions() as session:
         assert session.scalar(select(ProviderCircuitState)) is None
+
+
+def test_all_probe_leases_are_retried_after_lease_expiry(
+    routed_app, requests_mock, mocker
+):
+    """Wait through concurrent half-open probes and recover within the budget."""
+    database = routed_app.extensions["database"]
+    snapshot = database.get_proxy_snapshot_by_api_key("cursor-key")
+    breaker = ProviderCircuitBreakerStore(database.sessions, database.secret_cipher)
+    now = datetime.now(timezone.utc)
+    for profile in snapshot.profiles:
+        scopes = breaker.scopes_for_profile(
+            snapshot.id, profile.provider, profile.profile_id, profile.provider_settings
+        )
+        for scope in scopes:
+            breaker.open_quota(scope, now=now - timedelta(hours=2))
+        assert breaker.acquire(scopes, now=now).allowed
+
+    clock = [now]
+    datetime_mock = mocker.patch(
+        "app.persistence.provider_circuit_breaker.datetime", wraps=datetime
+    )
+    datetime_mock.now.side_effect = lambda *_args, **_kwargs: clock[0]
+    routing_datetime_mock = mocker.patch(
+        "app.providers.routing.datetime", wraps=datetime
+    )
+    routing_datetime_mock.now.side_effect = lambda *_args, **_kwargs: clock[0]
+    clock[0] += timedelta(seconds=29.5)
+    mocker.patch(
+        "app.providers.routing.monotonic",
+        side_effect=lambda: (clock[0] - now).total_seconds(),
+    )
+    sleep = mocker.patch(
+        "app.providers.routing.cooperative_sleep",
+        side_effect=lambda seconds: clock.__setitem__(
+            0, clock[0] + timedelta(seconds=seconds)
+        ),
+    )
+    requests_mock.post(
+        AZURE,
+        content=(
+            event(
+                {"type": "response.output_text.delta", "delta": "recovered"},
+                "response.output_text.delta",
+            )
+            + event(
+                {"type": "response.completed", "response": {}}, "response.completed"
+            )
+        ),
+        headers={"Content-Type": "text/event-stream"},
+    )
+    for url, model in (
+        (OPENAI, "gpt-5.4"),
+        (OPENROUTER, "anthropic/claude-sonnet-4"),
+        (DEEPSEEK, "deepseek-v4-flash"),
+    ):
+        requests_mock.post(
+            url,
+            content=successful_chat(model),
+            headers={"Content-Type": "text/event-stream"},
+        )
+
+    response = post(routed_app)
+
+    assert response.status_code == 200, response.get_data(as_text=True)
+    assert len(requests_mock.request_history) == 1
+    sleep.assert_called_once()
+    assert sleep.call_args.args[0] == pytest.approx(0.5)
+    assert sleep.call_count <= 60
 
 
 def test_all_quota_paused_profiles_return_service_unavailable(
@@ -723,9 +976,12 @@ def test_exhausted_route_returns_retryable_unavailable_after_transient_failures(
     requests_mock.post(DEEPSEEK, status_code=402)
     response = post(routed_app)
     assert response.status_code == 503
-    assert response.json["error"]["code"] == "provider_quota_unavailable"
+    assert response.json["error"]["code"] == "provider_temporarily_unavailable"
     assert response.headers["Retry-After"] == expected_retry_after
-    assert requests_mock.call_count == 4
+    expected_urls = [AZURE, OPENAI, OPENROUTER, DEEPSEEK]
+    if openai_retry_after is None:
+        expected_urls.append(OPENAI)
+    assert [request.url for request in requests_mock.request_history] == expected_urls
 
 
 def test_deepseek_http_402_uses_next_profile_without_leaking_credentials(
@@ -1048,6 +1304,43 @@ def test_native_model_routes_to_provider_that_lists_it_without_default_fallback(
     assert requests_mock.request_history[0].json()["model"] == "deepseek-flash"
 
 
+def test_unrouted_provider_model_is_selectable_by_native_and_qualified_id(
+    routed_app, requests_mock
+):
+    """Explicit catalog IDs select ready profiles outside the default route."""
+    database = routed_app.extensions["database"]
+    with database.sessions.begin() as session:
+        deepseek = session.scalar(
+            select(ProviderProfile).where(ProviderProfile.provider == "deepseek")
+        )
+        deepseek.display_name = "DeepSeek Test"
+        deepseek.default_model = "deepseek-flash"
+        replace_catalog_entries(session, deepseek, [("deepseek-flash", None)], None)
+
+    models_response = routed_app.test_client().get("/v1/models", headers=AUTH)
+    model_ids = [model["id"] for model in models_response.json["data"]]
+    assert "deepseek-flash" in model_ids
+    assert "deepseek:DeepSeek Test/deepseek-flash" in model_ids
+
+    requests_mock.post(
+        DEEPSEEK,
+        content=successful_chat("deepseek-flash"),
+        headers={"Content-Type": "text/event-stream"},
+    )
+    for model_id in ("deepseek-flash", "deepseek:DeepSeek Test/deepseek-flash"):
+        response = post(routed_app, model=model_id)
+        assert response.status_code == 200, response.get_data(as_text=True)
+
+    assert [request.url for request in requests_mock.request_history] == [
+        DEEPSEEK,
+        DEEPSEEK,
+    ]
+    assert [request.json()["model"] for request in requests_mock.request_history] == [
+        "deepseek-flash",
+        "deepseek-flash",
+    ]
+
+
 def test_qualified_account_model_pins_provider_and_forwards_native_model(
     routed_app, requests_mock
 ):
@@ -1295,7 +1588,7 @@ def test_azure_catalog_model_success_does_not_call_fallbacks(routed_app, request
 
 
 def test_explicit_azure_uses_second_azure_profile_before_failing(
-    routed_app, requests_mock
+    routed_app, requests_mock, mocker
 ):
     """An explicit Azure route cascades among active Azure profiles only."""
     database = routed_app.extensions["database"]
@@ -1332,6 +1625,7 @@ def test_explicit_azure_uses_second_azure_profile_before_failing(
     requests_mock.post(AZURE, status_code=429)
     requests_mock.post(backup_url, status_code=503)
     requests_mock.post(OPENAI, status_code=200)
+    mocker.patch("app.providers.routing.cooperative_sleep")
 
     response = post(routed_app, path="/azure/v1/chat/completions")
 
@@ -1339,9 +1633,11 @@ def test_explicit_azure_uses_second_azure_profile_before_failing(
     assert [request.url for request in requests_mock.request_history] == [
         AZURE,
         backup_url,
+        AZURE,
     ]
     assert requests_mock.request_history[0].headers["api-key"] == "azure-secret"
     assert requests_mock.request_history[1].headers["api-key"] == "backup-secret"
+    assert requests_mock.request_history[2].headers["api-key"] == "azure-secret"
 
 
 def test_root_route_cascades_between_active_azure_profiles(routed_app, requests_mock):

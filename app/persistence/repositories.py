@@ -97,7 +97,6 @@ class TenantRepository:
             .outerjoin(
                 ProviderProfile,
                 (ProviderProfile.tenant_id == Tenant.id)
-                & ProviderProfile.route_priority.is_not(None)
                 & ProviderProfile.deleted_at.is_(None),
             )
             .outerjoin(
@@ -105,7 +104,11 @@ class TenantRepository:
                 ProviderCatalogEntry.profile_id == ProviderProfile.id,
             )
             .where(Tenant.api_key_hash == digest)
-            .order_by(ProviderProfile.route_priority, ProviderCatalogEntry.id)
+            .order_by(
+                ProviderProfile.route_priority.is_(None),
+                ProviderProfile.route_priority,
+                ProviderCatalogEntry.id,
+            )
             .execution_options(populate_existing=True)
         ).all()
         if not rows:
@@ -115,6 +118,7 @@ class TenantRepository:
             return None
 
         catalogs: dict[str, list[tuple[str, str | None]]] = {}
+        pricing: dict[str, dict[str, dict[str, str]]] = {}
         profiles: dict[str, ProviderProfile] = {}
         for _tenant, profile, entry in rows:
             if profile is None:
@@ -123,7 +127,25 @@ class TenantRepository:
             catalog = catalogs.setdefault(profile.id, [])
             if entry is not None:
                 catalog.append((entry.model_id, entry.deployment_id))
+                if all(
+                    value is not None
+                    for value in (
+                        entry.input_price_per_1m_tokens,
+                        entry.output_price_per_1m_tokens,
+                        entry.cache_price_per_1m_tokens,
+                        entry.pricing_currency,
+                        entry.pricing_source,
+                    )
+                ):
+                    pricing.setdefault(profile.id, {})[entry.model_id] = {
+                        "input_per_1m_tokens": entry.input_price_per_1m_tokens,
+                        "output_per_1m_tokens": entry.output_price_per_1m_tokens,
+                        "cache_per_1m_tokens": entry.cache_price_per_1m_tokens,
+                        "currency": entry.pricing_currency,
+                        "source": entry.pricing_source,
+                    }
         snapshots = []
+        available_snapshots = []
         for profile in profiles.values():
             try:
                 validate_routed_profile(profile, catalogs[profile.id])
@@ -131,34 +153,38 @@ class TenantRepository:
                 if not secret.strip():
                     continue
             except (ValueError, InvalidTag):
-                # Invalid route members cannot be used; never invent another model.
+                # Invalid profiles cannot be used; never invent another model.
                 continue
-            snapshots.append(
-                DatabaseTenantSnapshot(
-                    id=tenant.id,
-                    api_key_hash=tenant.api_key_hash,
-                    custom_model_id=tenant.custom_model_id,
-                    provider=profile.provider,
-                    provider_settings=deepcopy(profile.settings),
-                    inference_secret=secret,
-                    default_model=profile.default_model,
-                    profile_id=profile.id,
-                    profile_name=profile.display_name,
-                    history_generation=profile.history_generation,
-                    profile_deleted=False,
-                    catalog_model_ids=tuple(
-                        model
-                        for model, _ in selectable_catalog_models(
-                            profile.provider, catalogs[profile.id]
-                        )
-                    ),
-                )
+            snapshot = DatabaseTenantSnapshot(
+                id=tenant.id,
+                api_key_hash=tenant.api_key_hash,
+                custom_model_id=tenant.custom_model_id,
+                provider=profile.provider,
+                provider_settings=deepcopy(profile.settings),
+                inference_secret=secret,
+                default_model=profile.default_model,
+                profile_id=profile.id,
+                profile_name=profile.display_name,
+                history_generation=profile.history_generation,
+                profile_deleted=False,
+                catalog_model_ids=tuple(
+                    model
+                    for model, _ in selectable_catalog_models(
+                        profile.provider, catalogs[profile.id]
+                    )
+                ),
+                catalog_pricing=pricing.get(profile.id, {}),
+                catalog_refreshed_at=profile.catalog_refreshed_at,
             )
+            available_snapshots.append(snapshot)
+            if profile.route_priority is not None:
+                snapshots.append(snapshot)
         return DatabaseTenantRoutingSnapshot(
             id=tenant.id,
             api_key_hash=tenant.api_key_hash,
             custom_model_id=tenant.custom_model_id,
             profiles=tuple(snapshots),
+            available_profiles=tuple(available_snapshots),
         )
 
     def get_admin_snapshot(

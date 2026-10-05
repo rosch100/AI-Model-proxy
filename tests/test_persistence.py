@@ -210,6 +210,43 @@ def test_provider_circuit_migration_is_postgresql_only_and_has_atomic_identity(
     assert "scope_id" not in generated_sql
 
 
+def test_provider_catalog_pricing_migration_adds_nullable_columns(monkeypatch):
+    """Add normalized optional prices to provider catalog rows."""
+    project_root = Path(__file__).resolve().parents[1]
+    monkeypatch.setenv(
+        "DATABASE_URL", "postgresql+psycopg://user:password@localhost/proxy"
+    )
+    output = StringIO()
+    config = Config(str(project_root / "alembic.ini"), output_buffer=output)
+    config.set_main_option("script_location", str(project_root / "migrations"))
+    migration_context = MigrationContext.configure(
+        dialect_name="postgresql",
+        opts={"as_sql": True, "output_buffer": output},
+    )
+    script = ScriptDirectory.from_config(config)
+    migration = script.get_revision("20261012_catalog_pricing").module
+
+    assert migration.down_revision == "20261011_attempt_diagnostics"
+    with Operations.context(migration_context):
+        migration.upgrade()
+
+    generated_sql = output.getvalue()
+    for column in (
+        "input_price_per_1m_tokens",
+        "output_price_per_1m_tokens",
+        "cache_price_per_1m_tokens",
+        "pricing_currency",
+        "pricing_source",
+    ):
+        statement = next(
+            line
+            for line in generated_sql.splitlines()
+            if f"ADD COLUMN {column} " in line
+        )
+        assert " VARCHAR(" in statement
+        assert " NOT NULL" not in statement
+
+
 def test_model_id_length_downgrade_uses_sqlalchemy_identifier_expressions(monkeypatch):
     """Use identifier-aware SQLAlchemy expressions for static table names."""
     project_root = Path(__file__).resolve().parents[1]

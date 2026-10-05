@@ -12,6 +12,7 @@ from app.persistence.admin_auth import authenticate_admin, create_admin_session
 from app.persistence.models import (
     CostRefreshJob,
     CostUsageRecord,
+    ProviderCatalogEntry,
     ProviderProfile,
     ProviderScopeBinding,
     ProviderScopeNode,
@@ -108,13 +109,14 @@ def test_dashboard_shows_status_for_each_same_provider_account(admin_app):
                     inference_secret_ciphertext="encrypted-backup",
                 ),
                 ProviderProfile(
-                    id="openai-disabled-dashboard",
+                    id="deepseek-outside-cascade-dashboard",
                     tenant_id="acme",
-                    provider="openai",
-                    display_name="Disabled OpenAI",
+                    provider="deepseek",
+                    display_name="DeepSeek Direct",
                     settings={},
-                    default_model="gpt-5.4",
-                    inference_secret_ciphertext="encrypted-disabled",
+                    default_model="deepseek-flash",
+                    inference_secret_ciphertext="encrypted-deepseek",
+                    catalog_error="latest refresh failed; cached catalog remains available",
                 ),
                 ProviderProfile(
                     id="openai-incomplete-dashboard",
@@ -124,6 +126,23 @@ def test_dashboard_shows_status_for_each_same_provider_account(admin_app):
                     settings={},
                     default_model=None,
                 ),
+                ProviderProfile(
+                    id="openai-no-catalog-dashboard",
+                    tenant_id="acme",
+                    provider="openai",
+                    display_name="OpenAI Without Catalog",
+                    settings={},
+                    default_model="gpt-5.4",
+                    inference_secret_ciphertext="encrypted-no-catalog",
+                ),
+            )
+        )
+        session.flush()
+        session.add(
+            ProviderCatalogEntry(
+                profile_id="deepseek-outside-cascade-dashboard",
+                model_id="deepseek-flash",
+                source="provider",
             )
         )
 
@@ -133,17 +152,18 @@ def test_dashboard_shows_status_for_each_same_provider_account(admin_app):
     assert response.status_code == 200
     assert 'data-provider-account="openai-primary-dashboard"' in body
     assert 'data-provider-account="openai-backup-dashboard"' in body
-    assert 'data-provider-account="openai-disabled-dashboard"' in body
+    assert 'data-provider-account="deepseek-outside-cascade-dashboard"' in body
     assert 'data-provider-account="openai-incomplete-dashboard"' in body
+    assert 'data-provider-account="openai-no-catalog-dashboard"' in body
     assert "Primary OpenAI" in body
     assert "Backup OpenAI" in body
-    assert "Disabled OpenAI" in body
+    assert "DeepSeek Direct" in body
     assert "Incomplete OpenAI" in body
     assert "Position 1" in body
     assert "Position 2" in body
-    disabled_card = re.search(
+    deepseek_card = re.search(
         r'<li class="provider-status-card[^\"]*" '
-        r'data-provider-account="openai-disabled-dashboard">([\s\S]*?)</li>',
+        r'data-provider-account="deepseek-outside-cascade-dashboard">([\s\S]*?)</li>',
         body,
     )
     incomplete_card = re.search(
@@ -151,14 +171,38 @@ def test_dashboard_shows_status_for_each_same_provider_account(admin_app):
         r'data-provider-account="openai-incomplete-dashboard">([\s\S]*?)</li>',
         body,
     )
-    assert disabled_card is not None
-    assert 'class="provider-status-indicator is-disabled"' in disabled_card.group(1)
+    no_catalog_card = re.search(
+        r'<li class="provider-status-card[^\"]*" '
+        r'data-provider-account="openai-no-catalog-dashboard">([\s\S]*?)</li>',
+        body,
+    )
+    assert deepseek_card is not None
+    assert 'class="provider-status-indicator is-ready"' in deepseek_card.group(1)
+    assert (
+        "Eingerichtet · direkt per Modellkennung nutzbar, nicht in der Standardkaskade"
+        in deepseek_card.group(1)
+    )
     assert incomplete_card is not None
+    assert no_catalog_card is not None
+    assert 'class="provider-status-indicator needs-attention"' in no_catalog_card.group(
+        1
+    )
+    assert "Einrichtung prüfen" in no_catalog_card.group(1)
     assert 'class="provider-status-indicator needs-attention"' in incomplete_card.group(
         1
     )
-    assert "Deaktiviert · nicht in der Anfragenreihenfolge" in disabled_card.group(1)
+    assert "Konto deaktiviert" not in deepseek_card.group(1)
     assert "Einrichtung prüfen" in incomplete_card.group(1)
+
+    connection_body = (
+        _authenticated_client(admin_app)
+        .get("/admin/settings/connection")
+        .get_data(as_text=True)
+    )
+    assert "DeepSeek Direct" in connection_body
+    assert "Nicht in der Standardkaskade" in connection_body
+    assert "Direkt per Modellkennung nutzbar" in connection_body
+    assert "Modellliste konnte nicht geladen werden" in connection_body
 
 
 def test_dashboard_explains_missing_cost_configuration(admin_app):

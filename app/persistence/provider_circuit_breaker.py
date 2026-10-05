@@ -62,6 +62,7 @@ class CircuitPermit:
     allowed: bool
     leases: tuple[ProbeLease, ...] = ()
     retry_at: datetime | None = None
+    lease_blocked: bool = False
 
 
 @dataclass(frozen=True)
@@ -167,14 +168,22 @@ class ProviderCircuitBreakerStore:
                     if _identity_from_state(state) in scope_by_identity
                 ]
                 blocked_until = []
+                lease_blocked = False
+                cooldown_blocked = False
                 for state in states:
                     lease_until = _utc(state.lease_until) if state.lease_until else None
                     if _utc(state.probe_at) > moment:
                         blocked_until.append(_utc(state.probe_at))
+                        cooldown_blocked = True
                     elif lease_until is not None and lease_until > moment:
                         blocked_until.append(lease_until)
+                        lease_blocked = True
                 if blocked_until:
-                    return CircuitPermit(False, retry_at=max(blocked_until))
+                    return CircuitPermit(
+                        False,
+                        retry_at=max(blocked_until),
+                        lease_blocked=lease_blocked and not cooldown_blocked,
+                    )
 
                 leases = []
                 lease_until = moment + _PROBE_LEASE

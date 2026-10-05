@@ -464,7 +464,8 @@ def test_openrouter_account_key_survives_save_and_catalog_refresh(
     page = client.get("/admin/settings/connection")
     page_body = page.get_data(as_text=True)
     assert "openai/gpt-4o" in page_body
-    assert "Konto gespeichert. Es ist noch nicht für Anfragen aktiviert." in page_body
+    assert "Konto gespeichert. Es ist noch nicht in der Standardkaskade" in page_body
+    assert "direkt per Modellkennung verwendet" in page_body
     assert key not in page_body
 
     edit_page = client.get(f"/admin/settings/connection/{profile_id}/edit")
@@ -529,10 +530,11 @@ def test_catalog_refresh_does_not_store_results_for_changed_profile(
         with database.sessions.begin() as session:
             changed_profile = session.get(ProviderProfile, profile_id)
             changed_profile.settings = {"changed_during_refresh": True}
-        return [("openai/gpt-4o", None)]
+        return [("openai/gpt-4o", None)], {}
 
     monkeypatch.setattr(
-        "app.admin.views.refresh_provider_catalog", refresh_with_profile_change
+        "app.admin.views.refresh_provider_catalog_with_pricing",
+        refresh_with_profile_change,
     )
     response = client.post(
         f"/admin/settings/connection/{profile_id}/catalog",
@@ -600,9 +602,11 @@ def test_older_catalog_refresh_cannot_overwrite_newer_refresh(admin_app, monkeyp
             ).catalog_generation
         with database.sessions.begin() as session:
             session.get(ProviderProfile, profile_id).catalog_generation += 1
-        return [("older/model", None)]
+        return [("older/model", None)], {}
 
-    monkeypatch.setattr("app.admin.views.refresh_provider_catalog", start_older_refresh)
+    monkeypatch.setattr(
+        "app.admin.views.refresh_provider_catalog_with_pricing", start_older_refresh
+    )
     first_response = client.post(
         f"/admin/settings/connection/{profile_id}/catalog",
         data={"csrf_token": csrf},
@@ -614,8 +618,8 @@ def test_older_catalog_refresh_cannot_overwrite_newer_refresh(admin_app, monkeyp
         assert profile.catalog_refreshed_at is None
 
     monkeypatch.setattr(
-        "app.admin.views.refresh_provider_catalog",
-        lambda provider, settings, inference_secret: [("newer/model", None)],
+        "app.admin.views.refresh_provider_catalog_with_pricing",
+        lambda provider, settings, inference_secret: ([("newer/model", None)], {}),
     )
     second_response = client.post(
         f"/admin/settings/connection/{profile_id}/catalog",

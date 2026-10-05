@@ -7,6 +7,7 @@ import hmac
 import json
 import os
 from dataclasses import dataclass, field
+from datetime import datetime
 from typing import Any, Mapping
 
 from .exceptions import ServiceConfigurationError
@@ -55,6 +56,8 @@ class DatabaseTenantSnapshot:
     history_generation: int | None = None
     profile_deleted: bool = False
     catalog_model_ids: tuple[str, ...] = ()
+    catalog_pricing: Mapping[str, Mapping[str, str]] = field(default_factory=dict)
+    catalog_refreshed_at: datetime | None = None
 
     @property
     def azure_base_url(self) -> str | None:
@@ -93,12 +96,13 @@ class DatabaseTenantSnapshot:
 
 @dataclass(frozen=True)
 class DatabaseTenantRoutingSnapshot:
-    """Authenticated tenant identity and its validated, ordered provider route."""
+    """Authenticated identity, active route, and ready provider profiles."""
 
     id: str
     api_key_hash: str
     custom_model_id: str
     profiles: tuple[DatabaseTenantSnapshot, ...]
+    available_profiles: tuple[DatabaseTenantSnapshot, ...]
 
 
 def hash_api_key(api_key: str) -> str:

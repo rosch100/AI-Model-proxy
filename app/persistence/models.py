@@ -151,7 +151,7 @@ def _ensure_profile_name_key(_mapper, _connection, profile: ProviderProfile) -> 
 
 
 class ProviderCatalogEntry(Base):
-    """Provider model IDs and optional Azure deployment mappings."""
+    """Provider catalog models and optional published per-million prices."""
 
     __tablename__ = "provider_catalog_entries"
     __table_args__ = (
@@ -165,6 +165,17 @@ class ProviderCatalogEntry(Base):
     model_id: Mapped[str] = mapped_column(String(256), nullable=False)
     deployment_id: Mapped[str | None] = mapped_column(String(256), nullable=True)
     source: Mapped[str] = mapped_column(String(32), nullable=False)
+    input_price_per_1m_tokens: Mapped[str | None] = mapped_column(
+        String(64), nullable=True
+    )
+    output_price_per_1m_tokens: Mapped[str | None] = mapped_column(
+        String(64), nullable=True
+    )
+    cache_price_per_1m_tokens: Mapped[str | None] = mapped_column(
+        String(64), nullable=True
+    )
+    pricing_currency: Mapped[str | None] = mapped_column(String(8), nullable=True)
+    pricing_source: Mapped[str | None] = mapped_column(String(256), nullable=True)
 
 
 class ProviderScopeNode(Base):

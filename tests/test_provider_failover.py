@@ -217,11 +217,17 @@ def test_http_quota_failure_is_recorded_once_and_pauses_next_request(
                 "message": "private provider prose and secret must not be logged",
                 "metadata": {
                     "limit_source": "openrouter_key_limit",
+                    "provider_name": "OpenAI",
+                    "is_byok": True,
+                    "is_free_tier": False,
                     "secret": "provider-secret-do-not-log",
                 },
             }
         },
-        headers={"x-request-id": "req_1234567890abcdef12345678"},
+        headers={
+            "x-request-id": "req_1234567890abcdef12345678",
+            "x-ratelimit-remaining-requests": "2",
+        },
     )
     first = post(routed_app)
 
@@ -234,6 +240,10 @@ def test_http_quota_failure_is_recorded_once_and_pauses_next_request(
     assert "provider_limit_source=openrouter_key_limit" in formatted_warning
     assert "provider_request_id=req_1234567890abcdef12345678" in formatted_warning
     assert "error_category=quota_exhausted" in formatted_warning
+    assert '"provider_name": "OpenAI"' in formatted_warning
+    assert '"is_byok": true' in formatted_warning
+    assert '"is_free_tier": false' in formatted_warning
+    assert '"x-ratelimit-remaining-requests": "2"' in formatted_warning
     assert "private provider prose" not in formatted_warning
     assert "provider-secret-do-not-log" not in formatted_warning
 
@@ -250,10 +260,21 @@ def test_http_quota_failure_is_recorded_once_and_pauses_next_request(
     assert requests_mock.call_count == 1
 
 
-def test_transient_error_is_not_replaced_by_later_blocked_provider(
-    routed_app, requests_mock
+@pytest.mark.parametrize("blocked_first", [False, True])
+@pytest.mark.parametrize(
+    ("transient_retry_after", "cooldown_seconds", "expected_retry_after"),
+    [(None, 90.1, "91"), ("120", 90.1, "120"), (None, 10, "30"), ("5", 10.1, "11")],
+)
+def test_transient_error_retry_after_respects_blocked_profile_cooldown(
+    routed_app,
+    requests_mock,
+    mocker,
+    blocked_first,
+    transient_retry_after,
+    cooldown_seconds,
+    expected_retry_after,
 ):
-    """Return the attempted provider failure when a later profile is circuit-blocked."""
+    """Honor both transient retry guidance and a blocked profile's cooldown."""
     database = routed_app.extensions["database"]
     with database.sessions.begin() as session:
         profiles = tuple(
@@ -270,23 +291,35 @@ def test_transient_error_is_not_replaced_by_later_blocked_provider(
         openrouter_profile = next(
             profile for profile in profiles if profile.provider == "openrouter"
         )
-        openai_profile.route_priority = 1
-        openrouter_profile.route_priority = 2
+        openai_profile.route_priority = 2 if blocked_first else 1
+        openrouter_profile.route_priority = 1 if blocked_first else 2
 
     snapshot = database.get_proxy_snapshot_by_api_key("cursor-key")
     breaker = ProviderCircuitBreakerStore(database.sessions, database.secret_cipher)
+    now = datetime.now(timezone.utc)
+    clock = mocker.patch("app.providers.circuit_breaker.datetime", wraps=datetime)
+    clock.now.return_value = now
     breaker.open_quota(
-        breaker.scope(snapshot.id, "openrouter", "profile", openrouter_profile.id)
+        breaker.scope(snapshot.id, "openrouter", "profile", openrouter_profile.id),
+        now=now - timedelta(hours=1) + timedelta(seconds=cooldown_seconds),
+    )
+    headers = (
+        {"Retry-After": transient_retry_after}
+        if transient_retry_after is not None
+        else {}
     )
     requests_mock.post(
-        OPENAI, status_code=503, json={"error": {"code": "server_error"}}
+        OPENAI,
+        status_code=503,
+        json={"error": {"code": "server_error"}},
+        headers=headers,
     )
 
     response = post(routed_app)
 
     assert response.status_code == 503
-    assert response.json["error"]["code"] != "provider_quota_unavailable"
-    assert "Retry-After" not in response.headers
+    assert response.json["error"]["code"] == "provider_quota_unavailable"
+    assert response.headers["Retry-After"] == expected_retry_after
     assert [request.url for request in requests_mock.request_history] == [OPENAI]
 
 
@@ -490,6 +523,42 @@ def test_openrouter_inflight_budget_returns_retry_after_to_client(
 
     response = post(routed_app)
 
+    assert response.status_code == 503
+    assert response.json["error"]["code"] == "provider_quota_unavailable"
+    assert response.headers["Retry-After"] == "120"
+    assert requests_mock.call_count == 1
+    with database.sessions() as session:
+        assert session.scalar(select(ProviderCircuitState)) is None
+
+
+def test_terminal_openrouter_402_keeps_retry_after_without_transient_failure(
+    routed_app, requests_mock
+):
+    """Keep an isolated terminal 402 distinct from route-wide overloads."""
+    database = routed_app.extensions["database"]
+    with database.sessions.begin() as session:
+        for profile in session.scalars(
+            select(ProviderProfile).where(ProviderProfile.tenant_id == "acme")
+        ):
+            profile.route_priority = None
+        session.flush()
+        profile = session.scalar(
+            select(ProviderProfile).where(
+                ProviderProfile.tenant_id == "acme",
+                ProviderProfile.provider == "openrouter",
+            )
+        )
+        profile.route_priority = 1
+
+    requests_mock.post(
+        OPENROUTER,
+        status_code=402,
+        headers={"Retry-After": "120"},
+        json={"error": {}},
+    )
+
+    response = post(routed_app)
+
     assert response.status_code == 402
     assert response.headers["Retry-After"] == "120"
     assert requests_mock.call_count == 1
@@ -587,15 +656,33 @@ def test_partial_azure_output_never_replays(routed_app, requests_mock):
     assert requests_mock.call_count == 1
 
 
-def test_exhausted_route_returns_last_status(routed_app, requests_mock):
-    """Return the final provider's status when the route is exhausted."""
+@pytest.mark.parametrize(
+    ("azure_retry_after", "openai_retry_after", "expected_retry_after"),
+    [(None, "45", "45"), (None, None, "30"), ("120", "45", "120")],
+)
+def test_exhausted_route_returns_retryable_unavailable_after_transient_failures(
+    routed_app,
+    requests_mock,
+    azure_retry_after,
+    openai_retry_after,
+    expected_retry_after,
+):
+    """A terminal final 402 must not hide earlier overloads or their backoff."""
     activate_deepseek_profile(routed_app)
-    requests_mock.post(AZURE, status_code=503)
-    requests_mock.post(OPENAI, status_code=429)
+    azure_headers = (
+        {"Retry-After": azure_retry_after} if azure_retry_after is not None else {}
+    )
+    openai_headers = (
+        {"Retry-After": openai_retry_after} if openai_retry_after is not None else {}
+    )
+    requests_mock.post(AZURE, status_code=503, headers=azure_headers)
+    requests_mock.post(OPENAI, status_code=429, headers=openai_headers)
     requests_mock.post(OPENROUTER, status_code=500)
     requests_mock.post(DEEPSEEK, status_code=402)
     response = post(routed_app)
-    assert response.status_code == 402
+    assert response.status_code == 503
+    assert response.json["error"]["code"] == "provider_quota_unavailable"
+    assert response.headers["Retry-After"] == expected_retry_after
     assert requests_mock.call_count == 4
 
 

@@ -14,7 +14,7 @@ from string import ascii_letters, digits
 from typing import Any, Dict, Iterable, Optional
 
 import requests
-from flask import Response, current_app, stream_with_context
+from flask import Response, current_app, g, has_request_context, stream_with_context
 from rich.live import Live
 from rich.markup import escape as rich_escape
 
@@ -30,6 +30,7 @@ from ..providers.circuit_breaker import ProviderCircuitAttempt
 from ..providers.failover_upstream import (
     PreparedUpstream,
     _event_failure,
+    _transport_error_details,
     sanitize_error_event,
 )
 from ..reasoning_display import (
@@ -762,6 +763,24 @@ class ResponseAdapter:
                         event = sanitize_error_event(original_event)
                     if self._circuit_attempt is not None:
                         self._circuit_attempt.failed(classified_failure.classification)
+                    if state.has_emitted_output and has_request_context():
+                        current_app.logger.warning(
+                            "Provider stream failed after output: request_id=%s "
+                            "tenant=%s profile=%s provider=%s status=%s "
+                            "error_code=%s error_category=%s provider_diagnostics=%s",
+                            getattr(g, "proxy_request_id", "unavailable"),
+                            self.adapter.activity_tenant_id or "unknown",
+                            self.adapter.activity_profile_id or "unknown",
+                            self.adapter.activity_provider or "azure",
+                            classified_failure.status,
+                            classified_failure.code,
+                            classified_failure.classification.category,
+                            json.dumps(
+                                classified_failure.provider_diagnostics,
+                                sort_keys=True,
+                                ensure_ascii=False,
+                            ),
+                        )
                 if event.event in {
                     "response.completed",
                     "response.failed",
@@ -1093,9 +1112,31 @@ class ResponseAdapter:
                         circuit_attempt,
                     )
                 )
-            except requests.RequestException:
+            except requests.RequestException as exc:
                 if not isinstance(upstream_resp, PreparedUpstream):
                     raise
+                if has_request_context():
+                    current_app.logger.warning(
+                        "Provider stream interrupted: request_id=%s tenant=%s "
+                        "profile=%s provider=%s error_type=%s "
+                        "provider_diagnostics=%s",
+                        getattr(g, "proxy_request_id", "unavailable"),
+                        self.adapter.activity_tenant_id or "unknown",
+                        self.adapter.activity_profile_id or "unknown",
+                        self.adapter.activity_provider or "azure",
+                        type(exc).__name__,
+                        json.dumps(
+                            _transport_error_details(
+                                exc,
+                                headers=getattr(upstream_resp, "headers", None),
+                                upstream_url=self.adapter.activity_settings.get(
+                                    "base_url"
+                                ),
+                            ),
+                            sort_keys=True,
+                            ensure_ascii=False,
+                        ),
+                    )
                 error = self._failed(
                     {
                         "response": {

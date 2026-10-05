@@ -12,6 +12,7 @@ from concurrent.futures import TimeoutError as FutureTimeoutError
 from dataclasses import dataclass, field
 from itertools import chain
 from typing import Any
+from urllib.parse import urlsplit
 
 import requests
 from flask import Response, current_app, g, has_request_context, jsonify
@@ -106,6 +107,22 @@ _SAFE_PROVIDER_ERROR_CODES = frozenset(_ERROR_CODE_STATUSES)
 _SAFE_PROVIDER_ERROR_TYPES = _SAFE_PROVIDER_ERROR_CODES | frozenset(
     {"provider_error", "error", "too_many_requests", "rate_limited"}
 )
+_SAFE_PROVIDER_METADATA_FIELDS = frozenset(
+    {"provider_name", "is_byok", "is_free_tier", "billing_multiplier"}
+)
+_PROVIDER_RATE_LIMIT_HEADERS = frozenset(
+    {
+        "x-ratelimit-limit-requests",
+        "x-ratelimit-remaining-requests",
+        "x-ratelimit-reset-requests",
+        "x-ratelimit-limit-tokens",
+        "x-ratelimit-remaining-tokens",
+        "x-ratelimit-reset-tokens",
+        "x-ratelimit-limit",
+        "x-ratelimit-remaining",
+        "x-ratelimit-reset",
+    }
+)
 _SAFE_PROVIDER_ERROR_PARAMS = frozenset(
     {
         "model",
@@ -141,6 +158,91 @@ _PROVIDER_REQUEST_ID_HEADERS = (
     "apim-request-id",
     "x-ms-request-id",
 )
+_PROVIDER_ERROR_CODE_PATTERN = re.compile(r"[a-z][a-z0-9_.-]{0,63}\Z")
+_SAFE_PROVIDER_NAME_PATTERN = re.compile(r"[\w .()+/-]{1,80}\Z")
+_SAFE_RATE_LIMIT_VALUE_PATTERN = re.compile(
+    r"(?:[0-9]{1,13}(?:\.[0-9]{1,3})?|(?:[0-9]+(?:\.[0-9]+)?(?:ms|s|m|h|d))+|"
+    r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9:.+-]{1,20}Z?)\Z"
+)
+_SENSITIVE_DIAGNOSTIC_PATTERN = re.compile(
+    r"(?:sk[-_][a-z0-9_-]{8,}|github_pat_[a-z0-9_]{20,}|gh[pousr]_[a-z0-9]{20,}|"
+    r"xox[baprs]-[a-z0-9-]{20,}|bearer\s|api[-_]?key|secret|token|password|"
+    r"[a-f0-9]{32,})",
+    re.IGNORECASE,
+)
+_URL_PATTERN = re.compile(r"https?://[^\s'\"<>]+", re.IGNORECASE)
+_SCHEMELESS_URL_PATTERN = re.compile(r"(?i)(?<![\w-])url:\s*.*\Z")
+_BEARER_CREDENTIAL_PATTERN = re.compile(r"(?i)bearer\s+\S+")
+
+
+def _safe_exception_message(exc: BaseException) -> str | None:
+    """Retain a bounded transport reason while stripping URLs and credentials."""
+    message = str(exc).replace("\r", " ").replace("\n", " ").strip()
+    if not message:
+        return None
+
+    def strip_url(match: re.Match[str]) -> str:
+        try:
+            parsed = urlsplit(match.group(0).rstrip(".,);"))
+            host = parsed.hostname
+            port = parsed.port
+        except ValueError:
+            return "<upstream-url>"
+        if not host:
+            return "<upstream-url>"
+        if port is not None:
+            host = f"{host}:{port}"
+        return f"{parsed.scheme}://{host}"
+
+    message = _URL_PATTERN.sub(strip_url, message)
+    message = _SCHEMELESS_URL_PATTERN.sub("url: <path>", message)
+    message = _BEARER_CREDENTIAL_PATTERN.sub("Bearer <redacted>", message)
+    if _SENSITIVE_DIAGNOSTIC_PATTERN.search(message):
+        return "<redacted-sensitive-transport-detail>"
+    return message[:512]
+
+
+def _transport_error_details(
+    exc: requests.RequestException,
+    *,
+    headers: Any = None,
+    upstream_url: str | None = None,
+) -> dict[str, Any]:
+    """Capture safe exception-chain facts without logging arbitrary request data."""
+    causes: list[str] = []
+    current: BaseException | None = exc
+    while current is not None and len(causes) < 5:
+        causes.append(type(current).__name__)
+        current = current.__cause__ or current.__context__
+
+    diagnostics: dict[str, Any] = {
+        "exception_type": type(exc).__name__,
+        "exception_chain": causes,
+    }
+    message = _safe_exception_message(exc)
+    if message is not None:
+        diagnostics["message"] = message
+    for attribute in ("errno", "winerror"):
+        value = getattr(exc, attribute, None)
+        if isinstance(value, int) and not isinstance(value, bool):
+            diagnostics[attribute] = value
+    request = getattr(exc, "request", None)
+    request_url = getattr(request, "url", None)
+    if not isinstance(request_url, str):
+        request_url = upstream_url
+    if isinstance(request_url, str):
+        try:
+            hostname = urlsplit(request_url).hostname
+        except ValueError:
+            hostname = None
+        if hostname:
+            diagnostics["upstream_host"] = hostname[:253]
+    if isinstance(headers, Mapping):
+        safe_header_diagnostics = _provider_error_details({}, headers)[
+            "provider_diagnostics"
+        ]
+        diagnostics.update(safe_header_diagnostics)
+    return diagnostics
 
 
 def _recognized_provider_request_id(headers: Mapping[str, Any]) -> str | None:
@@ -158,11 +260,17 @@ def _recognized_provider_request_id(headers: Mapping[str, Any]) -> str | None:
 def _recognized_error_value(
     value: object, allowed_values: frozenset[str]
 ) -> str | None:
-    """Retain only known provider error codes or types."""
+    """Retain known error identifiers or safe, bounded provider codes."""
     if not isinstance(value, str):
         return None
     normalized = value.strip().casefold()
-    return normalized if normalized in allowed_values else None
+    if normalized in allowed_values:
+        return normalized
+    if _PROVIDER_ERROR_CODE_PATTERN.fullmatch(
+        normalized
+    ) and not _SENSITIVE_DIAGNOSTIC_PATTERN.search(normalized):
+        return normalized
+    return None
 
 
 def _recognized_error_parameter(value: object) -> str | None:
@@ -175,33 +283,87 @@ def _recognized_error_parameter(value: object) -> str | None:
     return normalized if _PROVIDER_PARAMETER_PATH.fullmatch(normalized) else None
 
 
-def _provider_error_details(
-    error: dict[str, Any], headers: Any
-) -> dict[str, str | None]:
-    """Extract only allowlisted scalar diagnostic fields from an upstream error."""
+def _safe_metadata_value(key: str, value: object) -> str | bool | int | float | None:
+    """Keep only bounded documented scalar metadata that is safe for logs."""
+    if key in {"is_byok", "is_free_tier"}:
+        return value if isinstance(value, bool) else None
+    if key == "billing_multiplier":
+        if isinstance(value, int) and not isinstance(value, bool):
+            return value if 0 <= value <= 100 else None
+        if isinstance(value, float):
+            return value if math.isfinite(value) and 0 <= value <= 100 else None
+        return None
+    if key == "provider_name":
+        if (
+            isinstance(value, str)
+            and _SAFE_PROVIDER_NAME_PATTERN.fullmatch(value)
+            and not _SENSITIVE_DIAGNOSTIC_PATTERN.search(value)
+        ):
+            return value
+    return None
+
+
+def _provider_error_details(error: dict[str, Any], headers: Any) -> dict[str, Any]:
+    """Extract bounded provider diagnostics without raw message, body, or secrets."""
     metadata = error.get("metadata")
-    limit_source = metadata.get("limit_source") if isinstance(metadata, dict) else None
+    if not isinstance(metadata, dict):
+        metadata = {}
     normalized_headers = (
         {str(key).casefold(): value for key, value in headers.items()}
         if isinstance(headers, Mapping)
         else {}
     )
     request_id = _recognized_provider_request_id(normalized_headers)
+    limit_source = metadata.get("limit_source")
     safe_limit_source = (
         limit_source
-        if isinstance(limit_source, str) and limit_source in _OPENROUTER_LIMIT_SOURCES
+        if isinstance(limit_source, str)
+        and _PROVIDER_ERROR_CODE_PATTERN.fullmatch(limit_source)
+        and not _SENSITIVE_DIAGNOSTIC_PATTERN.search(limit_source)
         else None
     )
+    error_code = _recognized_error_value(error.get("code"), _SAFE_PROVIDER_ERROR_CODES)
+    error_type = _recognized_error_value(error.get("type"), _SAFE_PROVIDER_ERROR_TYPES)
+    error_param = _recognized_error_parameter(error.get("param"))
+    provider_diagnostics = {
+        key: value
+        for key, value in {
+            "provider_error_code": error_code,
+            "provider_error_type": error_type,
+            "provider_error_param": error_param,
+            "provider_limit_source": safe_limit_source,
+            "provider_request_id": request_id,
+        }.items()
+        if value is not None
+    }
+    for key in _SAFE_PROVIDER_METADATA_FIELDS:
+        value = _safe_metadata_value(key, metadata.get(key))
+        if value is not None:
+            provider_diagnostics[key] = value
+
+    retry_after = classify_upstream_error(
+        "unknown", None, None, normalized_headers, None
+    ).retry_after_seconds
+    if retry_after is not None:
+        provider_diagnostics["retry_after_seconds"] = retry_after
+
+    rate_limit_headers = {
+        key: value.strip()
+        for key, value in normalized_headers.items()
+        if key in _PROVIDER_RATE_LIMIT_HEADERS
+        and isinstance(value, str)
+        and len(value) <= 32
+        and _SAFE_RATE_LIMIT_VALUE_PATTERN.fullmatch(value.strip())
+    }
+    if rate_limit_headers:
+        provider_diagnostics["rate_limit_headers"] = rate_limit_headers
     return {
-        "provider_error_code": _recognized_error_value(
-            error.get("code"), _SAFE_PROVIDER_ERROR_CODES
-        ),
-        "provider_error_type": _recognized_error_value(
-            error.get("type"), _SAFE_PROVIDER_ERROR_TYPES
-        ),
-        "provider_error_param": _recognized_error_parameter(error.get("param")),
+        "provider_error_code": error_code,
+        "provider_error_type": error_type,
+        "provider_error_param": error_param,
         "provider_limit_source": safe_limit_source,
         "provider_request_id": request_id,
+        "provider_diagnostics": provider_diagnostics,
     }
 
 
@@ -221,6 +383,7 @@ class UpstreamError(Exception):
     provider_error_param: str | None = None
     provider_limit_source: str | None = None
     provider_request_id: str | None = None
+    provider_diagnostics: dict[str, Any] = field(default_factory=dict, repr=False)
 
     def response(self) -> Response:
         """Return a safe JSON error before any SSE headers have been committed."""
@@ -278,6 +441,7 @@ def transport_failure(exc: requests.RequestException) -> UpstreamError:
         "Provider connection failed. The request was not replayed if its outcome was uncertain.",
         safe_connection_failure,
         provider_error_type=type(exc).__name__,
+        provider_diagnostics=_transport_error_details(exc),
     )
 
 
@@ -608,7 +772,7 @@ def chat_stream(
                             "status=%s error_code=%s error_category=%s "
                             "provider_error_code=%s provider_error_type=%s "
                             "provider_error_param=%s provider_limit_source=%s "
-                            "provider_request_id=%s",
+                            "provider_request_id=%s provider_diagnostics=%s",
                             getattr(g, "proxy_request_id", "unavailable"),
                             provider or "unknown",
                             failure.status,
@@ -619,6 +783,11 @@ def chat_stream(
                             failure.provider_error_param or "unknown",
                             failure.provider_limit_source or "unknown",
                             failure.provider_request_id or "unknown",
+                            json.dumps(
+                                failure.provider_diagnostics,
+                                sort_keys=True,
+                                ensure_ascii=False,
+                            ),
                         )
                 if isinstance(data, dict):
                     parsed_usage = parse_provider_usage(data.get("usage"))
@@ -635,10 +804,16 @@ def chat_stream(
         outcome = "failure"
         if has_request_context():
             current_app.logger.warning(
-                "Provider stream interrupted: request_id=%s provider=%s error_type=%s",
+                "Provider stream interrupted: request_id=%s provider=%s error_type=%s "
+                "provider_diagnostics=%s",
                 getattr(g, "proxy_request_id", "unavailable"),
                 provider or "unknown",
                 type(exc).__name__,
+                json.dumps(
+                    _transport_error_details(exc),
+                    sort_keys=True,
+                    ensure_ascii=False,
+                ),
             )
         yield (
             b'data: {"error":{"code":"stream_interrupted",'

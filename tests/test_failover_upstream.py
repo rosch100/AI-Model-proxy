@@ -133,6 +133,92 @@ def test_http_failure_keeps_safe_structured_diagnostics_without_provider_text():
     assert "secret raw vendor payload" not in repr(failure)
 
 
+def test_provider_diagnostics_include_unknown_safe_fields_and_rate_headers():
+    """Retain useful structured provider diagnostics without raw error content."""
+    response = upstream(
+        [
+            json.dumps(
+                {
+                    "error": {
+                        "code": "account_budget_exceeded",
+                        "type": "provider_error",
+                        "message": "private prompt content must not be logged",
+                        "metadata": {
+                            "limit_source": "provider_budget",
+                            "provider_name": "Google AI Studio",
+                            "is_byok": True,
+                            "is_free_tier": False,
+                            "billing_multiplier": 1.25,
+                            "raw": "sk-secret-provider-payload",
+                        },
+                    }
+                }
+            ).encode()
+        ],
+        status=429,
+    )
+    response.headers.update(
+        {
+            "Retry-After": "45",
+            "x-ratelimit-limit-requests": "100",
+            "x-ratelimit-remaining-requests": "2",
+            "x-ratelimit-reset-requests": "3s",
+            "x-request-id": "req_1234567890abcdef12345678",
+            "Authorization": "Bearer sk-secret-header",
+        }
+    )
+
+    with pytest.raises(failover_upstream.UpstreamError) as caught:
+        failover_upstream.prepare_upstream(response, provider="openrouter")
+
+    failure = caught.value
+    assert failure.provider_error_code == "account_budget_exceeded"
+    assert failure.provider_error_type == "provider_error"
+    assert failure.provider_limit_source == "provider_budget"
+    assert failure.provider_request_id == "req_1234567890abcdef12345678"
+    assert failure.provider_diagnostics == {
+        "provider_error_code": "account_budget_exceeded",
+        "provider_error_type": "provider_error",
+        "provider_limit_source": "provider_budget",
+        "provider_request_id": "req_1234567890abcdef12345678",
+        "provider_name": "Google AI Studio",
+        "is_byok": True,
+        "is_free_tier": False,
+        "billing_multiplier": 1.25,
+        "retry_after_seconds": 45,
+        "rate_limit_headers": {
+            "x-ratelimit-limit-requests": "100",
+            "x-ratelimit-remaining-requests": "2",
+            "x-ratelimit-reset-requests": "3s",
+        },
+    }
+    assert "private prompt content" not in repr(failure)
+    assert "sk-secret-provider-payload" not in repr(failure)
+    assert "sk-secret-header" not in repr(failure)
+
+
+def test_oversized_billing_multiplier_does_not_break_provider_error_handling():
+    """Ignore enormous provider metadata instead of raising during diagnostics."""
+    response = upstream(
+        [
+            json.dumps(
+                {
+                    "error": {
+                        "code": "invalid_request_error",
+                        "metadata": {"billing_multiplier": 10**1000},
+                    }
+                }
+            ).encode()
+        ],
+        status=400,
+    )
+
+    with pytest.raises(failover_upstream.UpstreamError) as caught:
+        failover_upstream.prepare_upstream(response, provider="openai")
+
+    assert "billing_multiplier" not in caught.value.provider_diagnostics
+
+
 def test_indexed_provider_parameter_path_is_retained():
     """Retain recognized parameter paths with valid message indexes."""
     response = upstream(
@@ -184,6 +270,32 @@ def test_sensitive_shaped_provider_error_identifiers_are_not_retained():
     assert "sk-secret-credential" not in repr(failure)
 
 
+def test_common_credential_shaped_provider_codes_are_not_logged():
+    """Reject common credential forms even when they match provider-code syntax."""
+    response = upstream(
+        [
+            json.dumps(
+                {
+                    "error": {
+                        "code": "github" + "_pat_" + ("placeholder_" * 2),
+                        "metadata": {
+                            "limit_source": "xox" + "b-" + ("placeholder-" * 2)
+                        },
+                    }
+                }
+            ).encode()
+        ],
+        status=400,
+    )
+
+    with pytest.raises(failover_upstream.UpstreamError) as caught:
+        failover_upstream.prepare_upstream(response, provider="openai")
+
+    assert caught.value.provider_error_code is None
+    assert caught.value.provider_limit_source is None
+    assert caught.value.provider_diagnostics == {}
+
+
 @pytest.mark.parametrize("header", ["apim-request-id", "x-ms-request-id"])
 def test_azure_request_id_header_is_captured(header):
     """Retain Azure's support correlation header in safe diagnostics."""
@@ -209,13 +321,19 @@ def test_sse_failure_logs_safe_provider_diagnostics(app, mocker):
                     "error": {
                         "code": "rate_limit_exceeded",
                         "message": "private provider prose",
-                        "metadata": {"limit_source": "openrouter_in_flight_budget"},
+                        "metadata": {
+                            "limit_source": "openrouter_in_flight_budget",
+                            "provider_name": "OpenAI",
+                            "is_byok": True,
+                            "is_free_tier": False,
+                        },
                     }
                 },
                 "error",
             ),
         ]
     )
+    response.headers["x-ratelimit-remaining-requests"] = "2"
     warning = mocker.patch.object(app.logger, "warning")
 
     with app.test_request_context("/v1/chat/completions"):
@@ -234,19 +352,85 @@ def test_sse_failure_logs_safe_provider_diagnostics(app, mocker):
     assert "request_id=proxy-correlation-1" in formatted_warning
     assert "provider_error_code=rate_limit_exceeded" in formatted_warning
     assert "provider_limit_source=openrouter_in_flight_budget" in formatted_warning
+    assert '"provider_name": "OpenAI"' in formatted_warning
+    assert '"is_byok": true' in formatted_warning
+    assert '"x-ratelimit-remaining-requests": "2"' in formatted_warning
     assert "private provider prose" not in formatted_warning
     assert b"private provider prose" not in body
 
 
-def test_stream_transport_failure_logs_exception_type_without_exception_text(
-    app, mocker
-):
-    """Log the transport failure class without exposing URLs or exception text."""
+def test_transport_failure_keeps_safe_reason_without_url_or_credentials():
+    """Keep actionable transport text but remove private URL and credential data."""
+    error = requests.ReadTimeout(
+        "Read timed out for https://api.openai.com/v1/chat?token=sk-secret-value"
+    )
+
+    failure = failover_upstream.transport_failure(error)
+
+    assert failure.provider_diagnostics["exception_type"] == "ReadTimeout"
+    assert failure.provider_diagnostics["message"] == (
+        "Read timed out for https://api.openai.com"
+    )
+    assert "sk-secret-value" not in repr(failure.provider_diagnostics)
+    assert "/v1/chat" not in repr(failure.provider_diagnostics)
+
+
+def test_transport_failure_redacts_scheme_less_url_paths_and_credentials():
+    """Redact path and query values in scheme-less transport URLs."""
+    error = requests.ReadTimeout(
+        "Read timed out url: /v1/responses?sig=signature-value&code=authorization-value"
+    )
+
+    failure = failover_upstream.transport_failure(error)
+    message = failure.provider_diagnostics["message"]
+
+    assert message == "Read timed out url: <path>"
+    assert "/v1/responses" not in message
+    assert "signature-value" not in message
+    assert "authorization-value" not in message
+
+
+def test_transport_failure_redacts_complete_scheme_less_url_value():
+    """Redact whitespace-separated text after a scheme-less URL label."""
+    error = requests.ReadTimeout(
+        "Read timed out url: /v1/responses?sig=signature-value extra details"
+    )
+
+    failure = failover_upstream.transport_failure(error)
+
+    assert failure.provider_diagnostics["message"] == "Read timed out url: <path>"
+    assert "signature-value" not in repr(failure.provider_diagnostics)
+    assert "extra details" not in repr(failure.provider_diagnostics)
+
+
+def test_transport_failure_does_not_redact_curl_diagnostics():
+    """A curl diagnostic is not a scheme-less URL label."""
+    failure = failover_upstream.transport_failure(requests.ReadTimeout("curl: /path"))
+
+    assert failure.provider_diagnostics["message"] == "curl: /path"
+
+
+def test_transport_failure_handles_malformed_urls_without_raising():
+    """Malformed URLs in transport text must not interrupt error handling."""
+    failure = failover_upstream.transport_failure(
+        requests.ReadTimeout("Read timed out for https://[::1")
+    )
+
+    assert failure.provider_diagnostics["exception_type"] == "ReadTimeout"
+    assert failure.provider_diagnostics["message"] == (
+        "Read timed out for <upstream-url>"
+    )
+
+
+def test_stream_transport_failure_logs_safe_exception_diagnostics(app, mocker):
+    """Log transport cause details while excluding raw URLs and credentials."""
     response = upstream([])
 
     def interrupted_stream():
         yield event({"choices": [{"delta": {"content": "partial"}}]})
-        raise requests.ReadTimeout("secret-upstream-url-and-token")
+        raise requests.ReadTimeout(
+            "Read timed out for https://api.openai.com/v1/chat?token=sk-secret-value"
+        )
 
     response.iter_content.return_value = interrupted_stream()
     warning = mocker.patch.object(app.logger, "warning")
@@ -267,7 +451,10 @@ def test_stream_transport_failure_logs_exception_type_without_exception_text(
     assert "request_id=proxy-correlation-2" in formatted_warning
     assert "provider=openai" in formatted_warning
     assert "error_type=ReadTimeout" in formatted_warning
-    assert "secret-upstream-url-and-token" not in formatted_warning
+    assert '"exception_type": "ReadTimeout"' in formatted_warning
+    assert '"message": "Read timed out for https://api.openai.com"' in formatted_warning
+    assert "sk-secret-value" not in formatted_warning
+    assert "/v1/chat" not in formatted_warning
     assert b"stream_interrupted" in body
 
 

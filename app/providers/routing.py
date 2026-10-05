@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import json
+import math
 from collections.abc import Callable
 from datetime import datetime
 
@@ -188,6 +190,8 @@ def forward_tenant_route(
     circuit_state_unavailable = False
     attempts_started = 0
     last_retryable_error: UpstreamError | None = None
+    transient_failure_seen = False
+    transient_retry_after: float | None = None
     for profile, target_model in route_targets:
         permit = CircuitPermit(True)
         if breaker_store is not None:
@@ -257,12 +261,17 @@ def forward_tenant_route(
                 attempt_id, outcome="failure", status_code=exc.status
             )
             last_retryable_error = exc
+            if exc.classification.category == "transient":
+                transient_failure_seen = True
+                retry_after = exc.classification.retry_after_seconds
+                if retry_after is not None:
+                    transient_retry_after = max(transient_retry_after or 0, retry_after)
             current_app.logger.warning(
                 "Provider attempt failed: request_id=%s tenant=%s profile=%s "
                 "provider=%s status=%s retryable=%s error_code=%s "
                 "error_category=%s provider_error_code=%s provider_error_type=%s "
                 "provider_error_param=%s provider_limit_source=%s "
-                "provider_request_id=%s",
+                "provider_request_id=%s provider_diagnostics=%s",
                 getattr(g, "proxy_request_id", "unavailable"),
                 snapshot.id,
                 profile.profile_id,
@@ -276,6 +285,9 @@ def forward_tenant_route(
                 exc.provider_error_param or "unknown",
                 exc.provider_limit_source or "unknown",
                 exc.provider_request_id or "unknown",
+                json.dumps(
+                    exc.provider_diagnostics, sort_keys=True, ensure_ascii=False
+                ),
             )
             if circuit_update_failed:
                 continue
@@ -297,6 +309,23 @@ def forward_tenant_route(
             "provider_circuit_unavailable",
             "Provider availability could not be verified; retry the request shortly.",
             "30",
+        )
+    if transient_failure_seen:
+        retry_after_seconds = (
+            max(1, math.ceil(transient_retry_after))
+            if transient_retry_after is not None
+            else 30
+        )
+        cooldown_seconds = (
+            int(retry_after_header(retry_at))
+            for retry_at in blocked_until
+            if retry_at is not None
+        )
+        retry_after = str(max(retry_after_seconds, max(cooldown_seconds, default=0)))
+        return _service_unavailable(
+            "provider_quota_unavailable",
+            "All configured providers are temporarily unavailable.",
+            retry_after,
         )
     if last_retryable_error is not None:
         return last_retryable_error.response()

@@ -108,7 +108,8 @@ def test_late_azure_transport_failure_logs_safe_diagnostics(app, monkeypatch, mo
     formatted_warning = template % tuple(arguments)
     assert "provider=azure" in formatted_warning
     assert "ReadTimeout" in formatted_warning
-    assert "https://resource.openai.azure.com" in formatted_warning
+    diagnostics = json.loads(arguments[-1])
+    assert diagnostics["upstream_host"] == "resource.openai.azure.com"
     assert "Retry-After" not in formatted_warning
     assert '"retry_after_seconds": 45' in formatted_warning
     assert "123e4567-e89b-12d3-a456-426614174000" in formatted_warning

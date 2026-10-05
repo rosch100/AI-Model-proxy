@@ -666,11 +666,6 @@ code {
   background: var(--indicator-color);
 }
 
-.provider-status-indicator.is-disabled {
-  --indicator-color: #b42318;
-  background: var(--indicator-color);
-}
-
 .provider-status-indicator.is-idle {
   --indicator-color: #a7b1aa;
   background: var(--indicator-color);
@@ -691,10 +686,6 @@ code {
 
 .provider-status-card.is-live.is-warning {
   border-color: color-mix(in srgb, #e0a000 45%, var(--line));
-}
-
-.provider-status-card.is-live.is-disabled {
-  border-color: color-mix(in srgb, #b42318 45%, var(--line));
 }
 
 .provider-status-indicator.needs-attention {

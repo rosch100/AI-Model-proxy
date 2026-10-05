@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import json
 from collections.abc import Iterable, Sequence
+from decimal import Decimal, InvalidOperation
 
 import requests
 
@@ -156,10 +158,30 @@ def _refresh_deepseek(api_key: str) -> list[tuple[str, str | None]]:
     return [(model_id, None) for model_id in models]
 
 
+OPENROUTER_CATALOG_SOURCE = "https://openrouter.ai/api/v1/models"
+
+
+def refresh_provider_catalog_with_pricing(
+    provider: str, settings: dict[str, object], inference_secret: str
+) -> tuple[list[tuple[str, str | None]], dict[str, dict[str, str]]]:
+    """Refresh catalog rows and any complete, provider-published pricing."""
+    if provider != "openrouter":
+        return refresh_provider_catalog(provider, settings, inference_secret), {}
+    entries, pricing = _refresh_openrouter_with_pricing(inference_secret)
+    return entries, pricing
+
+
 def _refresh_openrouter(api_key: str) -> list[tuple[str, str | None]]:
+    entries, _ = _refresh_openrouter_with_pricing(api_key)
+    return entries
+
+
+def _refresh_openrouter_with_pricing(
+    api_key: str,
+) -> tuple[list[tuple[str, str | None]], dict[str, dict[str, str]]]:
     try:
         response = requests.get(
-            "https://openrouter.ai/api/v1/models",
+            OPENROUTER_CATALOG_SOURCE,
             headers={"Authorization": f"Bearer {api_key}"},
             timeout=30,
         )
@@ -168,19 +190,57 @@ def _refresh_openrouter(api_key: str) -> list[tuple[str, str | None]]:
     if response.status_code >= 400:
         raise CatalogRefreshError(f"OpenRouter catalog HTTP {response.status_code}")
     try:
-        payload = response.json()
-    except requests.exceptions.JSONDecodeError as exc:
+        payload = json.loads(response.text, parse_float=Decimal, parse_int=Decimal)
+    except (json.JSONDecodeError, ValueError) as exc:
         raise CatalogRefreshError("OpenRouter catalog payload is invalid.") from exc
     data = payload.get("data") if isinstance(payload, dict) else None
     if not isinstance(data, list):
         raise CatalogRefreshError("OpenRouter catalog payload is invalid.")
-    models = [
-        item["id"]
-        for item in data
-        if isinstance(item, dict)
-        and isinstance(item.get("id"), str)
-        and item["id"].strip()
-    ]
-    if not models:
+    entries = []
+    pricing = {}
+    for item in data:
+        if not isinstance(item, dict):
+            continue
+        model_id = item.get("id")
+        if not isinstance(model_id, str) or not model_id.strip():
+            continue
+        entries.append((model_id, None))
+        normalized = _complete_openrouter_pricing(item.get("pricing"))
+        if normalized is not None:
+            pricing[model_id] = normalized
+    if not entries:
         raise CatalogRefreshError("OpenRouter catalog contains no models.")
-    return [(model_id, None) for model_id in models]
+    return entries, pricing
+
+
+def _complete_openrouter_pricing(value: object) -> dict[str, str] | None:
+    """Normalize only the complete prompt/completion/cache-read USD rates."""
+    if not isinstance(value, dict):
+        return None
+    rates = []
+    for key in ("prompt", "completion", "input_cache_read"):
+        try:
+            raw = value[key]
+            if isinstance(raw, bool) or not isinstance(raw, (Decimal, int, str)):
+                return None
+            rate = raw if isinstance(raw, Decimal) else Decimal(raw)
+        except (KeyError, InvalidOperation, TypeError, ValueError):
+            return None
+        if not rate.is_finite() or rate < 0:
+            return None
+        rates.append(rate * Decimal(1_000_000))
+    return {
+        "input_per_1m_tokens": _decimal_string(rates[0]),
+        "output_per_1m_tokens": _decimal_string(rates[1]),
+        "cache_per_1m_tokens": _decimal_string(rates[2]),
+        "currency": "USD",
+        "source": OPENROUTER_CATALOG_SOURCE,
+    }
+
+
+def _decimal_string(value: Decimal) -> str:
+    """Format a finite decimal without exponent or insignificant trailing zeros."""
+    if not value:
+        return "0"
+    formatted = format(value, "f")
+    return formatted.rstrip("0").rstrip(".") if "." in formatted else formatted

@@ -4,10 +4,14 @@ from __future__ import annotations
 
 import json
 import math
+from collections import deque
 from collections.abc import Callable
-from datetime import datetime
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from time import monotonic
 
 from flask import Request, Response, current_app, g, jsonify
+from gevent import sleep as cooperative_sleep
 
 from app.azure.adapter import AzureAdapter
 from app.exceptions import ServiceConfigurationError
@@ -30,10 +34,43 @@ from app.providers.model_ids import account_model_id, qualified_model_id
 from app.providers.openai_compat import forward_openai_compatible
 from app.tenants import DatabaseTenantRoutingSnapshot, DatabaseTenantSnapshot
 
+MAX_TRANSIENT_RETRY_WAIT_SECONDS = 30.0
+DEFAULT_TRANSIENT_RETRY_DELAY_SECONDS = 1.0
+
 ProviderForwarder = Callable[
     [Request, DatabaseTenantSnapshot, str, int | None, ProviderCircuitAttempt | None],
     Response,
 ]
+
+
+@dataclass
+class RouteAttemptState:
+    """Accumulate request-level provider availability results."""
+
+    blocked_until: list[datetime | None]
+    lease_contention_seen: bool = False
+    transient_failure_seen: bool = False
+    transient_retry_after: float | None = None
+    last_retryable_error: UpstreamError | None = None
+    circuit_state_unavailable: bool = False
+    attempts_started: int = 0
+
+    def record_error(self, error: UpstreamError) -> None:
+        """Retain transient retry guidance and the latest retryable failure."""
+        self.last_retryable_error = error
+        if error.classification.category != "transient":
+            return
+        self.transient_failure_seen = True
+        retry_after = error.classification.retry_after_seconds
+        if retry_after is not None:
+            self.transient_retry_after = max(
+                self.transient_retry_after or 0, retry_after
+            )
+
+    def record_blocked(self, retry_at: datetime | None, *, lease_blocked: bool) -> None:
+        """Record a circuit block and whether an active probe lease may expire."""
+        self.blocked_until.append(retry_at)
+        self.lease_contention_seen |= lease_blocked
 
 
 def _forward_azure(
@@ -81,16 +118,29 @@ _PROVIDER_FORWARDERS: dict[str, ProviderForwarder] = {
 def routed_profiles(
     snapshot: DatabaseTenantRoutingSnapshot, *, azure_only: bool = False
 ) -> tuple[DatabaseTenantSnapshot, ...]:
-    """Apply operator provider switches without ever borrowing global credentials."""
-    profiles = tuple(
+    """Return enabled profiles in configured order for tenant-default routing."""
+    return _eligible_profiles(snapshot.profiles, azure_only=azure_only)
+
+
+def catalog_profiles(
+    snapshot: DatabaseTenantRoutingSnapshot, *, azure_only: bool = False
+) -> tuple[DatabaseTenantSnapshot, ...]:
+    """Return ready profiles available for explicit catalog-model selection."""
+    return _eligible_profiles(snapshot.available_profiles, azure_only=azure_only)
+
+
+def _eligible_profiles(
+    profiles: tuple[DatabaseTenantSnapshot, ...], *, azure_only: bool
+) -> tuple[DatabaseTenantSnapshot, ...]:
+    """Apply provider switches without borrowing global credentials."""
+    return tuple(
         profile
-        for profile in snapshot.profiles
+        for profile in profiles
         if (not azure_only or profile.provider == "azure")
         and (
             profile.provider != "azure" or current_app.config.get("ENABLE_AZURE", False)
         )
     )
-    return profiles
 
 
 def _route_targets(
@@ -207,182 +257,359 @@ def _quota_unavailable(retry_at: datetime) -> Response:
     )
 
 
-def forward_tenant_route(
-    req: Request, snapshot: DatabaseTenantRoutingSnapshot, *, azure_only: bool = False
-) -> Response:
-    """Try each configured candidate at most once, before committing headers."""
-    profiles = routed_profiles(snapshot, azure_only=azure_only)
-    if not profiles:
-        message = "No active provider profile is configured for this tenant."
-        if azure_only:
-            message = "The active tenant provider is not available on the Azure route."
-        raise ServiceConfigurationError(message)
-    payload = req.get_json(silent=True)
-    if not isinstance(payload, dict):
-        raise ServiceConfigurationError(
-            "Request model must match the tenant's Cursor model ID."
-        )
-    inbound_model = payload.get("model")
-    route_targets = _route_targets(profiles, inbound_model, snapshot.custom_model_id)
-    database = current_app.extensions.get("database")
-    breaker_store = (
-        ProviderCircuitBreakerStore(database.sessions, database.secret_cipher)
-        if isinstance(database, Database)
-        else None
-    )
-    blocked_until = []
-    circuit_state_unavailable = False
-    attempts_started = 0
-    last_retryable_error: UpstreamError | None = None
-    transient_failure_seen = False
-    transient_retry_after: float | None = None
-    for profile, target_model in route_targets:
-        permit = CircuitPermit(True)
-        if breaker_store is not None:
-            scopes = breaker_store.scopes_for_profile(
-                snapshot.id,
-                profile.provider,
-                profile.profile_id,
-                profile.provider_settings,
-            )
-            try:
-                permit = breaker_store.acquire(scopes)
-            except ProviderCircuitStoreError:
-                circuit_state_unavailable = True
-                current_app.logger.exception(
-                    "Provider circuit state unavailable; skipping profile=%s",
-                    profile.profile_id,
+def _resolve_request_targets(
+    snapshot: DatabaseTenantRoutingSnapshot,
+    inbound_model: object,
+    route_profiles: tuple[DatabaseTenantSnapshot, ...],
+    catalog_candidates: tuple[DatabaseTenantSnapshot, ...],
+    *,
+    azure_only: bool,
+) -> tuple[tuple[DatabaseTenantSnapshot, str], ...]:
+    """Resolve the default cascade or an explicit catalog model."""
+    if inbound_model == snapshot.custom_model_id:
+        if not route_profiles:
+            message = "No active provider profile is configured for this tenant."
+            if azure_only:
+                message = (
+                    "The active tenant provider is not available on the Azure route."
                 )
-                continue
-            if not permit.allowed:
-                blocked_until.append(permit.retry_at)
-                continue
-        attempts_started += 1
-        circuit_attempt = (
-            ProviderCircuitAttempt(
-                breaker_store,
-                permit,
-                snapshot.id,
-                profile.provider,
-                profile.profile_id,
-                profile.provider_settings,
-            )
-            if breaker_store is not None
-            else None
+            raise ServiceConfigurationError(message)
+        candidates = route_profiles
+    else:
+        candidates = route_profiles if azure_only else catalog_candidates
+    return _route_targets(candidates, inbound_model, snapshot.custom_model_id)
+
+
+def _acquire_route_permit(
+    snapshot: DatabaseTenantRoutingSnapshot,
+    profile: DatabaseTenantSnapshot,
+    target_model: str,
+    is_retry: bool,
+    breaker_store: ProviderCircuitBreakerStore | None,
+    state: RouteAttemptState,
+    retry_targets: list,
+    deadline: float,
+) -> CircuitPermit | None:
+    """Acquire breaker leases and queue one bounded retry for lease contention."""
+    if breaker_store is None:
+        return CircuitPermit(True)
+    scopes = breaker_store.scopes_for_profile(
+        snapshot.id,
+        profile.provider,
+        profile.profile_id,
+        profile.provider_settings,
+    )
+    try:
+        permit = breaker_store.acquire(scopes)
+    except ProviderCircuitStoreError:
+        state.circuit_state_unavailable = True
+        current_app.logger.exception(
+            "Provider circuit state unavailable; skipping profile=%s",
+            profile.profile_id,
         )
-        attempt_id = start_provider_attempt(
-            tenant_id=snapshot.id,
-            provider=profile.provider,
-            profile_id=profile.profile_id,
-            inbound_model=inbound_model,
-            routed_model=target_model,
-        )
+        return None
+    if not permit.allowed:
+        state.record_blocked(permit.retry_at, lease_blocked=permit.lease_blocked)
+        if permit.lease_blocked:
+            if not is_retry and permit.retry_at is not None:
+                lease_remaining = max(
+                    0.0,
+                    (permit.retry_at - datetime.now(timezone.utc)).total_seconds(),
+                )
+                retry_at = monotonic() + lease_remaining
+                if retry_at <= deadline:
+                    retry_targets.append((profile, target_model, True, retry_at))
+        return None
+    return permit
+
+
+def _schedule_transient_retry(
+    error: UpstreamError,
+    profile: DatabaseTenantSnapshot,
+    target_model: str,
+    is_retry: bool,
+    retry_targets: list,
+) -> None:
+    """Queue one safe retry for a transient 402/429 within the request budget."""
+    retry_after = error.classification.retry_after_seconds
+    if (
+        error.classification.category != "transient"
+        or is_retry
+        or error.status not in {402, 429}
+        or retry_after is not None
+        and retry_after > MAX_TRANSIENT_RETRY_WAIT_SECONDS
+    ):
+        return
+    delay = (
+        retry_after
+        if retry_after is not None
+        else DEFAULT_TRANSIENT_RETRY_DELAY_SECONDS
+    )
+    retry_targets.append((profile, target_model, True, monotonic() + max(delay, 0.1)))
+
+
+def _log_provider_failure(
+    snapshot: DatabaseTenantRoutingSnapshot,
+    profile: DatabaseTenantSnapshot,
+    error: UpstreamError,
+) -> None:
+    """Log classified, allowlisted provider diagnostics without raw error text."""
+    current_app.logger.warning(
+        "Provider attempt failed: request_id=%s tenant=%s profile=%s "
+        "provider=%s status=%s retryable=%s error_code=%s "
+        "error_category=%s provider_error_code=%s provider_error_type=%s "
+        "provider_error_param=%s provider_limit_source=%s "
+        "provider_request_id=%s provider_diagnostics=%s",
+        getattr(g, "proxy_request_id", "unavailable"),
+        snapshot.id,
+        profile.profile_id,
+        profile.provider,
+        error.status,
+        error.retryable,
+        error.code,
+        error.classification.category,
+        error.provider_error_code or "unknown",
+        error.provider_error_type or "unknown",
+        error.provider_error_param or "unknown",
+        error.provider_limit_source or "unknown",
+        error.provider_request_id or "unknown",
+        json.dumps(error.provider_diagnostics, sort_keys=True, ensure_ascii=False),
+    )
+
+
+def _record_provider_failure(
+    snapshot: DatabaseTenantRoutingSnapshot,
+    profile: DatabaseTenantSnapshot,
+    target_model: str,
+    attempt_id: int | None,
+    circuit_attempt: ProviderCircuitAttempt | None,
+    error: UpstreamError,
+    state: RouteAttemptState,
+    is_retry: bool,
+    retry_targets: list,
+) -> Response | None:
+    """Persist one failed attempt and return only terminal provider errors."""
+    if circuit_attempt is not None:
         try:
-            response = _forward_profile(
-                req, profile, target_model, attempt_id, circuit_attempt
+            circuit_attempt.failed(error.classification)
+        except ProviderCircuitStoreError:
+            state.circuit_state_unavailable = True
+            current_app.logger.exception(
+                "Could not resolve provider circuit state for profile=%s",
+                profile.profile_id,
             )
-            if circuit_attempt is not None:
-                response.call_on_close(circuit_attempt.release)
-            return response
-        except ServiceConfigurationError:
-            if circuit_attempt is not None:
-                circuit_attempt.release()
-            complete_provider_attempt(attempt_id, outcome="failure", status_code=400)
-            raise
-        except UpstreamError as exc:
-            circuit_update_failed = False
-            if circuit_attempt is not None:
-                try:
-                    circuit_attempt.failed(exc.classification)
-                except ProviderCircuitStoreError:
-                    circuit_update_failed = True
-                    circuit_state_unavailable = True
-                    current_app.logger.exception(
-                        "Could not resolve provider circuit state for profile=%s",
-                        profile.profile_id,
-                    )
             complete_provider_attempt(
                 attempt_id,
                 outcome="failure",
-                status_code=exc.status,
-                failure_details=_provider_failure_details(exc),
+                status_code=error.status,
+                failure_details=_provider_failure_details(error),
             )
-            last_retryable_error = exc
-            if exc.classification.category == "transient":
-                transient_failure_seen = True
-                retry_after = exc.classification.retry_after_seconds
-                if retry_after is not None:
-                    transient_retry_after = max(transient_retry_after or 0, retry_after)
-            current_app.logger.warning(
-                "Provider attempt failed: request_id=%s tenant=%s profile=%s "
-                "provider=%s status=%s retryable=%s error_code=%s "
-                "error_category=%s provider_error_code=%s provider_error_type=%s "
-                "provider_error_param=%s provider_limit_source=%s "
-                "provider_request_id=%s provider_diagnostics=%s",
-                getattr(g, "proxy_request_id", "unavailable"),
-                snapshot.id,
-                profile.profile_id,
-                profile.provider,
-                exc.status,
-                exc.retryable,
-                exc.code,
-                exc.classification.category,
-                exc.provider_error_code or "unknown",
-                exc.provider_error_type or "unknown",
-                exc.provider_error_param or "unknown",
-                exc.provider_limit_source or "unknown",
-                exc.provider_request_id or "unknown",
-                json.dumps(
-                    exc.provider_diagnostics, sort_keys=True, ensure_ascii=False
-                ),
-            )
-            if circuit_update_failed:
-                continue
-            if not exc.retryable:
-                return exc.response()
-        except Exception:  # noqa: BLE001 - release resources before re-raising
-            if circuit_attempt is not None:
-                try:
-                    circuit_attempt.release()
-                except ProviderCircuitStoreError:
-                    current_app.logger.exception(
-                        "Could not release provider circuit lease after unexpected failure for profile=%s",
-                        profile.profile_id,
-                    )
-            complete_provider_attempt(attempt_id, outcome="failure", status_code=None)
-            raise
-    if circuit_state_unavailable:
+            return None
+    complete_provider_attempt(
+        attempt_id,
+        outcome="failure",
+        status_code=error.status,
+        failure_details=_provider_failure_details(error),
+    )
+    state.record_error(error)
+    _schedule_transient_retry(error, profile, target_model, is_retry, retry_targets)
+    _log_provider_failure(snapshot, profile, error)
+    return error.response() if not error.retryable else None
+
+
+def _attempt_route_target(
+    req: Request,
+    snapshot: DatabaseTenantRoutingSnapshot,
+    inbound_model: object,
+    profile: DatabaseTenantSnapshot,
+    target_model: str,
+    is_retry: bool,
+    breaker_store: ProviderCircuitBreakerStore | None,
+    state: RouteAttemptState,
+    retry_targets: list,
+    deadline: float,
+) -> Response | None:
+    """Run one upstream attempt, persisting failures and releasing its lease."""
+    permit = _acquire_route_permit(
+        snapshot,
+        profile,
+        target_model,
+        is_retry,
+        breaker_store,
+        state,
+        retry_targets,
+        deadline,
+    )
+    if permit is None:
+        return None
+    state.attempts_started += 1
+    circuit_attempt = (
+        ProviderCircuitAttempt(
+            breaker_store,
+            permit,
+            snapshot.id,
+            profile.provider,
+            profile.profile_id,
+            profile.provider_settings,
+        )
+        if breaker_store is not None
+        else None
+    )
+    attempt_id = start_provider_attempt(
+        tenant_id=snapshot.id,
+        provider=profile.provider,
+        profile_id=profile.profile_id,
+        inbound_model=inbound_model,
+        routed_model=target_model,
+    )
+    try:
+        response = _forward_profile(
+            req, profile, target_model, attempt_id, circuit_attempt
+        )
+        if circuit_attempt is not None:
+            response.call_on_close(circuit_attempt.release)
+        return response
+    except ServiceConfigurationError:
+        if circuit_attempt is not None:
+            circuit_attempt.release()
+        complete_provider_attempt(attempt_id, outcome="failure", status_code=400)
+        raise
+    except UpstreamError as error:
+        return _record_provider_failure(
+            snapshot,
+            profile,
+            target_model,
+            attempt_id,
+            circuit_attempt,
+            error,
+            state,
+            is_retry,
+            retry_targets,
+        )
+    except Exception:  # noqa: BLE001 - release resources before re-raising
+        if circuit_attempt is not None:
+            try:
+                circuit_attempt.release()
+            except ProviderCircuitStoreError:
+                current_app.logger.exception(
+                    "Could not release provider circuit lease after unexpected failure "
+                    "for profile=%s",
+                    profile.profile_id,
+                )
+        complete_provider_attempt(attempt_id, outcome="failure", status_code=None)
+        raise
+    return None
+
+
+def _final_route_failure(state: RouteAttemptState) -> Response:
+    """Choose the response after every available route and retry was exhausted."""
+    if state.circuit_state_unavailable:
         return _service_unavailable(
             "provider_circuit_unavailable",
             "Provider availability could not be verified; retry the request shortly.",
             "30",
         )
-    if transient_failure_seen:
+    if state.transient_failure_seen:
         retry_after_seconds = (
-            max(1, math.ceil(transient_retry_after))
-            if transient_retry_after is not None
+            max(1, math.ceil(state.transient_retry_after))
+            if state.transient_retry_after is not None
             else 30
         )
         cooldown_seconds = (
             int(retry_after_header(retry_at))
-            for retry_at in blocked_until
+            for retry_at in state.blocked_until
             if retry_at is not None
         )
         retry_after = str(max(retry_after_seconds, max(cooldown_seconds, default=0)))
         return _service_unavailable(
-            "provider_quota_unavailable",
-            "All configured providers are temporarily unavailable.",
+            "provider_temporarily_unavailable",
+            "Providers are temporarily rate limited or unavailable.",
             retry_after,
         )
-    if last_retryable_error is not None:
-        return last_retryable_error.response()
-    if blocked_until:
-        retry_at = min(value for value in blocked_until if value is not None)
+    if state.last_retryable_error is not None:
+        return state.last_retryable_error.response()
+    if state.blocked_until:
+        retry_at = min(value for value in state.blocked_until if value is not None)
+        if state.lease_contention_seen:
+            return _service_unavailable(
+                "provider_temporarily_unavailable",
+                "Providers are handling concurrent recovery probes; retry shortly.",
+                retry_after_header(retry_at),
+            )
         return _quota_unavailable(retry_at)
-    if attempts_started:
+    if state.attempts_started:
         raise AssertionError(
             "A started provider route must return a response or failure"
         )
     raise ServiceConfigurationError(
         "No provider circuit state could be verified; no upstream request was sent."
     )
+
+
+def _retry_route_target(
+    target: tuple[DatabaseTenantSnapshot, str, bool, float],
+    deadline: float,
+) -> bool:
+    """Wait cooperatively for an eligible retry unless its request budget expired."""
+    retry_at = target[3]
+    if retry_at > deadline or monotonic() > deadline:
+        return False
+    remaining = retry_at - monotonic()
+    if remaining > 0:
+        cooperative_sleep(remaining)
+    return True
+
+
+def forward_tenant_route(
+    req: Request, snapshot: DatabaseTenantRoutingSnapshot, *, azure_only: bool = False
+) -> Response:
+    """Try each configured candidate, then eligible bounded transient retries."""
+    route_profiles = routed_profiles(snapshot, azure_only=azure_only)
+    catalog_candidates = catalog_profiles(snapshot, azure_only=azure_only)
+    payload = req.get_json(silent=True)
+    if not isinstance(payload, dict):
+        raise ServiceConfigurationError(
+            "Request model must match the tenant's Cursor model ID."
+        )
+    inbound_model = payload.get("model")
+    route_targets = _resolve_request_targets(
+        snapshot,
+        inbound_model,
+        route_profiles,
+        catalog_candidates,
+        azure_only=azure_only,
+    )
+    attempts = deque((profile, model, False, 0.0) for profile, model in route_targets)
+    database = current_app.extensions.get("database")
+    breaker_store = (
+        ProviderCircuitBreakerStore(database.sessions, database.secret_cipher)
+        if isinstance(database, Database)
+        else None
+    )
+    state = RouteAttemptState(blocked_until=[])
+    retry_targets = []
+    deadline = monotonic() + MAX_TRANSIENT_RETRY_WAIT_SECONDS
+    while attempts or retry_targets:
+        if not attempts:
+            attempts.extend(sorted(retry_targets, key=lambda target: target[3]))
+            retry_targets.clear()
+        profile, target_model, is_retry, _ = attempts.popleft()
+        if is_retry and not _retry_route_target(
+            (profile, target_model, is_retry, _), deadline
+        ):
+            continue
+        response = _attempt_route_target(
+            req,
+            snapshot,
+            inbound_model,
+            profile,
+            target_model,
+            is_retry,
+            breaker_store,
+            state,
+            retry_targets,
+            deadline,
+        )
+        if response is not None:
+            return response
+    return _final_route_failure(state)

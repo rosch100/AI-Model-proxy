@@ -24,9 +24,12 @@ def qualified_model_id(provider: str, profile_name: str, model_id: str) -> str:
 
 
 def tenant_catalog_model_ids(
-    profiles: Sequence[DatabaseTenantSnapshot], *, azure_only: bool = False
+    profiles: Sequence[DatabaseTenantSnapshot],
+    *,
+    azure_only: bool = False,
+    include_custom_model_id: bool = True,
 ) -> tuple[str, ...]:
-    """Project active tenant profiles into unique IDs Cursor can select."""
+    """Project ready tenant profiles into unique IDs Cursor can select."""
     candidates = tuple(
         profile for profile in profiles if not azure_only or profile.provider == "azure"
     )
@@ -34,8 +37,8 @@ def tenant_catalog_model_ids(
         return ()
 
     custom_model_id = candidates[0].custom_model_id
-    model_ids = [custom_model_id]
-    native_ids = {custom_model_id.casefold()}
+    model_ids = [custom_model_id] if include_custom_model_id else []
+    native_ids = {custom_model_id.casefold()} if include_custom_model_id else set()
     account_name_counts = {}
     for profile in candidates:
         if profile.profile_name is not None:

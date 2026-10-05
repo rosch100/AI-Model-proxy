@@ -5,7 +5,7 @@
 <section>
   {% set labels = {"azure": "Azure", "openai": "OpenAI", "openrouter": "OpenRouter", "deepseek": "DeepSeek"} %}
   <h1>Anbieter und Konten</h1>
-  <p class="lede">Mehrere Konten können gemeinsam eine priorisierte Failover-Reihenfolge bilden. Neue Konten bleiben inaktiv, bis sie ausdrücklich hinzugefügt werden.</p>
+  <p class="lede">Mehrere Konten können gemeinsam eine priorisierte Failover-Reihenfolge bilden. Bereite Konten sind auch außerhalb dieser Reihenfolge direkt über ihre Modellkennung nutzbar; nur Konten in der Reihenfolge dienen als Standard- und Failover-Ziele.</p>
   <h2>Bevorzugte Reihenfolge</h2>
   <p>Cursor verwendet die Modellkennung <code>{{ cursor_model_id }}</code>; der Proxy leitet sie an das Standardmodell des jeweiligen Kontos weiter.</p>
   <p>Nur bei HTTP 408/429/5xx oder einem sicheren Verbindungsfehler vor der Antwort versucht der Proxy das nächste Konto. Andere 4xx und Fehler nach Beginn einer Antwort werden nicht erneut gesendet.</p>
@@ -35,7 +35,7 @@
   {% if view.active_profile_id %}
     <p>Derzeit ausgewählt: <strong>{{ labels.get(view.active_provider, "Unbekannter Anbieter") }} · {{ view.active_profile_name or "Unbekanntes Konto" }}</strong></p>
   {% else %}
-    <p class="error-text">Kein Konto ist aktiv. Anfragen über den Proxy sind derzeit nicht möglich.</p>
+    <p class="error-text">Kein Konto ist in der Standardkaskade. Anfragen mit der Cursor-Modellkennung sind derzeit nicht möglich; bereitstehende Konten können weiterhin über ihre Modellkennung angesprochen werden.</p>
   {% endif %}
   <p><a href="{{ url_for('admin.create_connection_form') }}">Konto hinzufügen</a></p>
 
@@ -47,7 +47,8 @@
         <li>
           <h3>{{ profile.display_name }}</h3>
           <p>
-            {% if profile.route_priority is not none %}<strong>Für Anfragen ausgewählt · Position {{ profile.route_priority }}</strong>{% else %}Nicht ausgewählt{% endif %}
+            {% if profile.route_priority is not none %}<strong>Standardkaskade · Position {{ profile.route_priority }}</strong>{% else %}<strong>Nicht in der Standardkaskade</strong>{% endif %}
+            · {% if profile.inference_secret_ciphertext and profile.default_model in view.selectable_model_ids[profile.id] %}Direkt per Modellkennung nutzbar{% else %}Einrichtung prüfen{% endif %}
             · Standardmodell: {{ profile.default_model or "nicht ausgewählt" }}
             · {% if profile.catalog_error %}Modellliste konnte nicht geladen werden{% elif profile.catalog_refreshed_at %}Modellliste aktualisiert{% else %}Modellliste noch nicht geladen{% endif %}
             · {% if profile.inference_secret_ciphertext %}Schlüssel für Anfragen gespeichert{% else %}Schlüssel für Anfragen fehlt{% endif %}
@@ -73,7 +74,7 @@
             <form method="post" action="{{ url_for('admin.activate_connection', profile_id=profile.id) }}">
               <input type="hidden" name="csrf_token" value="{{ csrf_token() }}" />
               <input type="hidden" name="profile_id" value="{{ profile.id }}" />
-              <button type="submit" {% if not profile.inference_secret_ciphertext or profile.default_model not in view.selectable_model_ids[profile.id] %}disabled{% endif %}>Konto aktivieren</button>
+              <button type="submit" {% if not profile.inference_secret_ciphertext or profile.default_model not in view.selectable_model_ids[profile.id] %}disabled{% endif %}>Zur Standardkaskade hinzufügen</button>
             </form>
           {% endif %}
           {% if profile.catalog_error %}<p class="error-text">{{ profile.catalog_error }}</p>{% endif %}
@@ -98,7 +99,7 @@
   {% if view.active_profile_id %}
     <form method="post" action="{{ url_for('admin.deactivate_connection') }}">
       <input type="hidden" name="csrf_token" value="{{ csrf_token() }}" />
-      <button type="submit">Alle Konten deaktivieren</button>
+      <button type="submit">Standardkaskade leeren</button>
     </form>
   {% endif %}
 </section>

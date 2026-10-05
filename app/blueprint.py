@@ -5,8 +5,9 @@ forwards incoming HTTP requests to the configured backend implementation.
 """
 
 import uuid
+from datetime import timezone
 
-from flask import Blueprint, current_app, g, jsonify, request
+from flask import Blueprint, abort, current_app, g, jsonify, request
 
 from .auth import current_tenant, is_tenant_auth_mode, require_auth
 from .azure.adapter import AzureAdapter
@@ -19,11 +20,12 @@ from .common.recording import (
     record_payload,
 )
 from .exceptions import ConfigurationError, ServiceConfigurationError
-from .providers.model_ids import tenant_catalog_model_ids
-from .providers.routing import forward_tenant_route, routed_profiles
+from .providers.model_ids import qualified_model_id, tenant_catalog_model_ids
+from .providers.routing import catalog_profiles, forward_tenant_route, routed_profiles
 from .tenants import (
     AUTH_MODE_TENANT,
     DatabaseTenantRoutingSnapshot,
+    DatabaseTenantSnapshot,
 )
 
 blueprint = Blueprint("blueprint", __name__)
@@ -104,12 +106,14 @@ def _azure_model_ids() -> list[str]:
     """Return Cursor-facing Azure model ids for the authenticated principal."""
     tenant = current_tenant()
     if isinstance(tenant, DatabaseTenantRoutingSnapshot):
-        profiles = routed_profiles(
-            tenant, azure_only=_is_explicit_azure_path(request.path)
-        )
+        azure_only = _is_explicit_azure_path(request.path)
+        active_profiles = routed_profiles(tenant, azure_only=azure_only)
+        profiles = active_profiles if azure_only else catalog_profiles(tenant)
         return list(
             tenant_catalog_model_ids(
-                profiles, azure_only=_is_explicit_azure_path(request.path)
+                profiles,
+                azure_only=azure_only,
+                include_custom_model_id=bool(active_profiles),
             )
         )
     if tenant is not None:
@@ -190,6 +194,92 @@ def models():
                 }
                 for model in _azure_model_ids()
             ],
+        }
+    )
+
+
+def _discovery_models(profile: DatabaseTenantSnapshot) -> list[dict[str, object]]:
+    """Project a ready profile's catalog into safe discovery model items."""
+    models: list[dict[str, object]] = []
+    for model_id in profile.catalog_model_ids:
+        item: dict[str, object] = {"id": model_id}
+        if profile.profile_name is not None and profile.provider is not None:
+            item["qualified_id"] = qualified_model_id(
+                profile.provider, profile.profile_name, model_id
+            )
+        pricing = profile.catalog_pricing.get(model_id)
+        if pricing is not None and profile.catalog_refreshed_at is not None:
+            refreshed_at = profile.catalog_refreshed_at
+            if refreshed_at.tzinfo is None:
+                refreshed_at = refreshed_at.replace(tzinfo=timezone.utc)
+            item["pricing"] = {
+                key: pricing[key]
+                for key in (
+                    "input_per_1m_tokens",
+                    "output_per_1m_tokens",
+                    "cache_per_1m_tokens",
+                    "currency",
+                )
+            }
+            item["pricing"]["source"] = pricing["source"]
+            item["pricing"]["updated_at"] = refreshed_at.astimezone(
+                timezone.utc
+            ).isoformat()
+        models.append(item)
+    return models
+
+
+def _database_discovery_tenant():
+    """Return the authenticated database tenant or explicitly reject the mode."""
+    tenant = current_tenant()
+    if not isinstance(tenant, DatabaseTenantRoutingSnapshot):
+        abort(400, description="Provider discovery requires database tenant mode.")
+    return tenant
+
+
+@blueprint.route("/v1/providers", methods=["GET"])
+@require_auth
+def providers():
+    """List provider profiles available in the authenticated tenant snapshot."""
+    tenant = _database_discovery_tenant()
+    return jsonify(
+        {
+            "object": "list",
+            "data": [
+                {
+                    "provider": profile.provider,
+                    "name": profile.profile_name,
+                    "models": _discovery_models(profile),
+                }
+                for profile in catalog_profiles(tenant)
+            ],
+        }
+    )
+
+
+@blueprint.route("/v1/providers/<provider>/models", methods=["GET"])
+@require_auth
+def provider_models(provider: str):
+    """Return models for a named provider profile in this tenant snapshot."""
+    tenant = _database_discovery_tenant()
+    profile_name = request.args.get("profile")
+    if profile_name is None or not profile_name.strip():
+        abort(400, description="A non-empty profile query parameter is required.")
+    profile = next(
+        (
+            candidate
+            for candidate in catalog_profiles(tenant)
+            if candidate.provider == provider and candidate.profile_name == profile_name
+        ),
+        None,
+    )
+    if profile is None:
+        abort(404)
+    return jsonify(
+        {
+            "provider": profile.provider,
+            "name": profile.profile_name,
+            "models": _discovery_models(profile),
         }
     )
 

@@ -136,23 +136,30 @@ for enrollment and operator recovery if the last passkey is lost.
 In **Verbindung**, add provider accounts, refresh their catalogs and select a
 catalog-backed standard model per account. Activate multiple accounts and use
 **Nach oben / Nach unten** to set the root inference failover order. Cursor keeps
-one stable tenant model ID; each profile maps it explicitly to its standard model.
-The model list also exposes each catalog's native IDs, which route only across
-accounts that advertise that exact model (in route-priority order). To select a
+one stable tenant model ID; it uses only activated accounts in the configured
+failover order. The model list also exposes native IDs from every configured,
+ready account; selecting one routes directly to an account advertising that
+model, even if that account is not in the default failover order. To select a
 specific account with a unique name, use `Account Name/model-id`, for example
 `Research Team/deepseek-flash`. If account names are duplicated, use
 `provider:Account Name/model-id`, such as
 `deepseek:Research Team/deepseek-flash`; spaces remain readable, and reserved
-characters in account names are percent-encoded. An explicit account/model ID
-is pinned to that account and never falls back to a different account. Unknown
-model IDs are rejected rather than forwarded unchanged.
+characters in account names are percent-encoded. Provider-qualified IDs use the
+provider key (`deepseek`, `openrouter`, `openai`, or `azure`), then the exact
+account display name and native model ID. An explicit account/model ID is pinned
+to that account and never falls back to a different account. Unknown model IDs
+are rejected rather than forwarded unchanged.
 
-Root requests using the tenant model ID try the next account on HTTP 408/429/5xx,
+Root requests using the tenant model ID try the next account on HTTP 402/408/429/5xx,
 safe connection failures, or recognized early SSE errors, but never after stream
-output begins. Other 4xx and ambiguous read failures are final. Switching is best
-effort and may incur additional processing/costs. `/azure` stays scoped to active
-Azure accounts; `/codex` and single/environment-tenant mode keep their existing
-behavior.
+output begins. Other 4xx and ambiguous read failures are final. After the full route
+is tried, transient HTTP 402/429 responses and explicitly transient provider limits
+with a `Retry-After` of at most 30 seconds (or no header) get one cooperative retry
+per profile, using a 1-second default delay. Hard quota exhaustion is not retried
+on the same profile, though the next account in the route is still tried. Switching
+is best effort and may incur additional processing/costs. `/azure` stays scoped to
+active Azure accounts; `/codex` and single/environment-tenant mode keep their
+existing behavior.
 Run `flask db upgrade` before deploying the new route schema. See the
 [routing decision](docs/adr/0001-azure-rooted-multi-provider-proxy.md).
 
@@ -507,7 +514,9 @@ Flask reload server on port `8082`.
 | Method | Path | Auth | Description |
 | --- | --- | --- | --- |
 | `GET` | `/health` | No | Liveness |
-| `GET` | `/v1/models`, `/azure/v1/models` | Bearer | Azure model list for the principal |
+| `GET` | `/v1/models`, `/azure/v1/models` | Bearer | OpenAI-compatible model list for the principal |
+| `GET` | `/v1/providers` | Bearer | Database-tenant provider profiles with routable models and available pricing |
+| `GET` | `/v1/providers/<provider>/models?profile=<name>` | Bearer | Routable models and pricing for one named database-tenant profile |
 | `GET` | `/codex/v1/models` | Bearer | Codex model list |
 | `GET` | `/codex/ready` | Bearer | Codex auth readiness |
 | `POST` | `/v1/chat/completions`, `/azure/…` | Bearer | Chat completions → Azure |
@@ -515,6 +524,56 @@ Flask reload server on port `8082`.
 | `POST` | `/v1/responses`, `/azure/…` | Bearer | Responses → Azure |
 | `POST` | `/codex/v1/responses` | Bearer | Responses → Codex |
 | `*` | `/*` | Bearer | Catch-all proxy |
+
+Provider discovery is available only with `AUTH_MODE=tenant` and
+`TENANT_CONFIG_SOURCE=database`. `/v1/models` remains OpenAI-compatible and lists
+models available to the authenticated tenant. `/v1/providers` lists each ready
+profile as `{provider, name, models}`; `name` is the configured display name
+(or `null` for an unnamed profile). Models expose the native `id` and, for
+named profiles, a provider-qualified `qualified_id` using
+`provider:display-name/native-id`; reserved characters in the display name are
+percent-encoded in this identifier. The `profile` query parameter must also be
+URL-encoded. Select a profile with
+`/v1/providers/<provider>/models?profile=<URL-encoded display
+name>`; slashes and other reserved characters in the profile name must be
+URL-encoded. Unnamed profiles appear in the list but cannot be requested
+individually. Requests outside database tenant mode receive HTTP 400, missing
+authentication receives 401, and unknown providers/profiles receive 404. Both
+routes read only the authenticated request's `available_profiles` snapshot, do
+not query global configuration or other tenants, and expose no internal profile
+or tenant IDs, secrets, Azure deployment names, or raw settings.
+
+When a complete published price is available, each model includes `pricing`
+with `input_per_1m_tokens`, `output_per_1m_tokens`, `cache_per_1m_tokens`,
+`currency`, `source`, and `updated_at`. Prices are decimal strings per million
+tokens; cache means cache-read pricing. The pricing object is omitted when any
+required rate is unavailable. Example:
+
+```json
+{
+  "object": "list",
+  "data": [
+    {
+      "provider": "openrouter",
+      "name": "Research/Team",
+      "models": [
+        {
+          "id": "anthropic/claude-3.7",
+          "qualified_id": "openrouter:Research%2FTeam/anthropic/claude-3.7",
+          "pricing": {
+            "input_per_1m_tokens": "1.25",
+            "output_per_1m_tokens": "2.5",
+            "cache_per_1m_tokens": "0.25",
+            "currency": "USD",
+            "source": "https://openrouter.ai/api/v1/models",
+            "updated_at": "2026-10-05T00:00:00+00:00"
+          }
+        }
+      ]
+    }
+  ]
+}
+```
 
 ---
 
@@ -530,6 +589,13 @@ curl -H "Authorization: Bearer $SERVICE_API_KEY" \
 # Tenant mode — use a tenant cleartext key
 curl -H "Authorization: Bearer $TENANT_CLEARTEXT_KEY" \
   http://127.0.0.1:8082/v1/models
+
+# Database tenant mode — provider profiles and a named profile's models
+curl -H "Authorization: Bearer $TENANT_CLEARTEXT_KEY" \
+  http://127.0.0.1:8082/v1/providers
+curl -G -H "Authorization: Bearer $TENANT_CLEARTEXT_KEY" \
+  --data-urlencode "profile=Research/Team" \
+  http://127.0.0.1:8082/v1/providers/openrouter/models
 
 # Codex (AUTH_MODE=single, ENABLE_CODEX=true)
 curl -H "Authorization: Bearer $SERVICE_API_KEY" \

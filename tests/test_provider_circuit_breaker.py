@@ -134,6 +134,7 @@ def test_due_breaker_has_one_half_open_lease_and_expired_lease_can_be_claimed(
     assert first.allowed and first.leases[0].token
     assert not concurrent.allowed
     assert concurrent.retry_at == first.leases[0].lease_until
+    assert concurrent.lease_blocked
     assert expired.allowed and expired.leases[0].token != first.leases[0].token
 
 

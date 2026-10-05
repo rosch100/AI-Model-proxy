@@ -181,7 +181,7 @@ def create_provider_profile(
     inference_secret: str | None,
     actor_id: str,
 ) -> ProviderProfile:
-    """Create an inactive, tenant-owned account with encrypted credentials."""
+    """Create a tenant-owned account outside the default route."""
     if provider not in {"azure", "openai", "openrouter", "deepseek"}:
         raise ValueError("Unsupported provider")
     if session.get(Tenant, tenant_id) is None:
@@ -570,6 +570,7 @@ def replace_catalog_entries(
     profile: ProviderProfile,
     entries: list[tuple[str, str | None]],
     error: str | None,
+    pricing: dict[str, dict[str, str]] | None = None,
 ) -> None:
     """Replace catalog rows, deactivating routes whose target disappeared."""
     _lock_tenant(session, profile.tenant_id)
@@ -594,12 +595,34 @@ def replace_catalog_entries(
         session.delete(row)
     session.flush()
     for model_id, deployment_id in entries:
+        rates = pricing.get(model_id) if pricing else None
+        has_complete_pricing = rates is not None and all(
+            rates.get(key) is not None
+            for key in (
+                "input_per_1m_tokens",
+                "output_per_1m_tokens",
+                "cache_per_1m_tokens",
+                "currency",
+                "source",
+            )
+        )
         session.add(
             ProviderCatalogEntry(
                 profile_id=profile.id,
                 model_id=model_id,
                 deployment_id=deployment_id,
                 source="provider",
+                input_price_per_1m_tokens=(
+                    rates["input_per_1m_tokens"] if has_complete_pricing else None
+                ),
+                output_price_per_1m_tokens=(
+                    rates["output_per_1m_tokens"] if has_complete_pricing else None
+                ),
+                cache_price_per_1m_tokens=(
+                    rates["cache_per_1m_tokens"] if has_complete_pricing else None
+                ),
+                pricing_currency=rates["currency"] if has_complete_pricing else None,
+                pricing_source=rates["source"] if has_complete_pricing else None,
             )
         )
     profile.catalog_refreshed_at = datetime.now(timezone.utc)

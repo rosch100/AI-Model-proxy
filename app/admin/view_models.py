@@ -28,12 +28,13 @@ from app.persistence.provider_circuit_breaker import CircuitSnapshot
 
 @dataclass(frozen=True)
 class ProviderStatus:
-    """Dashboard status for one provider profile or a missing provider."""
+    """Dashboard status separates account readiness from default-route membership."""
 
     provider: str
     label: str
     state: str
     is_active: bool
+    is_routed: bool
     profile_id: str | None = None
     profile_name: str | None = None
     route_priority: int | None = None
@@ -44,7 +45,6 @@ class ProviderStatus:
     last_failure_status_code: int | None = None
     has_current_activity: bool = False
     quota_probe_at: datetime | None = None
-    is_disabled: bool = False
     is_overloaded: bool = False
     has_recent_failure: bool = False
 
@@ -291,13 +291,17 @@ def _summarize_records(
     return tuple(summaries)
 
 
-def provider_state(profile: ProviderProfile | None) -> str:
-    """Return a clear setup status for one provider profile."""
+def provider_state(
+    profile: ProviderProfile | None, catalog_model_ids: Sequence[str] = ()
+) -> str:
+    """Return whether one profile has credentials and its default model available."""
     if profile is None:
         return "Nicht eingerichtet"
-    if not profile.inference_secret_ciphertext or not profile.default_model:
-        return "Einrichtung prüfen"
-    if profile.catalog_error:
+    if (
+        not profile.inference_secret_ciphertext
+        or not profile.default_model
+        or profile.default_model not in catalog_model_ids
+    ):
         return "Einrichtung prüfen"
     return "Eingerichtet"
 
@@ -330,6 +334,7 @@ def dashboard_view(
     circuit_scopes_by_profile: Mapping[str, Sequence[CircuitSnapshot]] | None = None,
     include_activity_board: bool = True,
     failed_attempts: Sequence[tuple[ProviderAttemptEvent, str | None]] = (),
+    catalog_model_ids_by_profile: Mapping[str, Sequence[str]] | None = None,
 ) -> DashboardView:
     """Build provider status and latest-snapshot cost summaries for a tenant."""
     visible_profiles = sorted(
@@ -463,6 +468,7 @@ def dashboard_view(
                 else ACTIVITY_WINDOW_MINUTES
             ),
             circuit_snapshots=circuit_scopes_by_profile.get(profile.id, ()),
+            catalog_model_ids=(catalog_model_ids_by_profile or {}).get(profile.id, ()),
         )
         for profile in visible_profiles
     )
@@ -473,6 +479,7 @@ def dashboard_view(
             label=_PROVIDER_LABELS[provider],
             state="Nicht eingerichtet",
             is_active=False,
+            is_routed=False,
         )
         for provider in _PROVIDER_LABELS
         if provider not in configured_providers
@@ -498,6 +505,7 @@ def _provider_status(
     now: datetime,
     activity_window_minutes: int,
     circuit_snapshots: Sequence[CircuitSnapshot],
+    catalog_model_ids: Sequence[str],
 ) -> ProviderStatus:
     """Build a profile card from inference recency and its hysteresis state."""
     outcome = None if attempt_status is None else attempt_status["outcome"]
@@ -560,13 +568,13 @@ def _provider_status(
         and attempt_status["last_attempt_at"] >= now - timedelta(seconds=20)
     )
     is_overloaded = latest_attempt_is_rate_limited or quota_status_at is not None
-    state = provider_state(profile)
+    state = provider_state(profile, catalog_model_ids)
     return ProviderStatus(
         provider=profile.provider,
         label=_PROVIDER_LABELS[profile.provider],
         state=state,
-        is_active=profile.route_priority is not None,
-        is_disabled=profile.route_priority is None and state == "Eingerichtet",
+        is_active=state == "Eingerichtet",
+        is_routed=profile.route_priority is not None,
         is_overloaded=is_overloaded,
         has_recent_failure=has_recent_failure,
         profile_id=profile.id,

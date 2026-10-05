@@ -383,6 +383,11 @@ def test_routing_snapshot_uses_one_statement_ordered_catalog_and_immutable_profi
     assert snapshot.id == "acme"
     assert isinstance(snapshot.profiles, tuple)
     assert [p.profile_id for p in snapshot.profiles] == ids
+    assert [p.profile_name for p in snapshot.available_profiles] == [
+        "Two",
+        "One",
+        "Inactive",
+    ]
     assert snapshot.profiles[1].azure_model_deployments == {"gpt-5.4": "deployment-a"}
     assert snapshot.profiles[1].catalog_model_ids == ("gpt-5.4",)
     assert snapshot.profiles[1].default_model == "gpt-5.4"
@@ -442,26 +447,38 @@ def test_snapshot_empty_route_is_authenticated_and_unknown_key_is_not(route_data
     assert route_database.get_proxy_snapshot_by_api_key("unknown") is None
 
 
-def test_admin_snapshot_and_dashboard_derive_primary_and_all_active_providers(
-    route_database,
-):
-    """Admin views derive the primary and all routed providers from priorities."""
+def test_admin_dashboard_separates_ready_profiles_from_default_route(route_database):
+    """An account can be ready for direct model use without joining the route."""
     with route_database.sessions.begin() as session:
         tenant = session.get(Tenant, "acme")
         one = create_ready_profile(session, route_database, "One")
         two = create_ready_profile(
             session, route_database, "Two", provider="openrouter"
         )
+        direct = create_ready_profile(
+            session, route_database, "Direct", provider="deepseek"
+        )
         for profile in (two, one):
             admin_ops.activate_provider_profile(session, tenant, profile.id, "ada")
         resolved, primary = TenantRepository(session).get_admin_snapshot("acme")
         assert resolved.id == tenant.id
         assert primary.id == two.id
-        dashboard = dashboard_view(tenant, (one, two))
-        assert {p.provider for p in dashboard.providers if p.is_active} == {
+        dashboard = dashboard_view(
+            tenant,
+            (one, two, direct),
+            catalog_model_ids_by_profile={
+                profile.id: (profile.default_model,) for profile in (one, two, direct)
+            },
+        )
+        assert {p.provider for p in dashboard.providers if p.is_routed} == {
             "openai",
             "openrouter",
         }
+        direct_status = next(
+            status for status in dashboard.providers if status.profile_name == "Direct"
+        )
+        assert direct_status.is_active
+        assert not direct_status.is_routed
 
 
 def test_route_mutations_hold_tenant_lock_and_flush_null_phase(route_database):

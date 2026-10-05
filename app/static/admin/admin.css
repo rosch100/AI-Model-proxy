@@ -865,6 +865,14 @@ code {
   vertical-align: middle;
 }
 
+.activity-failure-row {
+  background: color-mix(in srgb, var(--flash-error) 5%, var(--surface));
+}
+
+.activity-failure-row td:first-child {
+  border-left: 3px solid var(--flash-error);
+}
+
 .activity-time-cell,
 .activity-token-cell {
   font-variant-numeric: tabular-nums;

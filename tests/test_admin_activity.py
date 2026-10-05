@@ -228,9 +228,17 @@ def test_activity_board_limits_request_list_to_most_recent_entries():
     assert board.requests[-1].occurred_at == now - timedelta(minutes=49)
 
 
-def test_activity_board_lists_provider_failures_as_attempts_not_requests():
-    """Expose failed upstream attempts separately from completed user requests."""
+def test_activity_board_merges_failures_with_requests_in_selected_period():
+    """Order failed upstream attempts alongside requests without counting them."""
     now = datetime(2026, 10, 3, 16, 20, tzinfo=timezone.utc)
+    request = InferenceActivityEvent(
+        tenant_id="acme",
+        provider="azure",
+        inbound_model="gpt-6-luna",
+        routed_model="gpt-6-luna",
+        total_tokens=10,
+        occurred_at=now - timedelta(minutes=3),
+    )
     attempt = ProviderAttemptEvent(
         id=1,
         tenant_id="acme",
@@ -243,22 +251,41 @@ def test_activity_board_lists_provider_failures_as_attempts_not_requests():
         occurred_at=now - timedelta(minutes=2),
         completed_at=now - timedelta(minutes=1),
     )
-
-    board = activity_board(
-        (),
-        custom_model_id="cursor-acme-model",
-        now=now,
-        failed_attempts=((attempt, "Altanis Proxy"),),
+    older_attempt = ProviderAttemptEvent(
+        id=2,
+        tenant_id="acme",
+        provider="openrouter",
+        profile_id="openrouter-main",
+        inbound_model="gpt-5",
+        routed_model="openai/gpt-5",
+        outcome="failure",
+        status_code=500,
+        occurred_at=now - timedelta(hours=2),
+        completed_at=now - timedelta(hours=2),
     )
 
-    assert board.requests == ()
+    board = activity_board(
+        (request,),
+        custom_model_id="cursor-acme-model",
+        now=now,
+        request_period_hours=1,
+        failed_attempts=((attempt, "Altanis Proxy"), (older_attempt, "Altanis Proxy")),
+    )
+
+    assert len(board.requests) == 1
     assert len(board.failed_attempts) == 1
-    assert board.failed_attempts[0].requested_model == "gpt-6-luna"
-    assert board.failed_attempts[0].provider_label == "OpenRouter"
-    assert board.failed_attempts[0].profile_name == "Altanis Proxy"
-    assert board.failed_attempts[0].routed_model == "openai/gpt-6-luna"
-    assert board.failed_attempts[0].status_code == 402
-    assert board.failed_attempts[0].occurred_at == now - timedelta(minutes=1)
+    assert [row.kind for row in board.entries] == ["failure", "request"]
+    assert [row.occurred_at for row in board.entries] == [
+        now - timedelta(minutes=1),
+        now - timedelta(minutes=3),
+    ]
+    failure = board.entries[0]
+    assert failure.requested_model == "gpt-6-luna"
+    assert failure.provider_label == "OpenRouter"
+    assert failure.profile_name == "Altanis Proxy"
+    assert failure.routed_model == "openai/gpt-6-luna"
+    assert failure.status_code == 402
+    assert failure.outcome_label == "Provider-Versuch fehlgeschlagen · HTTP 402"
 
 
 def test_dashboard_renders_activity_empty_state(admin_app):
@@ -274,8 +301,8 @@ def test_dashboard_renders_activity_empty_state(admin_app):
     assert "Tokens insgesamt" in body
 
 
-def test_dashboard_lists_failed_provider_attempts_separately(admin_app):
-    """Render failed upstream attempts without counting them as user requests."""
+def test_dashboard_lists_failures_with_requests_in_selected_period(admin_app):
+    """Render failed attempts in the same chronological list as requests."""
     database = admin_app.extensions["database"]
     occurred_at = datetime.now(timezone.utc) - timedelta(seconds=10)
     with database.sessions.begin() as session:
@@ -292,6 +319,18 @@ def test_dashboard_lists_failed_provider_attempts_separately(admin_app):
         session.add(profile)
         session.flush()
         session.add(
+            InferenceActivityEvent(
+                tenant_id="acme",
+                provider="azure",
+                inbound_model="gpt-6-luna",
+                routed_model="gpt-6-luna",
+                input_tokens=8,
+                output_tokens=4,
+                total_tokens=12,
+                occurred_at=occurred_at - timedelta(seconds=5),
+            )
+        )
+        session.add(
             ProviderAttemptEvent(
                 tenant_id="acme",
                 provider="openrouter",
@@ -307,12 +346,16 @@ def test_dashboard_lists_failed_provider_attempts_separately(admin_app):
 
     body = _authenticated_client(admin_app).get("/admin/").get_data(as_text=True)
 
-    assert "Fehlgeschlagene Provider-Versuche" in body
+    assert "Fehlgeschlagene Provider-Versuche</h3>" not in body
     assert "OpenRouter · Altanis Proxy" in body
     assert "Angefragt: gpt-6-luna" in body
     assert "An Provider gesendet: <code>openai/gpt-6-luna</code>" in body
     assert "Provider-Versuch fehlgeschlagen · HTTP 402" in body
-    assert "Keine Anfragen im gewählten Zeitraum" in body
+    assert "Neueste Einträge zuerst · 2 Einträge" in body
+    assert body.index("Fehlgeschlagener Provider-Versuch") < body.index(
+        "<strong>gpt-6-luna</strong>"
+    )
+    assert "Keine Anfragen im gewählten Zeitraum" not in body
 
 
 def test_dashboard_rejects_unsupported_activity_period(admin_app):
@@ -400,7 +443,7 @@ def test_dashboard_renders_provider_model_activity(admin_app):
     assert "Letzte 15 Minuten" in body
     assert "Letzte Stunde" in body
     assert "Tokens insgesamt" in body
-    assert "Neueste Anfragen zuerst" in body
+    assert "Neueste Einträge zuerst" in body
     assert "Azure" in body
     assert "Anbieterstatus" in body
     assert body.index("Anbieterstatus") < body.index("Aktuelle Anfragen")

@@ -14,7 +14,7 @@ azure-identity==1.26.0
 PyJWT>=2.15.1
 
 # Deployment
-gevent==25.9.1
+gevent==26.9.0
 gunicorn>=26.2.0
 supervisor==4.3.0
 # Required by gunicorn's gevent worker but not declared by it

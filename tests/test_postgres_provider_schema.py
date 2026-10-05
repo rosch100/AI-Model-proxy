@@ -33,6 +33,41 @@ pytestmark = [
 ]
 
 
+def test_model_activity_columns_fit_qualified_model_ids(postgres_test_databases):
+    """Store qualified Cursor model IDs in both routing activity tables."""
+    databases = postgres_test_databases
+    databases.upgrade("head")
+
+    with databases.runtime_engine.connect() as connection:
+        inspector = inspect(connection)
+        for table in ("provider_attempt_events", "inference_activity_events"):
+            inbound_model = next(
+                column
+                for column in inspector.get_columns(table)
+                if column["name"] == "inbound_model"
+            )
+            assert inbound_model["type"].length == 2048
+        failure_details = next(
+            column
+            for column in inspector.get_columns("provider_attempt_events")
+            if column["name"] == "failure_details"
+        )
+        assert failure_details["nullable"] is True
+
+    databases.downgrade("20261009_deepseek_provider")
+    with databases.runtime_engine.connect() as connection:
+        inspector = inspect(connection)
+        for table in ("provider_attempt_events", "inference_activity_events"):
+            inbound_model = next(
+                column
+                for column in inspector.get_columns(table)
+                if column["name"] == "inbound_model"
+            )
+            assert inbound_model["type"].length == 256
+
+    databases.upgrade("head")
+
+
 def test_multiple_provider_profiles_and_casefolded_active_names_are_enforced(
     postgres_test_databases,
 ):

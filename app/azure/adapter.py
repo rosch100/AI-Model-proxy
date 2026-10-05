@@ -8,7 +8,9 @@ import random
 import re
 import time
 from dataclasses import dataclass
+from functools import partial
 from typing import Any, Optional
+from urllib.parse import quote
 
 import requests
 from flask import Request, Response
@@ -17,7 +19,6 @@ from ..common.logging import console
 from ..common.recording import record_payload
 from ..providers.circuit_breaker import ProviderCircuitAttempt
 from ..providers.failover_upstream import (
-    ROUTED_READ_TIMEOUT_SECONDS,
     prepare_upstream,
     transport_failure,
 )
@@ -27,6 +28,7 @@ from ..tenants import DatabaseTenantSnapshot
 from .request_adapter import RequestAdapter
 from .response_adapter import ResponseAdapter
 
+AZURE_ROUTED_READ_TIMEOUT_SECONDS = 300.0
 MAX_AZURE_RETRY_DELAY_SECONDS = 60.0
 MIN_AZURE_RATE_LIMIT_DELAY_SECONDS = 15.0
 
@@ -71,6 +73,7 @@ class AzureAdapter:
         self.activity_profile_id: str | None = None
         self.activity_routed_model: str | None = None
         self.activity_settings: dict[str, Any] = {}
+        self.resume_stream = False
 
     # Public API
     def forward(
@@ -111,7 +114,7 @@ class AzureAdapter:
         request_kwargs = self.request_adapter.adapt(
             req, snapshot, target_model=target_model
         )
-        request_kwargs["timeout"] = (10.0, ROUTED_READ_TIMEOUT_SECONDS)
+        request_kwargs["timeout"] = (10.0, AZURE_ROUTED_READ_TIMEOUT_SECONDS)
         try:
             upstream = requests.request(**request_kwargs)
         except requests.RequestException as exc:
@@ -133,9 +136,34 @@ class AzureAdapter:
             prepared,
             activity_attempt_id=attempt_id,
             circuit_attempt=circuit_attempt,
+            resume_stream=(
+                partial(self._resume_azure_response, request_kwargs)
+                if self.resume_stream
+                else None
+            ),
         )
         response.call_on_close(prepared.close)
         return response
+
+    @staticmethod
+    def _resume_azure_response(
+        request_kwargs: dict[str, Any], response_id: str, sequence_number: int
+    ) -> requests.Response:
+        """Resume one stored Azure response after its last delivered event."""
+        url = f"{request_kwargs['url'].rstrip('/')}/{quote(response_id, safe='')}"
+        headers = {
+            key: value
+            for key, value in request_kwargs["headers"].items()
+            if key.casefold()
+            not in {"content-length", "content-type", "transfer-encoding", "expect"}
+        }
+        return requests.get(
+            url,
+            headers=headers,
+            params={"stream": "true", "starting_after": sequence_number},
+            stream=True,
+            timeout=request_kwargs["timeout"],
+        )
 
     def _request_upstream(
         self, request_context: AzureRequestContext

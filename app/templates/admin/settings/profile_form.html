@@ -17,6 +17,8 @@
       <div data-provider-fields="azure"{% if not profile and form.provider.data != "azure" %} hidden{% endif %}>
         <label>{{ form.base_url.label }}{{ form.base_url(type="url", placeholder="https://resource.openai.azure.com") }}</label>
         <p class="hint">Öffne im <a href="https://portal.azure.com/#view/HubsExtension/BrowseAll" target="_blank" rel="noopener noreferrer">Azure-Portal</a> deine Cognitive-Services- oder Azure-OpenAI-Ressource. Unter <strong>Keys and Endpoint</strong> findest du die Adresse (<strong>Endpoint</strong>) und den API-Schlüssel (Key 1 oder Key 2). Kopiere die Adresse ohne zusätzlichen Pfad oder URL-Parameter. Teile den Schlüssel nicht in Befehlsausgaben, Tickets oder Protokollen.</p>
+        <label class="reveal-toggle">{{ form.resume_streams() }}{{ form.resume_streams.label.text }}</label>
+        <p class="hint">Aktiviert Azure-Background-Streaming (store=true) und das Fortsetzen derselben Response nach einem Stream-Abbruch. Microsoft weist auf höhere First-Token-Latenz und mögliche Performanceprobleme hin; nur für Deployments aktivieren, die Background Responses unterstützen.</p>
       </div>
     {% endif %}
     {% if not profile or profile.provider == "openai" %}

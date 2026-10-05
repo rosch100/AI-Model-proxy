@@ -3,6 +3,7 @@
 import json
 
 import pytest
+import requests
 
 from app.azure.adapter import AzureAdapter
 from app.persistence.inference_activity import start_provider_attempt
@@ -17,6 +18,7 @@ class _FakeUpstreamResponse:
     def __init__(self, chunks):
         self._chunks = chunks
         self.closed = False
+        self.close_count = 0
 
     def iter_content(self, chunk_size=8192):
         del chunk_size
@@ -24,6 +26,7 @@ class _FakeUpstreamResponse:
 
     def close(self):
         self.closed = True
+        self.close_count += 1
 
 
 def _sse(event_name, payload):
@@ -134,6 +137,194 @@ def test_response_adapter_yields_each_delta_before_reading_next_upstream_chunk(a
 
     assert first_chunk["choices"][0]["delta"]["content"] == "first"
     assert upstream_advanced is False
+
+
+def test_resume_request_targets_response_and_sequence(monkeypatch):
+    """Resume uses the documented Azure response URL and sequence cursor."""
+    captured = {}
+    expected_response = object()
+
+    def fake_get(url, **kwargs):
+        captured["url"] = url
+        captured.update(kwargs)
+        return expected_response
+
+    monkeypatch.setattr("app.azure.adapter.requests.get", fake_get)
+
+    response = AzureAdapter._resume_azure_response(
+        {
+            "url": "https://resource.openai.azure.com/openai/v1/responses",
+            "headers": {
+                "api-key": "secret",
+                "content-type": "application/json",
+                "content-length": "36",
+            },
+            "timeout": (10.0, 300.0),
+        },
+        "resp_123",
+        17,
+    )
+
+    assert response is expected_response
+    assert captured == {
+        "url": "https://resource.openai.azure.com/openai/v1/responses/resp_123",
+        "headers": {"api-key": "secret"},
+        "params": {"stream": "true", "starting_after": 17},
+        "stream": True,
+        "timeout": (10.0, 300.0),
+    }
+
+
+def test_read_timeout_resumes_azure_response_after_last_emitted_sequence(app):
+    """Resume the same Azure response after the last forwarded SSE event."""
+    adapter = AzureAdapter()
+    adapter.inbound_model = "gpt-5.4"
+    adapter.include_usage = False
+
+    def interrupted_stream():
+        yield _sse(
+            "response.created",
+            {
+                "type": "response.created",
+                "sequence_number": 0,
+                "response": {"id": "resp_123"},
+            },
+        )
+        yield _sse(
+            "response.output_text.delta",
+            {
+                "type": "response.output_text.delta",
+                "sequence_number": 1,
+                "delta": "partial",
+            },
+        )
+        raise requests.ReadTimeout("temporary socket interruption")
+
+    def resumed_stream():
+        yield _sse(
+            "response.output_text.delta",
+            {
+                "type": "response.output_text.delta",
+                "sequence_number": 2,
+                "delta": " continued",
+            },
+        )
+        yield _sse(
+            "response.completed",
+            {
+                "type": "response.completed",
+                "sequence_number": 3,
+                "response": {"usage": {}},
+            },
+        )
+
+    resume_calls = []
+    original_upstream = _FakeUpstreamResponse(interrupted_stream())
+    resumed_upstream = _FakeUpstreamResponse(resumed_stream())
+
+    def resume(response_id, sequence_number):
+        resume_calls.append((response_id, sequence_number))
+        return resumed_upstream
+
+    response = adapter.response_adapter.adapt(
+        original_upstream,
+        resume_stream=resume,
+    )
+    body = b"".join(response.response)
+
+    assert resume_calls == [("resp_123", 1)]
+    assert b"partial" in body
+    assert b" continued" in body
+    assert b"stream_interrupted" not in body
+    assert body.endswith(b"data: [DONE]\n\n")
+    assert original_upstream.close_count == 1
+    assert resumed_upstream.close_count == 1
+
+
+def test_resumed_stream_sanitizes_provider_error_details(app):
+    """Do not expose provider-supplied error text after resuming a stream."""
+    adapter = AzureAdapter()
+    adapter.inbound_model = "gpt-5.4"
+    adapter.include_usage = False
+
+    def interrupted_stream():
+        yield _sse(
+            "response.created",
+            {
+                "type": "response.created",
+                "sequence_number": 0,
+                "response": {"id": "resp_123"},
+            },
+        )
+        raise requests.ReadTimeout("temporary socket interruption")
+
+    def resumed_stream():
+        yield _sse(
+            "response.failed",
+            {
+                "type": "response.failed",
+                "sequence_number": 1,
+                "response": {
+                    "error": {
+                        "code": "server_error",
+                        "status": 500,
+                        "message": "provider-secret-must-not-leak",
+                    }
+                },
+            },
+        )
+
+    response = adapter.response_adapter.adapt(
+        _FakeUpstreamResponse(interrupted_stream()),
+        resume_stream=lambda _response_id, _sequence_number: _FakeUpstreamResponse(
+            resumed_stream()
+        ),
+    )
+    body = b"".join(response.response)
+
+    assert b"provider-secret-must-not-leak" not in body
+    assert b"Provider returned an error (HTTP 500)." in body
+
+
+def test_response_failed_after_partial_error_is_reported(app):
+    """Keep the terminal provider failure visible after an earlier stream error."""
+    messages = _azure_messages(
+        app,
+        [
+            _sse(
+                "response.output_text.delta",
+                {"type": "response.output_text.delta", "delta": "partial"},
+            ),
+            _sse(
+                "error",
+                {
+                    "type": "error",
+                    "error": {
+                        "code": "server_error",
+                        "message": "intermediate stream error",
+                    },
+                },
+            ),
+            _sse(
+                "response.failed",
+                {
+                    "type": "response.failed",
+                    "response": {
+                        "error": {
+                            "code": "server_error",
+                            "message": "terminal provider failure",
+                        }
+                    },
+                },
+            ),
+        ],
+    )
+
+    content = "".join(
+        message["choices"][0]["delta"].get("content", "") for message in messages
+    )
+    assert "partial" in content
+    assert "terminal provider failure" in content
 
 
 def test_response_adapter_emits_usage_chunk(app):
@@ -279,6 +470,58 @@ def test_provider_stream_records_terminal_status(
 
     assert attempt.outcome == expected_outcome
     assert attempt.status_code == expected_status
+
+
+def test_read_timeout_persists_accepted_http_status_and_diagnostics(admin_app):
+    """Retain HTTP 200 and the transport failure when an accepted stream breaks."""
+    database = admin_app.extensions["database"]
+    profile_id = "azure-interrupted-stream"
+    with database.sessions.begin() as session:
+        session.add(
+            ProviderProfile(
+                id=profile_id,
+                tenant_id="acme",
+                provider="azure",
+                display_name="Interrupted Azure stream",
+                settings={},
+                default_model="gpt-5.4",
+                inference_secret_ciphertext="encrypted-key",
+            )
+        )
+
+    def chunks():
+        yield _sse("response.output_text.delta", {"delta": "partial"})
+        raise requests.ReadTimeout("secret-hostname-and-api-key")
+
+    with admin_app.app_context():
+        attempt_id = start_provider_attempt(
+            tenant_id="acme",
+            provider="azure",
+            profile_id=profile_id,
+            inbound_model="cursor-acme",
+            routed_model="gpt-5.4",
+        )
+        adapter = AzureAdapter()
+        adapter.inbound_model = "cursor-acme"
+        adapter.include_usage = False
+        response = adapter.response_adapter.adapt(
+            _FakeUpstreamResponse(chunks()),
+            activity_attempt_id=attempt_id,
+        )
+        body = b"".join(response.response)
+
+    with database.sessions() as session:
+        attempt = session.get(ProviderAttemptEvent, attempt_id)
+
+    assert b"partial" in body
+    assert b"stream_interrupted" in body
+    assert attempt.outcome == "failure"
+    assert attempt.status_code == 200
+    assert attempt.failure_details == {
+        "error_code": "stream_interrupted",
+        "exception_type": "ReadTimeout",
+    }
+    assert b"secret-hostname-and-api-key" not in body
 
 
 def test_response_adapter_emits_reasoning_content_separately(app):

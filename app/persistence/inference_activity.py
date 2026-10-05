@@ -149,6 +149,7 @@ def complete_provider_attempt(
     *,
     outcome: str,
     status_code: int | None,
+    failure_details: dict[str, object] | None = None,
     completed_at: datetime | None = None,
 ) -> None:
     """Finish a pending provider attempt with its observed terminal outcome."""
@@ -171,6 +172,7 @@ def complete_provider_attempt(
                 .values(
                     outcome=outcome,
                     status_code=status_code,
+                    failure_details=failure_details,
                     completed_at=moment,
                 )
             )

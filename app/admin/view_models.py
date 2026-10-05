@@ -133,6 +133,7 @@ class FailedProviderAttemptRow:
     time_label: str
     status_code: int | None
     outcome_label: str
+    failure_details_label: str | None
     kind: Literal["failure"] = "failure"
 
 
@@ -782,7 +783,20 @@ def _failed_provider_attempt_row(
         time_label=occurred_at.isoformat(),
         status_code=attempt.status_code,
         outcome_label=_provider_attempt_outcome_label(attempt.status_code),
+        failure_details_label=_failure_details_label(attempt.failure_details),
     )
+
+
+def _failure_details_label(details: Mapping[str, object] | None) -> str | None:
+    """Format persisted allowlisted failure diagnostics for the activity list."""
+    if not details:
+        return None
+    labels = [
+        str(value)
+        for key in ("error_code", "exception_type", "provider_error_code")
+        if isinstance((value := details.get(key)), str) and value
+    ]
+    return " · ".join(labels) or None
 
 
 def _provider_attempt_outcome_label(status_code: int | None) -> str:

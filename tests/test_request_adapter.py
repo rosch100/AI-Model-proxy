@@ -36,6 +36,8 @@ def test_request_adapter_prefers_inbound_reasoning_effort(app):
     request_kwargs = adapter.adapt(request)
 
     assert request_kwargs["json"]["model"] == "gpt-5.4"
+    assert "background" not in request_kwargs["json"]
+    assert request_kwargs["json"]["store"] is True
     assert request_kwargs["json"]["reasoning"]["effort"] == "high"
     assert request_kwargs["json"]["reasoning"]["summary"] == "auto"
 
@@ -413,6 +415,39 @@ def test_request_adapter_transforms_forced_function_tool_choice_for_responses(ap
         "type": "function",
         "name": "smoke_test",
     }
+
+
+def test_request_adapter_enables_background_resume_only_for_opted_in_profile(app):
+    """Only an opted-in Azure profile gets the background API flag."""
+    adapter = AzureAdapter().request_adapter
+    request = app.test_request_context(
+        "/chat/completions",
+        method="POST",
+        json={"model": "gpt-5.4", "input": "Hi", "stream": True},
+        headers={"Authorization": "Bearer test-service-api-key"},
+    ).request
+    snapshot = DatabaseTenantSnapshot(
+        id="acme",
+        api_key_hash="a" * 64,
+        custom_model_id="cursor-acme-model",
+        provider="azure",
+        provider_settings={
+            "base_url": "https://selected.openai.azure.com",
+            "model_deployments": {"gpt-5.4": "selected-deployment"},
+            "resume_streams": True,
+        },
+        inference_secret="selected-key",
+        default_model="gpt-5.4",
+        profile_id="selected-profile",
+        profile_name="Production",
+        history_generation=2,
+    )
+
+    request_kwargs = adapter.adapt(request, snapshot, target_model="gpt-5.4")
+
+    assert request_kwargs["json"]["background"] is True
+    assert request_kwargs["json"]["store"] is True
+    assert adapter.adapter.resume_stream is True
 
 
 def test_request_adapter_uses_explicit_snapshot_not_request_context_tenant(app):

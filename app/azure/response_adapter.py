@@ -11,7 +11,7 @@ import random
 import time
 from dataclasses import dataclass
 from string import ascii_letters, digits
-from typing import Any, Dict, Iterable, Optional
+from typing import Any, Callable, Dict, Iterable, Optional
 
 import requests
 from flask import Response, current_app, g, has_request_context, stream_with_context
@@ -91,6 +91,25 @@ class _ResponseStreamState:
     status_code: int | None = None
     aborted: bool = False
     quota_failure: bool = False
+    response_id: str | None = None
+    sequence_number: int | None = None
+    failure_details: dict[str, object] | None = None
+    resume_stream: Callable[[str, int], Any] | None = None
+    sanitize_errors: bool = False
+    resume_attempts: int = 0
+
+
+@dataclass
+class _StreamAttemptState:
+    """Track retry decisions and incomplete errors within one upstream attempt."""
+
+    empty_error_precursor: bool = False
+    stream_error_after_output: Optional[Dict[str, str]] = None
+    stream_rate_limit_noted: bool = False
+    terminal_event_seen: bool = False
+    resumed_stream: bool = False
+    retry_response: Any = None
+    stop_stream: bool = False
 
 
 class ResponseAdapter:
@@ -720,13 +739,289 @@ class ResponseAdapter:
             state.upstream_resp, request_context, event.json
         )
 
+    def _prepare_stream_event(
+        self, original_event: Any, state: _ResponseStreamState
+    ) -> tuple[Any, int | None, bool]:
+        """Classify one upstream event and update terminal attempt metadata."""
+        event_data = original_event.json
+        event_sequence_number = None
+        if isinstance(event_data, dict):
+            response = event_data.get("response")
+            response_id = response.get("id") if isinstance(response, dict) else None
+            if isinstance(response_id, str) and response_id:
+                state.response_id = response_id
+            sequence_number = event_data.get("sequence_number")
+            if isinstance(sequence_number, int) and not isinstance(
+                sequence_number, bool
+            ):
+                event_sequence_number = sequence_number
+
+        classified_failure = _event_failure(
+            original_event,
+            event_data,
+            provider=self.adapter.activity_provider or "azure",
+            headers=getattr(state.upstream_resp, "headers", {}),
+            settings=getattr(self.adapter, "activity_settings", {}),
+        )
+        if classified_failure is not None:
+            if self._circuit_attempt is not None:
+                self._circuit_attempt.failed(classified_failure.classification)
+            if state.has_emitted_output and has_request_context():
+                current_app.logger.warning(
+                    "Provider stream failed after output: request_id=%s "
+                    "tenant=%s profile=%s provider=%s status=%s "
+                    "error_code=%s error_category=%s provider_diagnostics=%s",
+                    getattr(g, "proxy_request_id", "unavailable"),
+                    self.adapter.activity_tenant_id or "unknown",
+                    self.adapter.activity_profile_id or "unknown",
+                    self.adapter.activity_provider or "azure",
+                    classified_failure.status,
+                    classified_failure.code,
+                    classified_failure.classification.category,
+                    json.dumps(
+                        classified_failure.provider_diagnostics,
+                        sort_keys=True,
+                        ensure_ascii=False,
+                    ),
+                )
+
+        is_terminal = original_event.event in {
+            "response.completed",
+            "response.failed",
+            "response.incomplete",
+        }
+        if is_terminal:
+            state.completed_successfully = original_event.event == "response.completed"
+            if state.completed_successfully:
+                state.status_code = 200
+                state.failure_details = None
+            else:
+                failure_response = (
+                    event_data.get("response") if isinstance(event_data, dict) else None
+                )
+                failure = (
+                    failure_response.get("error")
+                    if isinstance(failure_response, dict)
+                    else None
+                )
+                state.status_code = (
+                    classified_failure.status
+                    if classified_failure is not None
+                    else (
+                        int(failure["status"])
+                        if isinstance(failure, dict)
+                        and str(failure.get("status", "")).isdigit()
+                        else None
+                    )
+                )
+                if classified_failure is not None:
+                    state.failure_details = {"error_code": classified_failure.code}
+        return original_event, event_sequence_number, is_terminal
+
+    def _sanitize_stream_event(self, event: Any, state: _ResponseStreamState) -> Any:
+        """Sanitize provider errors only on routed or resumed streams."""
+        if not state.sanitize_errors:
+            return event
+        return sanitize_error_event(
+            event,
+            provider=self.adapter.activity_provider or "azure",
+            headers=getattr(state.upstream_resp, "headers", {}),
+            settings=getattr(self.adapter, "activity_settings", {}),
+        )
+
+    def _handle_stream_event(
+        self,
+        original_event: Any,
+        state: _ResponseStreamState,
+        attempt: _StreamAttemptState,
+        request_context: Any,
+        live: Live,
+    ) -> Iterable[Dict[str, Any]]:
+        """Apply retry policy and adapt one provider event to client chunks."""
+        event, sequence_number, terminal = self._prepare_stream_event(
+            original_event, state
+        )
+        attempt.terminal_event_seen = attempt.terminal_event_seen or terminal
+        if self._absorb_empty_error_precursor(event, state, request_context):
+            attempt.empty_error_precursor = True
+            return
+
+        raw_event = event.event or ""
+        event_data = event.json
+        rate_limit = self._is_rate_limit_failure(raw_event, event_data)
+        attempt.retry_response = self._retry_stream_if_possible(
+            event, state, request_context
+        )
+        if attempt.retry_response is not None:
+            return
+        event = self._sanitize_stream_event(event, state)
+        event_data = event.json
+        if raw_event == "error":
+            error = self._sse_error_details(event_data)
+            if state.has_emitted_output:
+                attempt.stream_error_after_output = {
+                    "code": str(error.get("code") or "stream_error"),
+                    "message": str(
+                        error.get("message")
+                        or (
+                            "Azure ended the stream after partial output; "
+                            "the response may be incomplete."
+                        )
+                    ),
+                }
+                state.failure_details = {
+                    "error_code": attempt.stream_error_after_output["code"]
+                }
+            elif error.get("code") or error.get("message"):
+                error_chunk = self._failed({"response": {"error": error}})
+                if error_chunk is not None:
+                    state.has_emitted_output = True
+                    self._record_completion_chunk(error_chunk, state)
+                    yield error_chunk
+                attempt.stop_stream = True
+                return
+
+        if rate_limit and state.has_emitted_output and request_context is not None:
+            self.adapter.note_stream_rate_limit(
+                request_context, state.upstream_resp.headers, event_data
+            )
+            attempt.stream_rate_limit_noted = True
+        for chunk in self._adapt_event(event, state, live):
+            state.has_emitted_output = True
+            yield chunk
+        if sequence_number is not None:
+            state.sequence_number = sequence_number
+
+    def _resume_interrupted_stream(
+        self, state: _ResponseStreamState, error: requests.RequestException
+    ) -> tuple[bool, requests.RequestException]:
+        """Resume an Azure response from its last delivered sequence when possible."""
+        if not (
+            state.resume_stream is not None
+            and state.response_id is not None
+            and state.sequence_number is not None
+            and state.resume_attempts < 3
+        ):
+            return False, error
+        state.resume_attempts += 1
+        time.sleep(0.25 * (2 ** (state.resume_attempts - 1)))
+        try:
+            replacement = state.resume_stream(state.response_id, state.sequence_number)
+        except requests.RequestException as resume_error:
+            return False, resume_error
+        if replacement.status_code != 200:
+            state.status_code = replacement.status_code
+            state.failure_details = {
+                "error_code": "stream_resume_failed",
+                "http_status": replacement.status_code,
+            }
+            replacement.close()
+            state.resume_attempts = 3
+            return False, error
+        state.upstream_resp.close()
+        state.upstream_resp = replacement
+        return True, error
+
+    def _stream_interruption_chunk(
+        self, state: _ResponseStreamState, error: requests.RequestException
+    ) -> Dict[str, Any] | None:
+        """Record a safe transport diagnostic and return a client-safe error chunk."""
+        if state.failure_details is None:
+            state.status_code = getattr(state.upstream_resp, "status_code", 200)
+            state.failure_details = {
+                "error_code": "stream_interrupted",
+                "exception_type": type(error).__name__,
+            }
+        else:
+            state.failure_details.setdefault("exception_type", type(error).__name__)
+        if has_request_context():
+            current_app.logger.warning(
+                "Provider stream interrupted: request_id=%s tenant=%s "
+                "profile=%s provider=%s error_type=%s provider_diagnostics=%s",
+                getattr(g, "proxy_request_id", "unavailable"),
+                self.adapter.activity_tenant_id or "unknown",
+                self.adapter.activity_profile_id or "unknown",
+                self.adapter.activity_provider or "azure",
+                type(error).__name__,
+                json.dumps(
+                    _transport_error_details(
+                        error,
+                        headers=getattr(state.upstream_resp, "headers", None),
+                        upstream_url=self.adapter.activity_settings.get("base_url"),
+                    ),
+                    sort_keys=True,
+                    ensure_ascii=False,
+                ),
+            )
+        return self._failed(
+            {
+                "response": {
+                    "error": {
+                        "code": "stream_interrupted",
+                        "message": (
+                            "Provider stream interrupted; not replayed "
+                            "to avoid duplicate output or tool calls."
+                        ),
+                    }
+                }
+            }
+        )
+
+    def _finish_stream_attempt(
+        self,
+        state: _ResponseStreamState,
+        attempt: _StreamAttemptState,
+        request_context: Any,
+    ) -> tuple[bool, Dict[str, Any] | None]:
+        """Retry pre-output noise or return the terminal incomplete-stream chunk."""
+        if (
+            attempt.empty_error_precursor
+            and not state.has_emitted_output
+            and not attempt.terminal_event_seen
+            and request_context is not None
+        ):
+            retry_response = self.adapter._retry_stream_rate_limit(
+                state.upstream_resp,
+                request_context,
+                {"code": "rate_limit_exceeded", "message": "token rate limit"},
+            )
+            if retry_response is not None:
+                state.upstream_resp = retry_response
+                self._reset_stream_attempt(state)
+                return True, None
+
+        incomplete = state.has_emitted_output and (
+            attempt.stream_error_after_output or attempt.empty_error_precursor
+        )
+        if not incomplete or attempt.terminal_event_seen:
+            return False, None
+        retryable_error = attempt.stream_error_after_output and (
+            attempt.stream_error_after_output["code"]
+            in {"rate_limit_exceeded", "stream_error"}
+        )
+        if (
+            request_context is not None
+            and not attempt.empty_error_precursor
+            and not attempt.stream_rate_limit_noted
+            and retryable_error
+        ):
+            self.adapter.note_empty_stream_error_precursor(request_context)
+        error = attempt.stream_error_after_output or {
+            "code": "rate_limit_exceeded",
+            "message": (
+                "Azure emitted an empty stream error before the response "
+                "ended; the response may be incomplete."
+            ),
+        }
+        return False, self._failed({"response": {"error": error}})
+
     def _stream_upstream_events(
         self,
         state: _ResponseStreamState,
         request_context: Any,
         live: Live,
     ) -> Iterable[Dict[str, Any]]:
-        """Adapt events, restarting the upstream stream only before output."""
+        """Adapt Azure events and resume transient drops from the last sequence."""
         while True:
             if state.upstream_resp.status_code != 200:
                 state.status_code = state.upstream_resp.status_code
@@ -742,179 +1037,43 @@ class ResponseAdapter:
                     self._record_completion_chunk(error_chunk, state)
                 return
 
-            retry_stream = False
-            empty_error_precursor = False
-            stream_error_after_output: Optional[Dict[str, str]] = None
-            stream_rate_limit_noted = False
-            terminal_event_seen = False
-            for event in sse_to_events(
-                state.upstream_resp.iter_content(chunk_size=128)
-            ):
-                original_event = event
-                classified_failure = _event_failure(
-                    original_event,
-                    original_event.json,
-                    provider=self.adapter.activity_provider or "azure",
-                    headers=getattr(state.upstream_resp, "headers", {}),
-                    settings=getattr(self.adapter, "activity_settings", {}),
-                )
-                if classified_failure is not None:
-                    if isinstance(state.upstream_resp, PreparedUpstream):
-                        event = sanitize_error_event(original_event)
-                    if self._circuit_attempt is not None:
-                        self._circuit_attempt.failed(classified_failure.classification)
-                    if state.has_emitted_output and has_request_context():
-                        current_app.logger.warning(
-                            "Provider stream failed after output: request_id=%s "
-                            "tenant=%s profile=%s provider=%s status=%s "
-                            "error_code=%s error_category=%s provider_diagnostics=%s",
-                            getattr(g, "proxy_request_id", "unavailable"),
-                            self.adapter.activity_tenant_id or "unknown",
-                            self.adapter.activity_profile_id or "unknown",
-                            self.adapter.activity_provider or "azure",
-                            classified_failure.status,
-                            classified_failure.code,
-                            classified_failure.classification.category,
-                            json.dumps(
-                                classified_failure.provider_diagnostics,
-                                sort_keys=True,
-                                ensure_ascii=False,
-                            ),
-                        )
-                if event.event in {
-                    "response.completed",
-                    "response.failed",
-                    "response.incomplete",
-                }:
-                    terminal_event_seen = True
-                    state.completed_successfully = event.event == "response.completed"
-                    if event.event != "response.completed":
-                        failure_data = original_event.json
-                        failure_response = (
-                            failure_data.get("response")
-                            if isinstance(failure_data, dict)
-                            else None
-                        )
-                        failure = (
-                            failure_response.get("error")
-                            if isinstance(failure_response, dict)
-                            else None
-                        )
-                        state.status_code = (
-                            classified_failure.status
-                            if classified_failure is not None
-                            else (
-                                int(failure["status"])
-                                if isinstance(failure, dict)
-                                and str(failure.get("status", "")).isdigit()
-                                else None
-                            )
-                        )
-                absorbed_precursor = self._absorb_empty_error_precursor(
-                    event, state, request_context
-                )
-                if absorbed_precursor:
-                    empty_error_precursor = True
-                    continue
-                raw_event = event.event or ""
-                is_rate_limit_failure = self._is_rate_limit_failure(
-                    raw_event, event.json
-                )
-                retry_response = self._retry_stream_if_possible(
-                    event, state, request_context
-                )
-                if retry_response is not None:
-                    state.upstream_resp = retry_response
-                    retry_stream = True
-                    break
-                if raw_event == "error":
-                    error = self._sse_error_details(event.json)
-                    if state.has_emitted_output:
-                        stream_error_after_output = {
-                            "code": str(error.get("code") or "stream_error"),
-                            "message": str(
-                                error.get("message")
-                                or "Azure ended the stream after partial output."
-                            ),
-                        }
-                    elif error.get("code") or error.get("message"):
-                        error_chunk = self._failed({"response": {"error": error}})
-                        if error_chunk is not None:
-                            state.has_emitted_output = True
-                            yield error_chunk
-                            self._record_completion_chunk(error_chunk, state)
-                        return
-                if (
-                    is_rate_limit_failure
-                    and state.has_emitted_output
-                    and request_context is not None
+            attempt = _StreamAttemptState()
+            try:
+                for original_event in sse_to_events(
+                    state.upstream_resp.iter_content(chunk_size=128)
                 ):
-                    self.adapter.note_stream_rate_limit(
-                        request_context, state.upstream_resp.headers, event.json
-                    )
-                    stream_rate_limit_noted = True
-                for chunk in self._adapt_event(event, state, live):
-                    state.has_emitted_output = True
-                    yield chunk
-
-            if retry_stream:
-                self._reset_stream_attempt(state)
-                continue
-            if (
-                empty_error_precursor
-                and not state.has_emitted_output
-                and not terminal_event_seen
-                and request_context is not None
-            ):
-                retry_response = self.adapter._retry_stream_rate_limit(
-                    state.upstream_resp,
-                    request_context,
-                    {
-                        "code": "rate_limit_exceeded",
-                        "message": "token rate limit",
-                    },
-                )
-                if retry_response is not None:
-                    state.upstream_resp = retry_response
-                    self._reset_stream_attempt(state)
+                    for chunk in self._handle_stream_event(
+                        original_event, state, attempt, request_context, live
+                    ):
+                        yield chunk
+                    if attempt.stop_stream or attempt.retry_response is not None:
+                        break
+            except requests.RequestException as exc:
+                resumed, resume_error = self._resume_interrupted_stream(state, exc)
+                if resumed:
+                    attempt.resumed_stream = True
                     continue
-            incomplete_after_output = state.has_emitted_output and (
-                stream_error_after_output or empty_error_precursor
-            )
-            if incomplete_after_output and not terminal_event_seen:
-                is_rate_limit_or_unknown_error = stream_error_after_output and (
-                    stream_error_after_output["code"] == "rate_limit_exceeded"
-                    or stream_error_after_output["code"] == "stream_error"
-                )
-                if (
-                    request_context is not None
-                    and not empty_error_precursor
-                    and not stream_rate_limit_noted
-                    and is_rate_limit_or_unknown_error
-                ):
-                    self.adapter.note_empty_stream_error_precursor(request_context)
-                if stream_error_after_output is None:
-                    error = {
-                        "code": "rate_limit_exceeded",
-                        "message": (
-                            "Azure emitted an empty stream error before the response "
-                            "ended; the response may be incomplete. It was not "
-                            "restarted to avoid duplicating output or tool calls."
-                        ),
-                    }
-                else:
-                    error = {
-                        **stream_error_after_output,
-                        "message": (
-                            f"{stream_error_after_output['message']} The response may "
-                            "be incomplete; it was not restarted to avoid duplicating "
-                            "output or tool calls."
-                        ),
-                    }
-                error_chunk = self._failed({"response": {"error": error}})
+                error_chunk = self._stream_interruption_chunk(state, resume_error)
                 if error_chunk is not None:
-                    yield error_chunk
                     self._record_completion_chunk(error_chunk, state)
+                    yield error_chunk
+                return
+
+            if attempt.stop_stream:
+                return
+            if attempt.retry_response is not None:
+                state.upstream_resp = attempt.retry_response
+                if not attempt.resumed_stream:
+                    self._reset_stream_attempt(state)
+                continue
+            retry, error_chunk = self._finish_stream_attempt(
+                state, attempt, request_context
+            )
+            if error_chunk is not None:
+                self._record_completion_chunk(error_chunk, state)
+                yield error_chunk
+            if retry:
+                continue
             return
 
     def _reset_stream_attempt(self, state: _ResponseStreamState) -> None:
@@ -1050,11 +1209,15 @@ class ResponseAdapter:
         request_context: Any,
         activity_attempt_id: int | None = None,
         circuit_attempt: ProviderCircuitAttempt | None = None,
+        resume_stream: Callable[[str, int], Any] | None = None,
     ) -> Iterable[Dict[str, Any]]:
         """Manage per-stream state, logging, and upstream response cleanup."""
         state = _ResponseStreamState(
             upstream_resp=upstream_resp,
             completion_msg={"role": "assistant", "content": "", "tool_calls": []},
+            resume_stream=resume_stream,
+            sanitize_errors=isinstance(upstream_resp, PreparedUpstream)
+            or resume_stream is not None,
         )
         self._circuit_attempt = circuit_attempt
         try:
@@ -1077,6 +1240,7 @@ class ResponseAdapter:
                     if state.completed_successfully and not state.aborted
                     else state.status_code
                 ),
+                failure_details=state.failure_details,
             )
             state.upstream_resp.close()
 
@@ -1087,6 +1251,7 @@ class ResponseAdapter:
         *,
         activity_attempt_id: int | None = None,
         circuit_attempt: ProviderCircuitAttempt | None = None,
+        resume_stream: Callable[[str, int], Any] | None = None,
     ) -> Response:
         """Adapt an upstream Azure streaming response into SSE for Flask."""
 
@@ -1110,33 +1275,12 @@ class ResponseAdapter:
                         request_context,
                         activity_attempt_id,
                         circuit_attempt,
+                        resume_stream,
                     )
                 )
-            except requests.RequestException as exc:
+            except requests.RequestException:
                 if not isinstance(upstream_resp, PreparedUpstream):
                     raise
-                if has_request_context():
-                    current_app.logger.warning(
-                        "Provider stream interrupted: request_id=%s tenant=%s "
-                        "profile=%s provider=%s error_type=%s "
-                        "provider_diagnostics=%s",
-                        getattr(g, "proxy_request_id", "unavailable"),
-                        self.adapter.activity_tenant_id or "unknown",
-                        self.adapter.activity_profile_id or "unknown",
-                        self.adapter.activity_provider or "azure",
-                        type(exc).__name__,
-                        json.dumps(
-                            _transport_error_details(
-                                exc,
-                                headers=getattr(upstream_resp, "headers", None),
-                                upstream_url=self.adapter.activity_settings.get(
-                                    "base_url"
-                                ),
-                            ),
-                            sort_keys=True,
-                            ensure_ascii=False,
-                        ),
-                    )
                 error = self._failed(
                     {
                         "response": {

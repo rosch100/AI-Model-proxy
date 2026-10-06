@@ -2,7 +2,10 @@
 
 import json
 
-from app.codex.response_adapter import adapt_responses_sse_to_chat_sse
+from app.codex.response_adapter import (
+    _chat_completion_id,
+    adapt_responses_sse_to_chat_sse,
+)
 
 
 def _sse(event_name, payload):
@@ -32,6 +35,14 @@ def _messages(*chunks, reasoning_display_mode="mdthinkblocks"):
         elif data:
             out.append(json.loads(data))
     return out
+
+
+def test_codex_chat_completion_ids_use_secure_random_choice(mocker):
+    """Generate opaque chat completion IDs using the secure random source."""
+    choice = mocker.patch("app.codex.response_adapter.secrets.choice", return_value="x")
+
+    assert _chat_completion_id() == "chatcmpl-" + "x" * 24
+    assert choice.call_count == 24
 
 
 def test_codex_adapts_output_text_to_chat_completion_chunks():

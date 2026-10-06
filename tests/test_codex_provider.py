@@ -7,6 +7,7 @@ import json
 import time
 
 import pytest
+import requests
 
 AUTH = {"Authorization": "Bearer test-service-api-key"}
 
@@ -46,8 +47,9 @@ def test_codex_ready_validates_auth_when_enabled(testapp, app, tmp_path):
     assert response.json == {"status": "ready"}
 
 
-def test_codex_ready_reports_not_ready_for_missing_auth(testapp, app, tmp_path):
-    """Codex readiness returns a local not-ready error for missing auth state."""
+def test_codex_ready_reports_not_ready_for_missing_auth(testapp, app, tmp_path, caplog):
+    """Readiness returns a generic error and logs no auth-state path."""
+    caplog.set_level("WARNING", logger="app.codex.adapter")
     app.config["CODEX_AUTH_PATH"] = tmp_path / "missing.json"
     app.config["ENABLE_CODEX"] = True
 
@@ -56,6 +58,8 @@ def test_codex_ready_reports_not_ready_for_missing_auth(testapp, app, tmp_path):
     assert response.json["status"] == "not_ready"
     assert response.json["error"] == "Codex authentication is not ready"
     assert str(tmp_path) not in response.text
+    assert str(tmp_path) not in caplog.text
+    assert "AuthStateError" in caplog.text
     assert "Traceback" not in response.text
 
 
@@ -109,6 +113,99 @@ def test_codex_responses_forwards_to_fake_upstream(testapp, app, tmp_path, monke
     assert captured["json"]["model"] == "codex-test-model"
     assert captured["json"]["stream"] is True
     assert "response.output_text.delta" in response.text
+
+
+def test_codex_refresh_auth_failure_returns_503_without_exposing_details(
+    testapp, app, tmp_path, monkeypatch, caplog
+):
+    """A failed forced token refresh is an unavailable-auth error, not a 400."""
+    caplog.set_level("WARNING", logger="app.codex.adapter")
+    auth_file = tmp_path / "auth.json"
+    _write_auth(auth_file)
+    app.config["CODEX_AUTH_PATH"] = auth_file
+
+    class UnauthorizedUpstreamResponse:
+        status_code = 401
+        headers = {"content-type": "application/json"}
+
+        def __init__(self):
+            self.closed = False
+
+        def close(self):
+            self.closed = True
+
+    upstream = UnauthorizedUpstreamResponse()
+    monkeypatch.setattr(
+        "app.codex.adapter.post_responses", lambda *args, **kwargs: upstream
+    )
+
+    class FailedRefreshResponse:
+        status_code = 401
+
+        @staticmethod
+        def json():
+            return {"error": "refresh_token_expired"}
+
+    monkeypatch.setattr(
+        "app.codex.auth_state.requests.post",
+        lambda *args, **kwargs: FailedRefreshResponse(),
+    )
+
+    response = testapp.post_json(
+        "/codex/v1/responses",
+        {"model": "codex-test-model", "input": "hello"},
+        headers=AUTH,
+        status=503,
+    )
+
+    assert response.json == {"error": {"message": "Codex authentication failed"}}
+    assert upstream.closed
+    assert str(auth_file) not in response.text
+    assert str(auth_file) not in caplog.text
+    assert "AuthStateError" in caplog.text
+
+
+def test_codex_refresh_transport_failure_returns_503_without_details(
+    testapp, app, tmp_path, monkeypatch, caplog
+):
+    """Hide refresh endpoint network errors behind the auth error response."""
+    caplog.set_level("WARNING", logger="app.codex.adapter")
+    auth_file = tmp_path / "auth.json"
+    _write_auth(auth_file)
+    app.config["CODEX_AUTH_PATH"] = auth_file
+
+    class UnauthorizedUpstreamResponse:
+        status_code = 401
+        headers = {"content-type": "application/json"}
+
+        def __init__(self):
+            self.closed = False
+
+        def close(self):
+            self.closed = True
+
+    upstream = UnauthorizedUpstreamResponse()
+    monkeypatch.setattr(
+        "app.codex.adapter.post_responses", lambda *args, **kwargs: upstream
+    )
+
+    def fail_refresh(*_args, **_kwargs):
+        raise requests.ConnectionError("secret-auth.internal?token=private")
+
+    monkeypatch.setattr("app.codex.auth_state.requests.post", fail_refresh)
+
+    response = testapp.post_json(
+        "/codex/v1/responses",
+        {"model": "codex-test-model", "input": "hello"},
+        headers=AUTH,
+        status=503,
+    )
+
+    assert response.json == {"error": {"message": "Codex authentication failed"}}
+    assert upstream.closed
+    assert "secret-auth.internal" not in response.text
+    assert "secret-auth.internal" not in caplog.text
+    assert "AuthStateError" in caplog.text
 
 
 def test_codex_provider_refreshes_and_retries_once_after_upstream_401(
@@ -318,9 +415,27 @@ def test_codex_routes_require_shared_service_api_key(testapp, provider_path):
     testapp.get(provider_path, status=401)
 
 
-def test_codex_errors_hide_exception_text(testapp, app, tmp_path, monkeypatch):
-    """Client payloads stay generic when auth state or upstream calls fail."""
-    import requests
+def test_codex_unsupported_request_shape_still_returns_400(testapp, app, tmp_path):
+    """Unsupported payload shapes remain client errors when auth is available."""
+    auth_file = tmp_path / "auth.json"
+    _write_auth(auth_file)
+    app.config["CODEX_AUTH_PATH"] = auth_file
+
+    response = testapp.post_json(
+        "/codex/v1/responses",
+        {"model": "codex-test-model"},
+        headers=AUTH,
+        status=400,
+    )
+
+    assert response.json == {
+        "error": {"message": "The Codex request could not be accepted"}
+    }
+
+
+def test_codex_errors_hide_exception_text(testapp, app, tmp_path, monkeypatch, caplog):
+    """Auth and transport failures use generic client errors and safe logs."""
+    caplog.set_level("WARNING", logger="app.codex.adapter")
 
     app.config["CODEX_AUTH_PATH"] = tmp_path / "missing.json"
     app.config["ENABLE_CODEX"] = True
@@ -329,13 +444,13 @@ def test_codex_errors_hide_exception_text(testapp, app, tmp_path, monkeypatch):
         "/codex/v1/responses",
         {"model": "codex-test-model", "input": "hello"},
         headers=AUTH,
-        status=400,
+        status=503,
     )
 
-    assert (
-        rejected.json["error"]["message"] == "The Codex request could not be accepted"
-    )
+    assert rejected.json["error"]["message"] == "Codex authentication failed"
     assert "missing.json" not in rejected.text
+    assert "missing.json" not in caplog.text
+    assert "AuthStateError" in caplog.text
     assert "Traceback" not in rejected.text
 
     auth_file = tmp_path / "auth.json"
@@ -358,3 +473,5 @@ def test_codex_errors_hide_exception_text(testapp, app, tmp_path, monkeypatch):
     assert failed.json["error"]["message"] == "Codex upstream request failed"
     assert "Traceback" not in failed.text
     assert "secret-upstream" not in failed.text
+    assert "secret-upstream" not in caplog.text
+    assert "ConnectionError" in caplog.text

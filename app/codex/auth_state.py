@@ -226,16 +226,19 @@ class CodexAuthManager:
                 skew_seconds=self.refresh_skew_seconds
             ):
                 return before
-            response = requests.post(
-                REFRESH_URL,
-                headers={"Content-Type": "application/json"},
-                json={
-                    "client_id": CLIENT_ID,
-                    "grant_type": "refresh_token",
-                    "refresh_token": before.refresh_token,
-                },
-                timeout=30.0,
-            )
+            try:
+                response = requests.post(
+                    REFRESH_URL,
+                    headers={"Content-Type": "application/json"},
+                    json={
+                        "client_id": CLIENT_ID,
+                        "grant_type": "refresh_token",
+                        "refresh_token": before.refresh_token,
+                    },
+                    timeout=30.0,
+                )
+            except requests.RequestException as exc:
+                raise AuthStateError("Codex token refresh request failed.") from exc
             if response.status_code == 401:
                 raise AuthStateError(_refresh_token_401_message(response))
             if response.status_code >= 400:

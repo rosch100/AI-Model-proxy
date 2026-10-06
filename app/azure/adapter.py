@@ -419,7 +419,9 @@ class AzureAdapter:
             return min(max(azure_delay, floor), MAX_AZURE_RETRY_DELAY_SECONDS)
 
         backoff_ceiling = AzureAdapter._backoff_ceiling(retry_number)
-        return random.uniform(max(floor, backoff_ceiling / 2.0), backoff_ceiling)
+        return random.uniform(  # nosec B311 — jitter is not a security token.
+            max(floor, backoff_ceiling / 2.0), backoff_ceiling
+        )
 
     def _handle_azure_error(self, resp: Response, request_kwargs) -> Response:
 

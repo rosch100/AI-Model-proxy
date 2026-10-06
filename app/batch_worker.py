@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import math
 import time
 from contextlib import contextmanager
@@ -36,6 +37,7 @@ POLL_INTERVAL_SECONDS = 10
 MAX_POLL_INTERVAL_SECONDS = 60
 RETENTION_CLEANUP_INTERVAL_SECONDS = 300
 CLEANUP_LIMIT = 50
+CLEANUP_RETRY_DELAY_SECONDS = 300
 
 
 class BatchWorkerError(RuntimeError):
@@ -932,40 +934,71 @@ def cleanup_expired_batches(
     deleted = 0
     for job_id, fence, tenant_id, profile_id, input_id, output_id, error_id in targets:
         file_ids = tuple(dict.fromkeys((input_id, output_id, error_id)))
-        if file_ids:
-            with database.sessions() as session:
-                profile = session.scalar(
-                    select(ProviderProfile).where(
-                        ProviderProfile.tenant_id == tenant_id,
-                        ProviderProfile.id == profile_id,
-                        ProviderProfile.provider == "openai",
+        try:
+            if file_ids:
+                with database.sessions() as session:
+                    profile = session.scalar(
+                        select(ProviderProfile).where(
+                            ProviderProfile.tenant_id == tenant_id,
+                            ProviderProfile.id == profile_id,
+                            ProviderProfile.provider == "openai",
+                        )
                     )
-                )
-                if profile is None or not profile.inference_secret_ciphertext:
-                    raise BatchWorkerError(
-                        "OpenAI profile is unavailable for expired file cleanup."
+                    if profile is None or not profile.inference_secret_ciphertext:
+                        raise BatchWorkerError(
+                            "OpenAI profile is unavailable for expired file cleanup."
+                        )
+                    secret = database.secret_cipher.decrypt(
+                        profile.inference_secret_ciphertext
                     )
-                secret = database.secret_cipher.decrypt(
-                    profile.inference_secret_ciphertext
-                )
-                if not isinstance(profile.settings, dict):
-                    raise BatchWorkerError("OpenAI profile settings are invalid.")
-                settings = dict(profile.settings)
-            remote = OpenAIBatchClient(secret, settings, http=http)
-            for file_id in file_ids:
-                if file_id:
-                    remote.delete_file(file_id)
+                    if not isinstance(profile.settings, dict):
+                        raise BatchWorkerError("OpenAI profile settings are invalid.")
+                    settings = dict(profile.settings)
+                remote = OpenAIBatchClient(secret, settings, http=http)
+                for file_id in file_ids:
+                    if file_id:
+                        remote.delete_file(file_id)
 
-        with database.sessions.begin() as session:
-            removed = session.execute(
-                delete(BatchJob).where(
-                    BatchJob.id == job_id,
-                    BatchJob.worker_owner == owner,
-                    BatchJob.fencing_token == fence,
-                    BatchJob.expires_at <= now,
+            with database.sessions.begin() as session:
+                removed = session.execute(
+                    delete(BatchJob).where(
+                        BatchJob.id == job_id,
+                        BatchJob.worker_owner == owner,
+                        BatchJob.fencing_token == fence,
+                        BatchJob.expires_at <= now,
+                    )
                 )
-            )
-            deleted += removed.rowcount
+                deleted += removed.rowcount
+        except Exception as exc:  # noqa: BLE001 - isolate each retained batch target
+            try:
+                released = _fenced_update(
+                    database,
+                    job_id,
+                    owner,
+                    fence,
+                    worker_owner=None,
+                    lease_expires_at=None,
+                    expires_at=now + timedelta(seconds=CLEANUP_RETRY_DELAY_SECONDS),
+                )
+            except (
+                Exception
+            ) as update_error:  # noqa: BLE001 - preserve target isolation
+                logging.getLogger(__name__).warning(
+                    "Batch file retention cleanup deferral failed "
+                    "(cleanup=%s persistence=%s)",
+                    type(exc).__name__,
+                    type(update_error).__name__,
+                )
+                continue
+            if released:
+                logging.getLogger(__name__).warning(
+                    "Batch file retention cleanup deferred (%s)", type(exc).__name__
+                )
+            else:
+                logging.getLogger(__name__).warning(
+                    "Batch file retention cleanup lost ownership (%s)",
+                    type(exc).__name__,
+                )
     return deleted
 
 

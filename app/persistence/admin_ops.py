@@ -292,6 +292,24 @@ def update_provider_profile(
         if key not in merged_settings and key in profile.settings:
             merged_settings[key] = profile.settings[key]
     normalized_settings = _validate_provider_settings(profile.provider, merged_settings)
+    if profile.provider == "openai":
+        has_retained_batch = session.scalar(
+            select(BatchJob.id)
+            .where(
+                BatchJob.tenant_id == tenant_id,
+                BatchJob.profile_id == profile.id,
+            )
+            .limit(1)
+        )
+        batch_credentials_changed = bool(inference_secret) or any(
+            (normalized_settings.get(key) or "") != (profile.settings.get(key) or "")
+            for key in ("organization", "project")
+        )
+        if has_retained_batch is not None and batch_credentials_changed:
+            raise ValueError(
+                "Cannot change OpenAI credentials or settings while batch jobs "
+                "are retained"
+            )
     scheduler_limits = normalized_settings.get("scheduler_limits", [])
     if scheduler_limits:
         configured_scopes: dict[str, set[str]] = {

@@ -160,6 +160,14 @@ on the same profile, though the next account in the route is still tried. Switch
 is best effort and may incur additional processing/costs. `/azure` stays scoped to
 active Azure accounts; `/codex` and single/environment-tenant mode keep their
 existing behavior.
+
+Optional PostgreSQL provider scheduler token budgets are admission controls based
+on a configured reservation estimate, not hard spending caps: actual usage is
+settled after a response and may exceed the estimate. A token-budget policy
+requires a configured estimate; configure it conservatively. While retained
+OpenAI batch jobs reference an account,
+its API key, organization, and project cannot be changed; this preserves access to
+those jobs and their remote-file cleanup until retention completes.
 Run `flask db upgrade` before deploying the new route schema. See the
 [routing decision](docs/adr/0001-azure-rooted-multi-provider-proxy.md).
 

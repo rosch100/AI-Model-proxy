@@ -32,7 +32,7 @@ from app.batch_worker import (
     process_batch_claim,
     run_batch_worker,
 )
-from app.persistence.admin_ops import delete_provider_profile
+from app.persistence.admin_ops import delete_provider_profile, update_provider_profile
 from app.persistence.models import (
     BatchJob,
     ProviderCatalogEntry,
@@ -1065,6 +1065,37 @@ def test_supervisor_worker_wrapper_is_disabled_unless_explicitly_enabled():
     assert result.stderr == ""
 
 
+@pytest.mark.parametrize(
+    "enabled_value", ["1", "t", "true", "y", "yes", "on", "TRUE", "Yes"]
+)
+def test_supervisor_worker_wrapper_accepts_environs_true_values(
+    enabled_value, tmp_path
+):
+    """Supervisor and environs enable the worker for the same boolean spellings."""
+    script = Path(__file__).resolve().parents[1] / "supervisord" / "batch-worker.sh"
+    fake_flask = tmp_path / "flask"
+    fake_flask.write_text("#!/bin/sh\nprintf '%s\\n' \"$*\"\n", encoding="utf-8")
+    fake_flask.chmod(0o755)
+    environment = {
+        **os.environ,
+        "BATCH_WORKER_ENABLED": enabled_value,
+        "AUTH_MODE": "tenant",
+        "TENANT_CONFIG_SOURCE": "database",
+        "PATH": f"{tmp_path}:{os.environ['PATH']}",
+    }
+
+    result = subprocess.run(
+        ["/bin/sh", str(script)],
+        env=environment,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 0
+    assert result.stdout.strip() == "batch-worker"
+
+
 def test_supervisor_worker_wrapper_requires_database_tenant_mode():
     """An enabled worker wrapper rejects process configurations outside DB tenants."""
     script = Path(__file__).resolve().parents[1] / "supervisord" / "batch-worker.sh"
@@ -1239,6 +1270,57 @@ def test_batch_worker_rejects_non_postgresql_queue_backend(admin_app):
         run_batch_worker(admin_app)
 
 
+@pytest.mark.parametrize(
+    ("settings", "inference_secret", "should_raise"),
+    [
+        ({"organization": "org-changed", "project": "proj_test"}, None, True),
+        ({"organization": "org-test", "project": "proj_test"}, "sk-rotated", True),
+        ({"organization": "org-test", "project": "proj_test"}, "", False),
+    ],
+)
+def test_profile_credentials_cannot_change_while_batch_jobs_are_retained(
+    admin_app, settings, inference_secret, should_raise
+):
+    """Retained batches remain tied to the credentials and scope they were created with."""
+    client, database = _prepare_batch_app(admin_app)
+    _create_job(client)
+
+    with database.sessions.begin() as session:
+        if should_raise:
+            with pytest.raises(ValueError, match="batch jobs are retained"):
+                update_provider_profile(
+                    session,
+                    database.secret_cipher,
+                    "acme",
+                    "openai-batch-profile",
+                    "OpenAI batch",
+                    settings,
+                    "gpt-5.4",
+                    inference_secret,
+                    "ada",
+                )
+        else:
+            update_provider_profile(
+                session,
+                database.secret_cipher,
+                "acme",
+                "openai-batch-profile",
+                "OpenAI batch",
+                settings,
+                "gpt-5.4",
+                inference_secret,
+                "ada",
+            )
+
+    with database.sessions() as session:
+        profile = session.get(ProviderProfile, "openai-batch-profile")
+        assert profile.settings["organization"] == "org-test"
+        assert (
+            database.secret_cipher.decrypt(profile.inference_secret_ciphertext)
+            == "sk-secret"
+        )
+
+
 def test_profile_delete_is_blocked_while_batch_retention_needs_its_secret(admin_app):
     """Retained jobs keep their provider profile credential available for cleanup."""
     client, database = _prepare_batch_app(admin_app)
@@ -1252,6 +1334,74 @@ def test_profile_delete_is_blocked_while_batch_retention_needs_its_secret(admin_
                 "openai-batch-profile",
                 "ada",
             )
+
+
+def test_cleanup_failure_releases_one_job_and_continues_other_expired_jobs(
+    admin_app, requests_mock
+):
+    """A broken profile credential defers only its job, not later cleanup targets."""
+    client, database = _prepare_batch_app(admin_app)
+    first_id = _create_job(client)
+    second_response = client.post(
+        "/v1/batches",
+        json=_payload("second"),
+        headers=_headers(idempotency_key="batch-key-2"),
+    )
+    assert second_response.status_code == 202
+    second_id = second_response.json["id"]
+    with database.sessions.begin() as session:
+        first = session.get(BatchJob, first_id)
+        first.status = "completed"
+        first.provider_input_file_id = "file-unavailable-profile"
+        first.expires_at = datetime.now(timezone.utc) - timedelta(seconds=2)
+        second = session.get(BatchJob, second_id)
+        second.status = "completed"
+        second.profile_id = first.profile_id
+        second.provider_input_file_id = "file-cleanable"
+        second.expires_at = datetime.now(timezone.utc) - timedelta(seconds=1)
+        profile = session.get(ProviderProfile, first.profile_id)
+        profile.inference_secret_ciphertext = "invalid-ciphertext"
+
+    # The later target uses a valid backup profile while the first target remains broken.
+    with database.sessions.begin() as session:
+        backup = ProviderProfile(
+            id="openai-batch-cleanup-backup",
+            tenant_id="acme",
+            provider="openai",
+            display_name="OpenAI cleanup backup",
+            settings={},
+            default_model="gpt-5.4",
+            inference_secret_ciphertext=database.secret_cipher.encrypt("sk-backup"),
+        )
+        session.add(backup)
+        session.flush()
+        session.add(
+            ProviderCatalogEntry(
+                profile_id=backup.id,
+                model_id="gpt-5.4",
+                source="provider",
+            )
+        )
+        session.get(BatchJob, second_id).profile_id = backup.id
+
+    requests_mock.delete(
+        "https://api.openai.com/v1/files/file-cleanable", json={"deleted": True}
+    )
+
+    deleted = cleanup_expired_batches(database)
+
+    assert deleted == 1
+    assert [request.url for request in requests_mock.request_history] == [
+        "https://api.openai.com/v1/files/file-cleanable"
+    ]
+    with database.sessions() as session:
+        deferred = session.get(BatchJob, first_id)
+        assert deferred is not None
+        assert deferred.worker_owner is None
+        assert deferred.lease_expires_at is None
+        deferred_expires_at = deferred.expires_at.replace(tzinfo=timezone.utc)
+        assert deferred_expires_at > datetime.now(timezone.utc)
+        assert session.get(BatchJob, second_id) is None
 
 
 def test_cleanup_deletes_remote_files_before_removing_expired_job(

@@ -954,6 +954,170 @@ def test_all_budget_blocked_candidates_report_earliest_retry_after(routed_app):
     assert response.headers["Retry-After"] == "3"
 
 
+def test_scheduler_candidate_skips_model_policy_for_another_model(routed_app):
+    """A model budget applies only to its configured routed model."""
+    snapshot = routed_app.extensions["database"].get_proxy_snapshot_by_api_key(
+        "cursor-key"
+    )
+    profile = next(item for item in snapshot.profiles if item.provider == "openai")
+    with routed_app.extensions["database"].sessions.begin() as session:
+        persisted = session.get(ProviderProfile, profile.profile_id)
+        persisted.settings = {
+            **persisted.settings,
+            "organization": "org-openai",
+            "project": "project-openai",
+            "scheduler_limits": [
+                {
+                    "scope_kind": "model",
+                    "scope_id": "gpt-5.5",
+                    "metric": "requests",
+                    "limit": 12,
+                    "window_seconds": 60,
+                }
+            ],
+        }
+
+    refreshed = routed_app.extensions["database"].get_proxy_snapshot_by_api_key(
+        "cursor-key"
+    )
+    profile = next(item for item in refreshed.profiles if item.provider == "openai")
+    candidate = _scheduler_candidate(
+        refreshed, profile, "gpt-5.4", {"model": "cursor-acme-model"}
+    )
+
+    assert candidate.policies == ()
+    assert {
+        (scope.kind.value, scope.scope_id) for scope in candidate.cooldown_scopes
+    } == {
+        ("profile", profile.profile_id),
+        ("organization", "org-openai"),
+        ("project", "project-openai"),
+    }
+
+
+def test_transient_retry_after_does_not_prevent_same_provider_profile_failover(
+    routed_app, requests_mock, mocker
+):
+    """One OpenAI account's 429 cooldown leaves its sibling account available."""
+    database = routed_app.extensions["database"]
+    with database.sessions.begin() as session:
+        tenant = session.get(Tenant, "acme")
+        primary = session.scalar(
+            select(ProviderProfile).where(
+                ProviderProfile.tenant_id == "acme",
+                ProviderProfile.provider == "openai",
+            )
+        )
+        for profile in session.scalars(
+            select(ProviderProfile).where(ProviderProfile.tenant_id == "acme")
+        ):
+            profile.route_priority = None
+        session.flush()
+        primary.route_priority = 1
+        backup = create_provider_profile(
+            session,
+            database.secret_cipher,
+            "acme",
+            "openai",
+            "OpenAI backup",
+            {},
+            "gpt-5.4",
+            "openai-backup-secret",
+            "ada",
+        )
+        replace_catalog_entries(session, backup, [("gpt-5.4", None)], None)
+        activate_provider_profile(session, tenant, backup.id, "ada")
+
+    cooldown_scopes = []
+    original_apply_cooldown = ProviderBudgetScheduler.apply_cooldown
+
+    def record_cooldown(scheduler, scope, seconds, **kwargs):
+        cooldown_scopes.append(scope)
+        return original_apply_cooldown(scheduler, scope, seconds, **kwargs)
+
+    mocker.patch.object(ProviderBudgetScheduler, "apply_cooldown", record_cooldown)
+    requests_mock.post(
+        OPENAI,
+        [
+            {
+                "status_code": 429,
+                "headers": {"Retry-After": "1"},
+                "json": {"error": {"code": "rate_limit_exceeded"}},
+            },
+            {
+                "content": successful_chat("gpt-5.4"),
+                "headers": {"Content-Type": "text/event-stream"},
+            },
+        ],
+    )
+
+    response = post(routed_app)
+
+    assert response.status_code == 200
+    assert requests_mock.call_count == 2
+    assert {scope.kind.value for scope in cooldown_scopes} == {"profile"}
+
+
+def test_explicit_model_policy_is_also_a_cooldown_scope(routed_app):
+    """Explicit provider and model budgets add their scopes to cooldown tracking."""
+    snapshot = routed_app.extensions["database"].get_proxy_snapshot_by_api_key(
+        "cursor-key"
+    )
+    profile = next(item for item in snapshot.profiles if item.provider == "openai")
+    with routed_app.extensions["database"].sessions.begin() as session:
+        persisted = session.get(ProviderProfile, profile.profile_id)
+        persisted.settings = {
+            **persisted.settings,
+            "organization": "org-openai",
+            "project": "project-openai",
+            "scheduler_limits": [
+                {
+                    "scope_kind": "provider",
+                    "metric": "requests",
+                    "limit": 12,
+                    "window_seconds": 60,
+                },
+                {
+                    "scope_kind": "model",
+                    "metric": "requests",
+                    "limit": 12,
+                    "window_seconds": 60,
+                },
+                {
+                    "scope_kind": "organization",
+                    "metric": "requests",
+                    "limit": 12,
+                    "window_seconds": 60,
+                },
+                {
+                    "scope_kind": "project",
+                    "metric": "requests",
+                    "limit": 12,
+                    "window_seconds": 60,
+                },
+            ],
+        }
+
+    refreshed = routed_app.extensions["database"].get_proxy_snapshot_by_api_key(
+        "cursor-key"
+    )
+    profile = next(item for item in refreshed.profiles if item.provider == "openai")
+    candidate = _scheduler_candidate(
+        refreshed, profile, "gpt-5.4", {"model": "cursor-acme-model"}
+    )
+
+    assert {
+        (scope.kind.value, scope.scope_id) for scope in candidate.cooldown_scopes
+    } == {
+        ("profile", profile.profile_id),
+        ("provider", "openai"),
+        ("model", "gpt-5.4"),
+        ("organization", "org-openai"),
+        ("project", "project-openai"),
+    }
+    assert len(candidate.cooldown_scopes) == 5
+
+
 def test_scheduler_policy_resolves_omitted_profile_scope_id(routed_app):
     """A profile policy resolves against its persisted profile identity."""
     snapshot = routed_app.extensions["database"].get_proxy_snapshot_by_api_key(
@@ -1011,7 +1175,7 @@ def test_scheduler_is_explicit_no_budget_without_profile_configuration(
     assert reservations[0].estimated_tokens is None
     assert {
         (scope.provider, scope.kind.value) for scope in reservations[0].cooldown_scopes
-    } == {("azure", "provider"), ("azure", "profile"), ("azure", "model")}
+    } == {("azure", "profile")}
     assert [request.url for request in requests_mock.request_history] == [AZURE]
 
 
@@ -1416,9 +1580,7 @@ def test_transient_retry_after_is_persisted_by_scheduler(
         .profiles[0]
     )
     assert cooldowns == [
-        ("azure", "provider", "azure", 19.0, "acme"),
         ("azure", "profile", first_profile.profile_id, 19.0, "acme"),
-        ("azure", "model", first_profile.default_model, 19.0, "acme"),
     ]
     assert [request.url for request in requests_mock.request_history] == [AZURE, OPENAI]
 

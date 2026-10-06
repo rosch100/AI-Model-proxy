@@ -460,6 +460,12 @@ def _scheduler_candidate(
             kind = BudgetScopeKind(entry["scope_kind"])
             metric = BudgetMetric(entry["metric"])
             configured_scope_id = entry.get("scope_id")
+            if (
+                kind is BudgetScopeKind.MODEL
+                and isinstance(configured_scope_id, str)
+                and configured_scope_id != target_model
+            ):
+                continue
             scope_id = _scheduler_scope_id(
                 profile.provider, kind, configured_scope_id, profile, target_model
             )
@@ -480,25 +486,29 @@ def _scheduler_candidate(
                 f"scheduler_limits[{index}] is invalid: {exc}"
             ) from exc
 
-    scopes = tuple(
-        _scheduler_scope(profile.provider, kind, scope_id, profile, target_model)
-        for kind, scope_id in (
-            (BudgetScopeKind.PROVIDER, profile.provider),
-            (BudgetScopeKind.PROFILE, profile.profile_id),
-            (BudgetScopeKind.MODEL, target_model),
+    scopes = [
+        _scheduler_scope(
+            profile.provider,
+            BudgetScopeKind.PROFILE,
+            profile.profile_id,
+            profile,
+            target_model,
         )
-    )
+    ]
+    for policy in policies:
+        if policy.scope not in scopes:
+            scopes.append(policy.scope)
     for key, kind in (
         ("organization", BudgetScopeKind.ORGANIZATION),
         ("project", BudgetScopeKind.PROJECT),
     ):
         configured_id = settings.get(key)
         if isinstance(configured_id, str) and configured_id.strip():
-            scopes += (
-                _scheduler_scope(
-                    profile.provider, kind, configured_id, profile, target_model
-                ),
+            scope = _scheduler_scope(
+                profile.provider, kind, configured_id, profile, target_model
             )
+            if scope not in scopes:
+                scopes.append(scope)
 
     token_policies = [
         policy for policy in policies if policy.metric is BudgetMetric.TOKENS
@@ -509,7 +519,7 @@ def _scheduler_candidate(
             "Token scheduler limits require token_reservation_estimate because "
             "output caps do not estimate prompt usage."
         )
-    return SchedulerCandidate(tuple(policies), scopes, estimate)
+    return SchedulerCandidate(tuple(policies), tuple(scopes), estimate)
 
 
 def _scheduler_scope_id(

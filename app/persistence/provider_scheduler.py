@@ -47,7 +47,7 @@ def _adjust_aimd_limit(current: int, *, outcome: str) -> int:
         return min(AIMD_MAX_CONCURRENCY, current + 1)
     if outcome == "transient_failure":
         return max(AIMD_MIN_CONCURRENCY, current // 2)
-    if outcome == "terminal_failure":
+    if outcome in {"terminal_failure", "released"}:
         return current
     raise ValueError("Unsupported AIMD outcome")
 
@@ -1021,9 +1021,7 @@ class ProviderBudgetScheduler:
                     "Could not create provider budget window"
                 )
             if row.limit_units != claim.policy.limit_units:
-                raise ProviderSchedulerPolicyConflict(
-                    "Provider budget policy changed during an active fixed window"
-                )
+                row.limit_units = claim.policy.limit_units
             rows.append(row)
         return rows
 

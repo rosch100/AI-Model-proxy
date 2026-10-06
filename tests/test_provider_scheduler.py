@@ -6,6 +6,7 @@ import base64
 import re
 from datetime import datetime, timezone
 from pathlib import Path
+from unittest.mock import Mock
 
 import pytest
 from sqlalchemy import create_engine, select
@@ -30,9 +31,32 @@ from app.persistence.provider_scheduler import (
     ReservationRequest,
     SharedBudgetIdentity,
     _adjust_aimd_limit,
+    _WindowClaim,
 )
 from app.persistence.secrets import SecretCipher
 from app.providers.scheduler_config import parse_scheduler_limits
+
+
+def test_existing_budget_window_adopts_changed_limit():
+    """An active fixed window enforces an updated policy limit without 503."""
+    scope = BudgetScope("openai", BudgetScopeKind.PROFILE, "profile-a")
+    policy = BudgetPolicy(scope, BudgetMetric.REQUESTS, 20, 60)
+    row = Mock(limit_units=10)
+    session = Mock()
+    session.scalar.return_value = row
+
+    result = ProviderBudgetScheduler._lock_windows(
+        session,
+        "openai",
+        (
+            _WindowClaim(
+                policy, "fingerprint", datetime(2026, 10, 6, tzinfo=timezone.utc), 1
+            ),
+        ),
+    )
+
+    assert result == [row]
+    assert row.limit_units == 20
 
 
 def test_scheduler_policy_can_resolve_scope_id_from_runtime_context():
@@ -59,6 +83,11 @@ def test_aimd_limit_increases_additively_and_decreases_multiplicatively():
     assert _adjust_aimd_limit(1, outcome="transient_failure") == 1
     assert _adjust_aimd_limit(64, outcome="success") == 64
     assert _adjust_aimd_limit(4, outcome="terminal_failure") == 4
+
+
+def test_aimd_release_keeps_limit_unchanged():
+    """Releasing a permit without upstream I/O must not change capacity."""
+    assert _adjust_aimd_limit(4, outcome="released") == 4
 
 
 def test_new_persistent_migration_revisions_fit_alembic_version_column():

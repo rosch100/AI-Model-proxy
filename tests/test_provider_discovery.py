@@ -1,6 +1,7 @@
 """Tenant-scoped provider and model discovery API contracts."""
 
 from datetime import datetime, timezone
+from decimal import Decimal
 from io import StringIO
 from pathlib import Path
 from unittest.mock import patch
@@ -14,7 +15,10 @@ from alembic.script import ScriptDirectory
 
 from app.persistence.admin_ops import create_provider_profile, replace_catalog_entries
 from app.persistence.models import ProviderCatalogEntry, ProviderProfile, Tenant
-from app.providers.catalog import refresh_provider_catalog_with_pricing
+from app.providers.catalog import (
+    _complete_openrouter_pricing,
+    refresh_provider_catalog_with_pricing,
+)
 from app.tenants import hash_api_key
 
 
@@ -345,6 +349,50 @@ def test_openrouter_catalog_parses_decimal_json_without_float_rounding(requests_
     assert pricing["precise"]["input_per_1m_tokens"] == "0.123456789123"
     assert pricing["precise"]["output_per_1m_tokens"] == "0.000000001"
     assert pricing["precise"]["cache_per_1m_tokens"] == "0.5"
+
+
+@pytest.mark.parametrize("key", ["prompt", "completion", "input_cache_read"])
+@pytest.mark.parametrize(
+    "rate",
+    [
+        "1e1000000000",
+        "1e-1000000000",
+        "1e58",
+        "1e-69",
+        "1" * 59,
+        "1" * 64 + "e-7",
+    ],
+)
+def test_openrouter_pricing_rejects_oversized_rates_before_formatting(key, rate):
+    """Reject the whole price set before any potentially large allocation."""
+    rates = {"prompt": "0.000001", "completion": "0", "input_cache_read": "0"}
+    rates[key] = rate
+
+    with patch("app.providers.catalog._decimal_string") as formatter:
+        assert _complete_openrouter_pricing(rates) is None
+        formatter.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    ("rate", "expected"),
+    [
+        ("1e57", "1" + "0" * 63),
+        ("1e-68", "0." + "0" * 61 + "1"),
+        ("1" * 58, "1" * 58 + "0" * 6),
+        ("1" * 63 + "e-7", "1" * 62 + ".1"),
+        ("0.0000012500", "1.25"),
+        ("0e1000000000", "0"),
+        ("-0e-1000000000", "0"),
+    ],
+)
+def test_openrouter_pricing_accepts_bounded_rates_and_zero(rate, expected):
+    """Keep exact boundary values, decimal normalization, and compact zeros."""
+    result = _complete_openrouter_pricing(
+        {"prompt": Decimal(rate), "completion": "0", "input_cache_read": "0"}
+    )
+
+    assert result is not None
+    assert result["input_per_1m_tokens"] == expected
 
 
 @pytest.mark.parametrize("provider", ["azure", "openai", "deepseek"])

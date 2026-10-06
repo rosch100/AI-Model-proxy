@@ -44,6 +44,8 @@ from app.admin.forms import (
     PasswordChangeForm,
     ProviderProfileForm,
     ReorderProviderForm,
+    SetProviderPriorityForm,
+    TenantRoutingForm,
 )
 from app.admin.security import (
     ADMIN_COOKIE_NAME,
@@ -90,6 +92,7 @@ from app.persistence.admin_ops import (
     replace_catalog_entries,
     rotate_api_key,
     save_billing_secret,
+    set_provider_profile_priority,
     update_provider_profile,
 )
 from app.persistence.database import Database
@@ -142,6 +145,7 @@ from app.providers.deepseek_balance import (
     fetch_deepseek_balance,
 )
 from app.providers.openai_admin import OpenAIProjectLookupError, list_openai_projects
+from app.providers.routing_config import parse_profile_routing_settings
 from app.providers.scheduler_config import parse_scheduler_limits
 
 admin_bp = Blueprint("admin", __name__, url_prefix="/admin")
@@ -911,6 +915,47 @@ def settings_connection():
     )
 
 
+@admin_bp.post("/settings/connection/routing")
+@login_required
+def save_routing_settings():
+    """Persist a tenant-wide validated routing policy."""
+    form = TenantRoutingForm()
+    if not form.validate_on_submit():
+        flash("Die Routing-Einstellungen sind ungültig.", "error")
+        return redirect(url_for("admin.settings_connection"))
+    try:
+        with _database().sessions.begin() as session:
+            tenant = session.scalar(
+                select(Tenant).where(Tenant.id == g.admin.tenant_id).with_for_update()
+            )
+            if tenant is None:
+                raise LookupError("Tenant was not found")
+            tenant.routing_strategy = form.strategy.data
+            tenant.routing_load_balancing_method = form.load_balancing_method.data
+            tenant.routing_cost_policy = form.cost_policy.data
+            tenant.routing_headroom_weight = form.headroom_weight.data
+            tenant.routing_max_retry_wait_seconds = form.max_retry_wait_seconds.data
+            tenant.routing_tie_breaker = form.tie_breaker.data
+            session.add(
+                AuditEvent(
+                    tenant_id=tenant.id,
+                    actor_id=g.admin.username,
+                    target="tenant:routing",
+                    action="routing.settings.update",
+                    outcome="success",
+                    details={
+                        "strategy": tenant.routing_strategy,
+                        "cost_policy": tenant.routing_cost_policy,
+                    },
+                )
+            )
+    except (LookupError, ValueError) as exc:
+        flash(f"Routing-Einstellungen konnten nicht gespeichert werden: {exc}", "error")
+        return redirect(url_for("admin.settings_connection"))
+    flash("Routing-Einstellungen gespeichert.", "info")
+    return redirect(url_for("admin.settings_connection"))
+
+
 @admin_bp.get("/settings/connection/create")
 @login_required
 def create_connection_form():
@@ -1202,6 +1247,31 @@ def deactivate_connection_profile(profile_id: str):
         "über seine Modellkennung direkt nutzbar.",
         "info",
     )
+    return redirect(url_for("admin.settings_connection"))
+
+
+@admin_bp.post("/settings/connection/<profile_id>/priority")
+@login_required
+def set_connection_priority(profile_id: str):
+    """Assign one saved provider account to an explicit priority group."""
+    form = SetProviderPriorityForm()
+    if not form.validate_on_submit() or form.profile_id.data != profile_id:
+        return "Bad Request", 400
+    try:
+        with _database().sessions.begin() as session:
+            tenant = session.get(Tenant, g.admin.tenant_id)
+            set_provider_profile_priority(
+                session,
+                tenant,
+                profile_id,
+                form.priority.data,
+                g.admin.username,
+            )
+    except LookupError:
+        return "Not Found", 404
+    except ValueError:
+        return "Bad Request", 400
+    flash("Prioritätsgruppe aktualisiert.", "info")
     return redirect(url_for("admin.settings_connection"))
 
 
@@ -1804,6 +1874,9 @@ def _profile_form(
         default_model=profile.default_model or "",
         organization=str(profile.settings.get("organization", "")),
         project=str(profile.settings.get("project", "")),
+        routing=json.dumps(
+            profile.settings.get("routing", {}), ensure_ascii=False, indent=2
+        ),
         scheduler_limits=json.dumps(
             parse_scheduler_limits(profile.settings.get("scheduler_limits", [])),
             ensure_ascii=False,
@@ -1835,10 +1908,14 @@ def _set_default_model_choices(
 
 def _provider_settings(form: ProviderProfileForm) -> dict[str, object]:
     """Extract selected provider fields and shared scheduler settings."""
+    routing = json.loads(form.routing.data or "{}")
+    parse_profile_routing_settings({"routing": routing})
     settings: dict[str, object] = {
         "scheduler_limits": parse_scheduler_limits(form.scheduler_limits.data or "[]"),
         "token_reservation_estimate": form.token_reservation_estimate.data,
     }
+    if routing:
+        settings["routing"] = routing
     provider = form.provider.data
     if provider == "azure":
         settings.update(
@@ -1932,6 +2009,14 @@ def _connection_context() -> dict[str, object]:
                 ),
             ),
             "logout_form": LoginForm(),
+            "routing_form": TenantRoutingForm(
+                strategy=tenant.routing_strategy,
+                load_balancing_method=tenant.routing_load_balancing_method,
+                cost_policy=tenant.routing_cost_policy,
+                headroom_weight=tenant.routing_headroom_weight,
+                max_retry_wait_seconds=tenant.routing_max_retry_wait_seconds,
+                tie_breaker=tenant.routing_tie_breaker,
+            ),
         }
 
 

@@ -11,6 +11,7 @@ from sqlalchemy import (
     Boolean,
     CheckConstraint,
     DateTime,
+    Float,
     ForeignKey,
     ForeignKeyConstraint,
     Index,
@@ -46,11 +47,56 @@ class Tenant(Base):
     __table_args__ = (
         UniqueConstraint("api_key_hash", name="uq_tenants_api_key_hash"),
         UniqueConstraint("custom_model_id", name="uq_tenants_custom_model_id"),
+        CheckConstraint(
+            "routing_strategy IN ('prioritized', 'load_balanced')",
+            name="ck_tenant_routing_strategy",
+        ),
+        CheckConstraint(
+            "routing_load_balancing_method = 'weighted_least_loaded'",
+            name="ck_tenant_routing_balancer",
+        ),
+        CheckConstraint(
+            "routing_cost_policy IN ('ignore', 'prefer_lower_cost', 'cost_tiers')",
+            name="ck_tenant_routing_cost_policy",
+        ),
+        CheckConstraint(
+            "routing_headroom_weight BETWEEN 0 AND 1",
+            name="ck_tenant_routing_headroom_weight",
+        ),
+        CheckConstraint(
+            "routing_max_retry_wait_seconds BETWEEN 1 AND 300",
+            name="ck_tenant_routing_retry_wait",
+        ),
+        CheckConstraint(
+            "routing_tie_breaker = 'profile_id'",
+            name="ck_tenant_routing_tie_breaker",
+        ),
     )
 
     id: Mapped[str] = mapped_column(String(128), primary_key=True)
     api_key_hash: Mapped[str] = mapped_column(String(64), nullable=False)
     custom_model_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    routing_strategy: Mapped[str] = mapped_column(
+        String(32), nullable=False, default="prioritized", server_default="prioritized"
+    )
+    routing_load_balancing_method: Mapped[str] = mapped_column(
+        String(32),
+        nullable=False,
+        default="weighted_least_loaded",
+        server_default="weighted_least_loaded",
+    )
+    routing_cost_policy: Mapped[str] = mapped_column(
+        String(32), nullable=False, default="ignore", server_default="ignore"
+    )
+    routing_headroom_weight: Mapped[float] = mapped_column(
+        Float, nullable=False, default=0.5, server_default="0.5"
+    )
+    routing_max_retry_wait_seconds: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=30, server_default="30"
+    )
+    routing_tie_breaker: Mapped[str] = mapped_column(
+        String(32), nullable=False, default="profile_id", server_default="profile_id"
+    )
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False
     )
@@ -85,9 +131,6 @@ class ProviderProfile(Base):
             "tenant_id", "provider", "id", name="uq_profile_tenant_provider_id"
         ),
         UniqueConstraint("tenant_id", "id", name="uq_profile_tenant_id"),
-        UniqueConstraint(
-            "tenant_id", "route_priority", name="uq_profile_tenant_route_priority"
-        ),
         CheckConstraint(
             "route_priority IS NULL OR route_priority > 0",
             name="ck_profile_route_priority_positive",
@@ -732,6 +775,12 @@ class ProviderConcurrencyState(Base):
         CheckConstraint(
             "concurrency_limit BETWEEN 1 AND 64", name="ck_concurrency_limit"
         ),
+        CheckConstraint(
+            "minimum_limit BETWEEN 1 AND 64 AND maximum_limit BETWEEN 1 AND 64 "
+            "AND minimum_limit <= concurrency_limit "
+            "AND concurrency_limit <= maximum_limit",
+            name="ck_concurrency_bounds",
+        ),
     )
 
     id: Mapped[int] = mapped_column(primary_key=True)
@@ -741,6 +790,12 @@ class ProviderConcurrencyState(Base):
     provider: Mapped[str] = mapped_column(String(16), nullable=False)
     scope_fingerprint: Mapped[str] = mapped_column(String(64), nullable=False)
     concurrency_limit: Mapped[int] = mapped_column(Integer, nullable=False)
+    minimum_limit: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=1, server_default="1"
+    )
+    maximum_limit: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=64, server_default="64"
+    )
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False
     )

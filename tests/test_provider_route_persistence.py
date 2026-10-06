@@ -111,6 +111,23 @@ def test_route_schema_replaces_tenant_pointer_with_nullable_positive_priority():
     assert column.type.python_type is int
 
 
+def test_tenant_schema_has_typed_routing_defaults():
+    """Tenant routing strategy and policies have safe persisted defaults."""
+    expected_types = {
+        "routing_strategy": str,
+        "routing_load_balancing_method": str,
+        "routing_cost_policy": str,
+        "routing_headroom_weight": float,
+        "routing_max_retry_wait_seconds": int,
+        "routing_tie_breaker": str,
+    }
+    for name, python_type in expected_types.items():
+        column = Tenant.__table__.columns[name]
+        assert column.type.python_type is python_type
+        assert column.nullable is False
+        assert column.server_default is not None
+
+
 @pytest.mark.parametrize("invalid_priority", [0, -1])
 def test_route_priority_rejects_nonpositive_values(route_database, invalid_priority):
     """Database constraints reject zero and negative route positions."""
@@ -122,21 +139,22 @@ def test_route_priority_rejects_nonpositive_values(route_database, invalid_prior
         session.rollback()
 
 
-def test_route_priority_is_unique_per_tenant_but_null_and_other_tenant_are_allowed(
-    route_database,
-):
-    """Nullable uniqueness is scoped to a tenant, not a provider."""
+def test_route_priority_allows_equal_groups_within_a_tenant(route_database):
+    """Repeated positive priorities are valid grouping keys within one tenant."""
+    constraints = [
+        constraint
+        for constraint in ProviderProfile.__table__.constraints
+        if getattr(constraint, "name", None) == "uq_profile_tenant_route_priority"
+    ]
+    assert constraints == []
+
     with route_database.sessions.begin() as session:
         one = create_ready_profile(session, route_database, "One")
         two = create_ready_profile(session, route_database, "Two")
         peer = create_ready_profile(session, route_database, "Peer", tenant_id="other")
-        create_ready_profile(session, route_database, "Inactive")
-        one.route_priority = peer.route_priority = 1
+        one.route_priority = two.route_priority = peer.route_priority = 1
         session.flush()
-        two.route_priority = 1
-        with pytest.raises(IntegrityError):
-            session.flush()
-        session.rollback()
+        assert [profile.route_priority for profile in (one, two, peer)] == [1, 1, 1]
 
 
 def test_activation_appends_and_reactivation_preserves_position_and_audits(
@@ -165,6 +183,65 @@ def test_activation_appends_and_reactivation_preserves_position_and_audits(
         assert len(events) == 3
         assert events[-1].details["route_priority"] == 1
         assert "secret-" not in repr([e.details for e in events])
+
+
+def test_catalog_refresh_prunes_stale_model_concurrency_and_audits(route_database):
+    """Retain valid model limits and audit limits removed with catalog entries."""
+    with route_database.sessions.begin() as session:
+        tenant = session.get(Tenant, "acme")
+        profile = create_ready_profile(session, route_database, "Catalog limits")
+        admin_ops.activate_provider_profile(session, tenant, profile.id, "ada")
+        profile.settings = {
+            "routing": {
+                "model_concurrency": {
+                    "gpt-5.4": {"initial": 3, "min": 1, "max": 8},
+                    "removed-model": {"initial": 2, "min": 1, "max": 4},
+                }
+            }
+        }
+
+        admin_ops.replace_catalog_entries(session, profile, [("gpt-5.4", None)], None)
+
+        assert profile.settings["routing"]["model_concurrency"] == {
+            "gpt-5.4": {"initial": 3, "min": 1, "max": 8}
+        }
+        assert profile.route_priority == 1
+        event = session.scalar(
+            select(AuditEvent).where(
+                AuditEvent.action == "profile.model_routing_pruned"
+            )
+        )
+        assert event is not None
+        assert event.actor_id == "system:catalog"
+        assert event.details["model_ids"] == ["removed-model"]
+
+
+def test_equal_priority_groups_can_be_set_and_reordered_without_splitting(
+    route_database,
+):
+    """Admin route changes retain group membership and compact whole groups."""
+    with route_database.sessions.begin() as session:
+        tenant = session.get(Tenant, "acme")
+        profiles = [
+            create_ready_profile(session, route_database, name)
+            for name in ("One", "Two", "Three")
+        ]
+        for profile in profiles:
+            admin_ops.activate_provider_profile(session, tenant, profile.id, "ada")
+        admin_ops.set_provider_profile_priority(
+            session, tenant, profiles[1].id, 1, "ada"
+        )
+        assert [profile.route_priority for profile in profiles] == [1, 1, 2]
+
+        admin_ops.reorder_provider_profile(
+            session, tenant, profiles[0].id, "down", "ada"
+        )
+
+        assert [profile.route_priority for profile in profiles] == [2, 2, 1]
+        admin_ops.set_provider_profile_priority(
+            session, tenant, profiles[2].id, None, "ada"
+        )
+        assert [profile.route_priority for profile in profiles] == [1, 1, None]
 
 
 def test_reorder_uses_collision_free_contiguous_swap_and_audit(route_database):
@@ -352,6 +429,36 @@ def test_failed_catalog_refresh_preserves_valid_route_and_catalog(route_database
         )
 
 
+def test_routing_snapshot_parses_tenant_and_profile_routing_settings(route_database):
+    """The snapshot exposes validated typed tenant and profile routing policies."""
+    with route_database.sessions.begin() as session:
+        tenant = session.get(Tenant, "acme")
+        tenant.routing_strategy = "load_balanced"
+        tenant.routing_cost_policy = "cost_tiers"
+        profile = create_ready_profile(session, route_database, "Weighted")
+        profile.route_priority = 1
+        profile.settings = {
+            **profile.settings,
+            "routing": {
+                "cost_tier": 2,
+                "load_balancing_weight": 1.5,
+                "profile_concurrency": {"initial": 6, "min": 2, "max": 20},
+                "model_concurrency": {"gpt-5.4": {"initial": 3, "min": 1, "max": 8}},
+            },
+        }
+
+    snapshot = route_database.get_proxy_snapshot_by_api_key("acme")
+
+    assert snapshot.routing_settings.strategy == "load_balanced"
+    assert snapshot.routing_settings.cost_policy == "cost_tiers"
+    assert snapshot.profiles[0].routing_settings.cost_tier == 2
+    assert snapshot.profiles[0].routing_settings.load_balancing_weight == 1.5
+    assert snapshot.profiles[0].routing_settings.profile_concurrency.maximum == 20
+    assert (
+        snapshot.profiles[0].routing_settings.model_concurrency["gpt-5.4"].initial == 3
+    )
+
+
 def test_routing_snapshot_uses_one_statement_ordered_catalog_and_immutable_profile_dtos(
     route_database,
 ):
@@ -402,7 +509,8 @@ def test_routing_snapshot_uses_one_statement_ordered_catalog_and_immutable_profi
 
 
 @pytest.mark.parametrize(
-    "invalid", ["catalog", "default", "secret", "settings", "deployment", "deleted"]
+    "invalid",
+    ["catalog", "default", "secret", "settings", "deployment", "routing", "deleted"],
 )
 def test_snapshot_excludes_invalid_routed_profiles_without_default_fallback(
     route_database, invalid
@@ -431,6 +539,8 @@ def test_snapshot_excludes_invalid_routed_profiles_without_default_fallback(
             bad.settings = {"base_url": "http://invalid.example"}
         elif invalid == "deployment":
             bad.settings = {**bad.settings, "model_deployments": {"gpt-5.4": "stale"}}
+        elif invalid == "routing":
+            bad.settings = {**bad.settings, "routing": {"load_balancing_weight": 0}}
         else:
             bad.deleted_at = datetime.now(timezone.utc)
         good_id = good.id

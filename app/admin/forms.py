@@ -7,6 +7,7 @@ import json
 from flask_wtf import FlaskForm
 from wtforms import (
     BooleanField,
+    FloatField,
     IntegerField,
     PasswordField,
     SelectField,
@@ -15,6 +16,7 @@ from wtforms import (
 )
 from wtforms.validators import (
     DataRequired,
+    InputRequired,
     Length,
     NumberRange,
     Optional,
@@ -24,6 +26,10 @@ from wtforms.validators import (
 from wtforms.widgets import PasswordInput
 
 from app.providers.azure_url import validate_azure_base_url
+from app.providers.routing_config import (
+    parse_profile_routing_settings,
+    parse_tenant_routing_settings,
+)
 from app.providers.scheduler_config import parse_scheduler_limits
 
 
@@ -107,6 +113,63 @@ class OpenRouterConnectionForm(FlaskForm):
     )
 
 
+class TenantRoutingForm(FlaskForm):
+    """Tenant-wide route selection policy with centralized bounds validation."""
+
+    strategy = SelectField(
+        "Routingstrategie",
+        choices=[
+            ("prioritized", "Priorisierte Kaskade"),
+            ("load_balanced", "Load-Balancing gleicher Prioritäten"),
+        ],
+        validators=[DataRequired()],
+    )
+    load_balancing_method = SelectField(
+        "Load-Balancing-Verfahren",
+        choices=[("weighted_least_loaded", "Gewichtete geringste Auslastung")],
+        validators=[DataRequired()],
+    )
+    cost_policy = SelectField(
+        "Kostenpolitik",
+        choices=[
+            ("ignore", "Kosten ignorieren"),
+            ("prefer_lower_cost", "Niedrigere vergleichbare Katalogkosten bevorzugen"),
+            ("cost_tiers", "Manuelle Kostenstufen verwenden"),
+        ],
+        validators=[DataRequired()],
+    )
+    headroom_weight = FloatField(
+        "Headroom-Gewichtung", validators=[InputRequired(), NumberRange(min=0, max=1)]
+    )
+    max_retry_wait_seconds = IntegerField(
+        "Maximale Wartezeit (Sekunden)",
+        validators=[DataRequired(), NumberRange(min=1, max=300)],
+    )
+    tie_breaker = SelectField(
+        "Gleichstandsregel",
+        choices=[("profile_id", "Profilkennung")],
+        validators=[DataRequired()],
+    )
+
+    def validate(self, extra_validators=None) -> bool:
+        """Use the shared routing parser for the complete tenant policy."""
+        if not super().validate(extra_validators):
+            return False
+        try:
+            parse_tenant_routing_settings(
+                strategy=self.strategy.data,
+                load_balancing_method=self.load_balancing_method.data,
+                cost_policy=self.cost_policy.data,
+                headroom_weight=self.headroom_weight.data,
+                max_retry_wait_seconds=self.max_retry_wait_seconds.data,
+                tie_breaker=self.tie_breaker.data,
+            )
+        except ValueError as exc:
+            self.strategy.errors.append(str(exc))
+            return False
+        return True
+
+
 class ProviderProfileForm(FlaskForm):
     """Provider-specific settings for creating or editing one named account."""
 
@@ -137,6 +200,7 @@ class ProviderProfileForm(FlaskForm):
     )
     organization = StringField("Organisation (optional)", validators=[Optional()])
     project = StringField("Projekt (optional)", validators=[Optional()])
+    routing = TextAreaField("Routing und Kapazität (optionales JSON-Objekt)")
     scheduler_limits = TextAreaField(
         "Scheduler-Limits (optionales JSON-Array)",
     )
@@ -144,6 +208,17 @@ class ProviderProfileForm(FlaskForm):
         "Token-Reservierungsschätzung (optional)",
         validators=[Optional(), NumberRange(min=1)],
     )
+
+    def validate_routing(self, field: TextAreaField) -> None:
+        """Validate and normalize per-profile scheduling parameters."""
+        try:
+            settings = json.loads(field.data or "{}")
+            parse_profile_routing_settings({"routing": settings})
+        except (ValueError, TypeError) as exc:
+            raise ValidationError(
+                "Routing/Kapazität muss ein gültiges JSON-Objekt mit positiven Grenzen sein."
+            ) from exc
+        field.data = json.dumps(settings, ensure_ascii=False, separators=(",", ":"))
 
     def validate_scheduler_limits(self, field: TextAreaField) -> None:
         """Validate and normalize scheduler tuples before persistence."""
@@ -173,6 +248,15 @@ class ActivateProviderForm(FlaskForm):
 
 class DeactivateProviderForm(FlaskForm):
     """CSRF-protected request to explicitly clear the provider route."""
+
+
+class SetProviderPriorityForm(ActivateProviderForm):
+    """Assign a provider profile to a positive tenant-local priority group."""
+
+    priority = IntegerField(
+        "Prioritätsgruppe",
+        validators=[DataRequired(), NumberRange(min=1)],
+    )
 
 
 class ReorderProviderForm(ActivateProviderForm):

@@ -10,7 +10,7 @@ from threading import Barrier
 from uuid import uuid4
 
 import pytest
-from sqlalchemy import select, text
+from sqlalchemy import func, select, text
 from sqlalchemy.orm import sessionmaker
 
 from app.persistence.models import (
@@ -28,6 +28,7 @@ from app.persistence.provider_scheduler import (
     BudgetScope,
     BudgetScopeKind,
     ProviderBudgetScheduler,
+    ProviderConcurrencyCandidate,
     ProviderConcurrencyController,
     ProviderSchedulerPolicyConflict,
     ReservationRequest,
@@ -123,6 +124,205 @@ def test_postgres_aimd_persists_success_increase_and_transient_decrease(
             ).scalar_one()
             == 1
         )
+
+
+def test_postgres_aimd_group_selection_uses_weighted_least_loaded_capacity(
+    postgres_test_databases,
+):
+    """The PostgreSQL group scoring selects the less-loaded profile."""
+    databases = postgres_test_databases
+    databases.upgrade("head")
+    tenant_id = f"aimd-group-{uuid4()}"
+    _create_tenant(databases, tenant_id)
+    cipher = SecretCipher.from_key(base64.urlsafe_b64encode(b"k" * 32).decode())
+    controller = ProviderConcurrencyController(
+        sessionmaker(bind=databases.runtime_engine, expire_on_commit=False), cipher
+    )
+    candidates = tuple(
+        ProviderConcurrencyCandidate(
+            provider="openai",
+            profile_id=profile_id,
+            target_model="model-a",
+            profile_initial_limit=4,
+            profile_minimum_limit=1,
+            profile_maximum_limit=4,
+            model_initial_limit=4,
+            model_minimum_limit=1,
+            model_maximum_limit=4,
+            weight=1.0,
+        )
+        for profile_id in ("profile-a", "profile-b")
+    )
+
+    occupied = controller.acquire(
+        tenant_id,
+        "openai",
+        "profile-a",
+        target_model="model-a",
+        profile_initial_limit=4,
+        profile_minimum_limit=1,
+        profile_maximum_limit=4,
+        model_initial_limit=4,
+        model_minimum_limit=1,
+        model_maximum_limit=4,
+    )
+    selected = controller.acquire_best(tenant_id, candidates)
+
+    assert occupied.allowed and occupied.lease is not None
+    assert selected.allowed and selected.lease is not None
+    assert selected.profile_id == "profile-b"
+    assert controller.settle(occupied.lease, outcome="released")
+    assert controller.settle(selected.lease, outcome="released")
+
+
+def test_postgres_aimd_profile_only_candidate_acquires_single_scope(
+    postgres_test_databases,
+):
+    """Acquire without a target model leases only the profile scope."""
+    databases = postgres_test_databases
+    databases.upgrade("head")
+    tenant_id = f"aimd-profile-only-{uuid4()}"
+    _create_tenant(databases, tenant_id)
+    cipher = SecretCipher.from_key(base64.urlsafe_b64encode(b"k" * 32).decode())
+    controller = ProviderConcurrencyController(
+        sessionmaker(bind=databases.runtime_engine, expire_on_commit=False), cipher
+    )
+
+    decision = controller.acquire(tenant_id, "openai", "profile-only")
+
+    assert decision.allowed and decision.lease is not None
+    assert decision.lease.additional_permits == ()
+    assert controller.settle(decision.lease, outcome="released")
+
+
+def test_postgres_aimd_parallel_group_selection_assigns_distinct_available_profiles(
+    postgres_test_databases,
+):
+    """Concurrent PostgreSQL selectors receive distinct available profiles."""
+    databases = postgres_test_databases
+    databases.upgrade("head")
+    tenant_id = f"aimd-group-lock-{uuid4()}"
+    _create_tenant(databases, tenant_id)
+    cipher = SecretCipher.from_key(base64.urlsafe_b64encode(b"k" * 32).decode())
+    controllers = tuple(
+        ProviderConcurrencyController(
+            sessionmaker(bind=databases.runtime_engine, expire_on_commit=False), cipher
+        )
+        for _ in range(2)
+    )
+    candidates = tuple(
+        ProviderConcurrencyCandidate(
+            provider="openai",
+            profile_id=profile_id,
+            target_model="model-a",
+            profile_initial_limit=1,
+            profile_minimum_limit=1,
+            profile_maximum_limit=1,
+            model_initial_limit=1,
+            model_minimum_limit=1,
+            model_maximum_limit=1,
+        )
+        for profile_id in ("profile-a", "profile-b")
+    )
+    barrier = Barrier(2)
+
+    def acquire(controller):
+        barrier.wait(timeout=10)
+        return controller.acquire_best(tenant_id, candidates)
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        decisions = tuple(pool.map(acquire, controllers))
+
+    assert all(
+        decision.allowed and decision.lease is not None for decision in decisions
+    )
+    assert {decision.profile_id for decision in decisions} == {"profile-a", "profile-b"}
+
+
+def test_postgres_budget_headroom_includes_the_pending_reservation(
+    postgres_test_databases,
+):
+    """Budget headroom reflects pending reservations until they're released."""
+    databases = postgres_test_databases
+    databases.upgrade("head")
+    tenant_id = f"scheduler-headroom-{uuid4()}"
+    _create_tenant(databases, tenant_id)
+    scheduler = _scheduler(databases)
+    scope = BudgetScope("openai", BudgetScopeKind.PROFILE, "profile-headroom")
+    request = ReservationRequest(
+        tenant_id,
+        (BudgetPolicy(scope, BudgetMetric.REQUESTS, 4, 60),),
+    )
+
+    assert scheduler.headroom(request) == 1.0
+    reserved = scheduler.reserve(request)
+    assert reserved.allowed and reserved.lease is not None
+    assert scheduler.headroom(request) == 0.5
+    assert scheduler.release(reserved.lease)
+    assert scheduler.headroom(request) == 1.0
+
+
+def test_postgres_aimd_atomically_reserves_profile_and_model_scopes(
+    postgres_test_databases,
+):
+    """A full model scope leaves no partial profile lease and other models can proceed."""
+    databases = postgres_test_databases
+    databases.upgrade("head")
+    tenant_id = f"aimd-dual-{uuid4()}"
+    _create_tenant(databases, tenant_id)
+    cipher = SecretCipher.from_key(base64.urlsafe_b64encode(b"k" * 32).decode())
+    controller = ProviderConcurrencyController(
+        sessionmaker(bind=databases.runtime_engine, expire_on_commit=False),
+        cipher,
+    )
+    options = {
+        "profile_initial_limit": 2,
+        "profile_minimum_limit": 1,
+        "profile_maximum_limit": 2,
+        "model_initial_limit": 1,
+        "model_minimum_limit": 1,
+        "model_maximum_limit": 4,
+    }
+
+    first = controller.acquire(
+        tenant_id, "openai", "profile-dual", target_model="model-a", **options
+    )
+    denied_same_model = controller.acquire(
+        tenant_id, "openai", "profile-dual", target_model="model-a", **options
+    )
+    allowed_other_model = controller.acquire(
+        tenant_id, "openai", "profile-dual", target_model="model-b", **options
+    )
+    denied_profile = controller.acquire(
+        tenant_id, "openai", "profile-dual", target_model="model-c", **options
+    )
+
+    assert first.allowed and first.lease is not None
+    assert not denied_same_model.allowed
+    assert allowed_other_model.allowed and allowed_other_model.lease is not None
+    assert not denied_profile.allowed
+    with databases.runtime_engine.connect() as connection:
+        active_by_fingerprint = dict(
+            connection.execute(
+                select(
+                    ProviderConcurrencyState.scope_fingerprint,
+                    func.count(ProviderConcurrencyLease.id),
+                )
+                .join(
+                    ProviderConcurrencyLease,
+                    ProviderConcurrencyLease.state_id == ProviderConcurrencyState.id,
+                )
+                .where(
+                    ProviderConcurrencyState.tenant_id == tenant_id,
+                    ProviderConcurrencyLease.status == "active",
+                )
+                .group_by(ProviderConcurrencyState.scope_fingerprint)
+            ).all()
+        )
+    assert len(active_by_fingerprint) == 4
+    assert sorted(active_by_fingerprint.values()) == [1, 1, 1, 1]
+    assert controller.settle(first.lease, outcome="success")
+    assert controller.settle(allowed_other_model.lease, outcome="released")
 
 
 def test_postgres_aimd_cleanup_expires_stale_active_permits(postgres_test_databases):

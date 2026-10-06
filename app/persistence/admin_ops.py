@@ -30,6 +30,7 @@ from app.persistence.secrets import SecretCipher
 from app.providers.azure_scope import canonical_cost_scopes
 from app.providers.azure_url import validate_azure_base_url
 from app.providers.catalog import selectable_catalog_models
+from app.providers.routing_config import parse_profile_routing_settings
 from app.providers.scheduler_config import parse_scheduler_limits
 from app.tenants import hash_api_key
 
@@ -143,9 +144,12 @@ def upsert_provider_profile(
 
 
 def _validate_provider_settings(
-    provider: str, settings: dict[str, object]
+    provider: str,
+    settings: dict[str, object],
+    *,
+    catalog_model_ids: set[str] | None = None,
 ) -> dict[str, object]:
-    """Validate scheduler configuration before persisting profile settings."""
+    """Validate scheduler and catalog-bound routing configuration."""
     if not isinstance(settings, dict):
         raise ValueError("Provider settings must be an object")
     normalized = dict(settings)
@@ -163,6 +167,7 @@ def _validate_provider_settings(
         for policy in normalized.get("scheduler_limits", [])
     ):
         raise ValueError("Token scheduler limits require token_reservation_estimate")
+    parse_profile_routing_settings(normalized, catalog_model_ids=catalog_model_ids)
     if provider not in {"azure", "openai", "openrouter", "deepseek"}:
         raise ValueError("Unsupported provider")
     return normalized
@@ -291,7 +296,16 @@ def update_provider_profile(
     for key in ("scheduler_limits", "token_reservation_estimate"):
         if key not in merged_settings and key in profile.settings:
             merged_settings[key] = profile.settings[key]
-    normalized_settings = _validate_provider_settings(profile.provider, merged_settings)
+    catalog_model_ids = set(
+        session.scalars(
+            select(ProviderCatalogEntry.model_id).where(
+                ProviderCatalogEntry.profile_id == profile.id
+            )
+        )
+    )
+    normalized_settings = _validate_provider_settings(
+        profile.provider, merged_settings, catalog_model_ids=catalog_model_ids
+    )
     if profile.provider == "openai":
         has_retained_batch = session.scalar(
             select(BatchJob.id)
@@ -519,15 +533,33 @@ def _routed_profiles(session: Session, tenant_id: str) -> list[ProviderProfile]:
 def _write_route(
     session: Session,
     previous: list[ProviderProfile],
-    ordered: list[ProviderProfile],
+    groups: list[list[ProviderProfile]],
 ) -> None:
-    """Renumber atomically using a flushed NULL phase to avoid unique collisions."""
+    """Rewrite ordered priority groups atomically through a flushed NULL phase."""
     for profile in previous:
         profile.route_priority = None
     session.flush()
-    for priority, profile in enumerate(ordered, start=1):
-        profile.route_priority = priority
+    for priority, group in enumerate(groups, start=1):
+        for profile in group:
+            profile.route_priority = priority
     session.flush()
+
+
+def _group_route(
+    profiles: list[ProviderProfile],
+) -> list[list[ProviderProfile]]:
+    """Preserve stable profile order while grouping identical priorities."""
+    groups: dict[int, list[ProviderProfile]] = {}
+    for profile in sorted(
+        profiles, key=lambda item: (item.route_priority or 0, item.id)
+    ):
+        if profile.route_priority is not None:
+            groups.setdefault(profile.route_priority, []).append(profile)
+    return [groups[priority] for priority in sorted(groups)]
+
+
+def _flatten_route(groups: list[list[ProviderProfile]]) -> list[ProviderProfile]:
+    return [profile for group in groups for profile in group]
 
 
 def _remove_from_route(
@@ -540,9 +572,8 @@ def _remove_from_route(
     if profile.route_priority is None:
         return
     previous = _routed_profiles(session, profile.tenant_id)
-    _write_route(
-        session, previous, [item for item in previous if item.id != profile.id]
-    )
+    remaining = [item for item in previous if item.id != profile.id]
+    _write_route(session, previous, _group_route(remaining))
     session.add(
         AuditEvent(
             tenant_id=profile.tenant_id,
@@ -600,13 +631,17 @@ def reorder_provider_profile(
     if profile.route_priority is None:
         raise ValueError("Cannot reorder an inactive provider account")
     previous = _routed_profiles(session, tenant.id)
-    ordered = list(previous)
-    index = next(index for index, item in enumerate(ordered) if item.id == profile.id)
-    destination = index + (-1 if direction == "up" else 1)
-    if destination < 0 or destination >= len(ordered):
+    groups = _group_route(previous)
+    group_index = next(
+        index
+        for index, group in enumerate(groups)
+        if any(item.id == profile.id for item in group)
+    )
+    destination = group_index + (-1 if direction == "up" else 1)
+    if destination < 0 or destination >= len(groups):
         return profile
-    ordered[index], ordered[destination] = ordered[destination], ordered[index]
-    _write_route(session, previous, ordered)
+    groups[group_index], groups[destination] = groups[destination], groups[group_index]
+    _write_route(session, previous, groups)
     session.add(
         AuditEvent(
             tenant_id=tenant.id,
@@ -619,6 +654,66 @@ def reorder_provider_profile(
                 "direction": direction,
                 "route_priority": profile.route_priority,
             },
+        )
+    )
+    return profile
+
+
+def set_provider_profile_priority(
+    session: Session,
+    tenant: Tenant,
+    profile_id: str,
+    priority: int | None,
+    actor_id: str,
+) -> ProviderProfile:
+    """Set a profile's route priority, joining or creating its priority group."""
+    if priority is not None and (
+        isinstance(priority, bool) or not isinstance(priority, int) or priority < 1
+    ):
+        raise ValueError("Route priority must be a positive integer or None")
+    _lock_tenant(session, tenant.id)
+    profile = session.scalar(
+        select(ProviderProfile)
+        .where(
+            ProviderProfile.id == profile_id,
+            ProviderProfile.tenant_id == tenant.id,
+            ProviderProfile.deleted_at.is_(None),
+        )
+        .with_for_update()
+        .execution_options(populate_existing=True)
+    )
+    if profile is None:
+        raise LookupError("Provider account was not found")
+    previous = _routed_profiles(session, tenant.id)
+    groups = [
+        remaining
+        for group in _group_route(previous)
+        if (remaining := [item for item in group if item.id != profile.id])
+    ]
+    if priority is not None:
+        catalog = session.scalars(
+            select(ProviderCatalogEntry).where(
+                ProviderCatalogEntry.profile_id == profile.id
+            )
+        )
+        validate_routed_profile(
+            profile, [(entry.model_id, entry.deployment_id) for entry in catalog]
+        )
+        if priority <= len(groups):
+            groups[priority - 1].append(profile)
+        elif priority == len(groups) + 1:
+            groups.append([profile])
+        else:
+            raise ValueError("Route priority cannot skip a priority group")
+    _write_route(session, previous, groups)
+    session.add(
+        AuditEvent(
+            tenant_id=tenant.id,
+            actor_id=actor_id,
+            target=f"profile:{profile.id}",
+            action="profile.priority",
+            outcome="success",
+            details={"profile_id": profile.id, "route_priority": priority},
         )
     )
     return profile
@@ -651,7 +746,9 @@ def activate_provider_profile(
     )
     if profile.route_priority is None:
         previous = _routed_profiles(session, tenant.id)
-        _write_route(session, previous, [*previous, profile])
+        groups = _group_route(previous)
+        groups.append([profile])
+        _write_route(session, previous, groups)
     session.add(
         AuditEvent(
             tenant_id=tenant.id,
@@ -737,6 +834,38 @@ def replace_catalog_entries(
     selectable_models = {
         model_id for model_id, _ in selectable_catalog_models(profile.provider, entries)
     }
+    routing = profile.settings.get("routing")
+    model_concurrency = (
+        routing.get("model_concurrency") if isinstance(routing, dict) else None
+    )
+    if isinstance(model_concurrency, dict):
+        stale_model_ids = sorted(set(model_concurrency) - selectable_models)
+        if stale_model_ids:
+            updated_model_concurrency = {
+                model_id: bounds
+                for model_id, bounds in model_concurrency.items()
+                if model_id in selectable_models
+            }
+            profile.settings = {
+                **profile.settings,
+                "routing": {
+                    **routing,
+                    "model_concurrency": updated_model_concurrency,
+                },
+            }
+            parse_profile_routing_settings(
+                profile.settings, catalog_model_ids=selectable_models
+            )
+            session.add(
+                AuditEvent(
+                    tenant_id=profile.tenant_id,
+                    actor_id="system:catalog",
+                    target=f"profile:{profile.id}",
+                    action="profile.model_routing_pruned",
+                    outcome="success",
+                    details={"model_ids": stale_model_ids},
+                )
+            )
     if profile.default_model not in selectable_models:
         _remove_from_route(
             session, profile, "system:catalog", "default_model_unavailable"

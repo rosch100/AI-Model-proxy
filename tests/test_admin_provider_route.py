@@ -60,6 +60,33 @@ def route_client(admin_app):
     return client, database, ids, csrf
 
 
+def test_tenant_routing_policy_is_editable_and_persisted(route_client):
+    """Expose tenant strategy controls and persist valid policy changes."""
+    client, database, _ids, csrf = route_client
+    page = client.get("/admin/settings/connection")
+    assert "Routingstrategie" in page.text
+    response = client.post(
+        "/admin/settings/connection/routing",
+        data={
+            "csrf_token": csrf,
+            "strategy": "load_balanced",
+            "load_balancing_method": "weighted_least_loaded",
+            "cost_policy": "cost_tiers",
+            "headroom_weight": "0",
+            "max_retry_wait_seconds": "18",
+            "tie_breaker": "profile_id",
+        },
+    )
+
+    assert response.status_code == 302
+    with database.sessions() as session:
+        tenant = session.get(Tenant, "acme")
+        assert tenant.routing_strategy == "load_balanced"
+        assert tenant.routing_cost_policy == "cost_tiers"
+        assert tenant.routing_headroom_weight == 0
+        assert tenant.routing_max_retry_wait_seconds == 18
+
+
 def test_connection_shows_priority_order(route_client):
     """Show provider profiles in route order with reorder controls."""
     client, _, ids, _ = route_client
@@ -88,6 +115,20 @@ def test_move_route_is_csrf_protected_and_changes_priority(route_client):
     with database.sessions() as session:
         assert session.get(ProviderProfile, ids[1]).route_priority == 1
         assert session.get(ProviderProfile, ids[0]).route_priority == 2
+
+
+def test_priority_endpoint_joins_equal_priority_group(route_client):
+    """The tenant admin can explicitly assign a profile to a priority group."""
+    client, database, ids, csrf = route_client
+    response = client.post(
+        f"/admin/settings/connection/{ids[1]}/priority",
+        data={"csrf_token": csrf, "profile_id": ids[1], "priority": "1"},
+    )
+
+    assert response.status_code == 302
+    with database.sessions() as session:
+        assert session.get(ProviderProfile, ids[0]).route_priority == 1
+        assert session.get(ProviderProfile, ids[1]).route_priority == 1
 
 
 def test_individual_deactivation_preserves_other_profile(route_client):

@@ -405,6 +405,56 @@ def test_non_openrouter_catalog_refresh_has_no_pricing(provider):
         )
 
 
+@pytest.mark.parametrize("provider", ["azure", "openai", "deepseek"])
+def test_non_openrouter_profile_does_not_persist_catalog_pricing(admin_app, provider):
+    """Ignore catalog pricing unless the profile has a pricing source."""
+    database = admin_app.extensions["database"]
+    settings = (
+        {"base_url": "https://resource.openai.azure.com"} if provider == "azure" else {}
+    )
+    with database.sessions.begin() as session:
+        profile = create_provider_profile(
+            session,
+            database.secret_cipher,
+            "acme",
+            provider,
+            f"{provider}-pricing-test",
+            settings,
+            "model-1",
+            f"secret-{provider}",
+            "ada",
+        )
+        replace_catalog_entries(
+            session,
+            profile,
+            [("model-1", None)],
+            None,
+            {
+                "model-1": {
+                    "input_per_1m_tokens": "1",
+                    "output_per_1m_tokens": "2",
+                    "cache_per_1m_tokens": "3",
+                    "currency": "USD",
+                    "source": "unsupported-source",
+                }
+            },
+        )
+        profile_id = profile.id
+
+    with database.sessions() as session:
+        entry = (
+            session.query(ProviderCatalogEntry)
+            .filter_by(profile_id=profile_id, model_id="model-1")
+            .one()
+        )
+
+    assert entry.input_price_per_1m_tokens is None
+    assert entry.output_price_per_1m_tokens is None
+    assert entry.cache_price_per_1m_tokens is None
+    assert entry.pricing_currency is None
+    assert entry.pricing_source is None
+
+
 def test_provider_catalog_entry_has_nullable_pricing_storage():
     """Keep optional pricing metadata nullable in the catalog schema."""
     columns = ProviderCatalogEntry.__table__.columns

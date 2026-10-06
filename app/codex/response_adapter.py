@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import json
-import random
+import secrets
 import time
 from dataclasses import dataclass
 from string import ascii_letters, digits
@@ -327,4 +327,4 @@ def _encode_sse(obj: dict[str, Any]) -> bytes:
 
 def _chat_completion_id() -> str:
     alphabet = ascii_letters + digits
-    return "chatcmpl-" + "".join(random.choices(alphabet, k=24))
+    return "chatcmpl-" + "".join(secrets.choice(alphabet) for _ in range(24))

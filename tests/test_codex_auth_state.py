@@ -9,6 +9,7 @@ from contextlib import contextmanager
 from pathlib import Path
 
 import pytest
+import requests
 
 from app.codex.auth_state import (
     REFRESH_URL,
@@ -144,6 +145,23 @@ def test_codex_auth_manager_skips_refresh_after_locked_reload(tmp_path, monkeypa
 
     assert state.refresh_token == "new-refresh"
     assert state.is_expired(skew_seconds=300) is False
+
+
+def test_codex_auth_manager_hides_refresh_transport_details(tmp_path, monkeypatch):
+    """Refresh transport failures become generic authentication errors."""
+    auth_file = tmp_path / "auth.json"
+    _write_auth(auth_file, access_exp=int(time.time()) - 3600)
+
+    def fail_refresh(*_args, **_kwargs):
+        raise requests.ConnectionError("secret-auth.internal?token=private")
+
+    monkeypatch.setattr("app.codex.auth_state.requests.post", fail_refresh)
+
+    with pytest.raises(AuthStateError, match="refresh request failed") as exc_info:
+        CodexAuthManager(CodexAuthStore(auth_file), refresh_skew_seconds=300).current()
+
+    assert "secret-auth.internal" not in str(exc_info.value)
+    assert isinstance(exc_info.value.__cause__, requests.ConnectionError)
 
 
 def test_codex_auth_manager_refreshes_expired_token(tmp_path, monkeypatch):

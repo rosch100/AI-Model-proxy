@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import re
 import secrets
 from datetime import datetime, timedelta, timezone
@@ -15,6 +16,7 @@ from sqlalchemy import select
 
 from app.admin.forms import ProviderProfileForm
 from app.admin.security import ADMIN_COOKIE_NAME
+from app.admin.views import _profile_form, _provider_settings
 from app.persistence.admin_auth import (
     authenticate_admin,
     create_admin_session,
@@ -35,6 +37,7 @@ from app.persistence.models import (
     CostRefreshJob,
     CostUsageRecord,
     InferenceActivityEvent,
+    ProviderBudgetPolicy,
     ProviderCatalogEntry,
     ProviderProfile,
     ProviderScopeBinding,
@@ -42,6 +45,13 @@ from app.persistence.models import (
     Tenant,
 )
 from app.persistence.passkeys import insert_passkey
+from app.persistence.provider_scheduler import (
+    ProviderBudgetScheduler,
+    ProviderConcurrencyController,
+    ProviderConcurrencyDecision,
+    ProviderConcurrencyLease,
+    ReservationDecision,
+)
 from app.providers import cost_jobs, costs
 from app.providers.catalog import CatalogRefreshError, refresh_provider_catalog
 from app.providers.cost_jobs import collect_provider_costs, persist_cost_refresh
@@ -191,8 +201,31 @@ def test_deepseek_profile_can_be_created_without_provider_specific_settings(
         )
 
 
-def test_deepseek_admin_profile_creation_and_catalog_refresh(admin_app, requests_mock):
+def test_deepseek_admin_profile_creation_and_catalog_refresh(
+    admin_app, requests_mock, monkeypatch
+):
     """Create a tenant DeepSeek account, then load its model catalog."""
+    monkeypatch.setattr(
+        ProviderBudgetScheduler,
+        "reserve",
+        lambda *_args, **_kwargs: ReservationDecision(True),
+    )
+    monkeypatch.setattr(
+        ProviderConcurrencyController,
+        "acquire",
+        lambda _self, tenant_id, provider, profile_id, **_kwargs: ProviderConcurrencyDecision(
+            True,
+            ProviderConcurrencyLease(
+                f"{tenant_id}-{profile_id}", 1, tenant_id, provider, "test-token"
+            ),
+        ),
+    )
+    monkeypatch.setattr(
+        ProviderConcurrencyController, "renew", lambda *_args, **_kwargs: True
+    )
+    monkeypatch.setattr(
+        ProviderConcurrencyController, "settle", lambda *_args, **_kwargs: True
+    )
     database = admin_app.extensions["database"]
     with database.sessions.begin() as session:
         account = authenticate_admin(session, "ada", "correct-horse-battery")
@@ -237,7 +270,10 @@ def test_deepseek_admin_profile_creation_and_catalog_refresh(admin_app, requests
             )
         )
         profile_id = profile.id
-        assert profile.settings == {}
+        assert profile.settings == {
+            "scheduler_limits": [],
+            "token_reservation_estimate": None,
+        }
         assert database.secret_cipher.decrypt(profile.inference_secret_ciphertext) == (
             "deepseek-inference-key"
         )
@@ -704,6 +740,289 @@ def test_azure_profile_editor_exposes_opt_in_and_persists_it(admin_app):
     with database.sessions() as session:
         saved_profile = session.get(ProviderProfile, profile_id)
         assert saved_profile.settings["resume_streams"] is True
+
+
+def test_profile_edit_round_trips_scheduler_configuration(admin_app):
+    """Existing scheduler settings render as editable values without loss."""
+    database = admin_app.extensions["database"]
+    policy = {
+        "scope_kind": "profile",
+        "scope_id": "profile-1",
+        "metric": "requests",
+        "limit": 12,
+        "window_seconds": 60,
+    }
+    with database.sessions.begin() as session:
+        profile = create_provider_profile(
+            session,
+            database.secret_cipher,
+            "acme",
+            "openai",
+            "Scheduler profile",
+            {
+                "organization": "org-1",
+                "project": "proj_1",
+                "scheduler_limits": [policy],
+                "token_reservation_estimate": 2048,
+            },
+            "gpt-5.4",
+            "sk-secret",
+            "ada",
+        )
+        profile_id = profile.id
+
+    with database.sessions() as session:
+        profile = session.get(ProviderProfile, profile_id)
+        form = _profile_form(profile, ())
+        assert json.loads(form.scheduler_limits.data) == [policy]
+        assert form.token_reservation_estimate.data == 2048
+        form.provider.data = "openai"
+        form.organization.data = "org-1"
+        form.project.data = "proj_1"
+        settings = _provider_settings(form)
+
+    assert settings["scheduler_limits"] == [policy]
+    assert settings["token_reservation_estimate"] == 2048
+    database.engine.dispose()
+
+
+def test_legacy_profile_update_preserves_scheduler_configuration():
+    """A settings update omitting scheduler keys must not erase persisted policy."""
+    database = build_admin_database()
+    seed_admin(database)
+    policy = {
+        "scope_kind": "profile",
+        "scope_id": "profile-1",
+        "metric": "requests",
+        "limit": 12,
+        "window_seconds": 60,
+    }
+    with database.sessions.begin() as session:
+        profile = create_provider_profile(
+            session,
+            database.secret_cipher,
+            "acme",
+            "openai",
+            "Scheduler profile",
+            {
+                "organization": "org-1",
+                "project": "proj_1",
+                "scheduler_limits": [policy],
+                "token_reservation_estimate": 2048,
+            },
+            "gpt-5.4",
+            "sk-secret",
+            "ada",
+        )
+        updated = update_provider_profile(
+            session,
+            database.secret_cipher,
+            "acme",
+            profile.id,
+            "Scheduler profile",
+            {"organization": "org-1", "project": "proj_1"},
+            "gpt-5.4",
+            None,
+            "ada",
+        )
+        assert updated.settings["scheduler_limits"] == [policy]
+        assert updated.settings["token_reservation_estimate"] == 2048
+    database.engine.dispose()
+
+
+def test_profile_update_rejects_budget_window_change_after_policy_is_registered():
+    """An immutable persisted window cannot be silently changed by admin settings."""
+    database = build_admin_database()
+    seed_admin(database)
+    policy = {
+        "scope_kind": "profile",
+        "metric": "requests",
+        "limit": 12,
+        "window_seconds": 60,
+    }
+    with database.sessions.begin() as session:
+        profile = create_provider_profile(
+            session,
+            database.secret_cipher,
+            "acme",
+            "openai",
+            "Scheduler profile",
+            {
+                "organization": "org-1",
+                "project": "proj_1",
+                "scheduler_limits": [policy],
+            },
+            "gpt-5.4",
+            "sk-secret",
+            "ada",
+        )
+        session.add(
+            ProviderBudgetPolicy(
+                provider="openai",
+                scope_kind="profile",
+                scope_fingerprint=database.secret_cipher.provider_budget_fingerprint(
+                    "openai", "profile", profile.id, tenant_id="acme"
+                ),
+                metric="requests",
+                window_seconds=60,
+            )
+        )
+        with pytest.raises(ValueError, match="window_seconds.*cannot be changed"):
+            update_provider_profile(
+                session,
+                database.secret_cipher,
+                "acme",
+                profile.id,
+                "Scheduler profile",
+                {
+                    "organization": "org-1",
+                    "project": "proj_1",
+                    "scheduler_limits": [{**policy, "window_seconds": 300}],
+                },
+                "gpt-5.4",
+                None,
+                "ada",
+            )
+        assert profile.settings["scheduler_limits"] == [policy]
+    database.engine.dispose()
+
+
+def test_create_provider_profile_requires_token_reservation_estimate():
+    """Token budgets cannot be persisted without a reservation estimate."""
+    database = build_admin_database()
+    seed_admin(database)
+    with database.sessions.begin() as session:
+        with pytest.raises(ValueError, match="token_reservation_estimate"):
+            create_provider_profile(
+                session,
+                database.secret_cipher,
+                "acme",
+                "openai",
+                "Token scheduler",
+                {
+                    "scheduler_limits": [
+                        {
+                            "scope_kind": "profile",
+                            "metric": "tokens",
+                            "limit": 1000,
+                            "window_seconds": 60,
+                        }
+                    ]
+                },
+                "gpt-5.4",
+                "sk-secret",
+                "ada",
+            )
+    database.engine.dispose()
+
+
+def test_partial_update_rejects_legacy_token_policy_without_estimate():
+    """An unrelated partial update must validate restored scheduler settings."""
+    database = build_admin_database()
+    seed_admin(database)
+    with database.sessions.begin() as session:
+        profile = create_provider_profile(
+            session,
+            database.secret_cipher,
+            "acme",
+            "openai",
+            "Token scheduler",
+            {},
+            "gpt-5.4",
+            "sk-secret",
+            "ada",
+        )
+        profile.settings = {
+            "scheduler_limits": [
+                {
+                    "scope_kind": "profile",
+                    "metric": "tokens",
+                    "limit": 1000,
+                    "window_seconds": 60,
+                }
+            ]
+        }
+        with pytest.raises(ValueError, match="token_reservation_estimate"):
+            update_provider_profile(
+                session,
+                database.secret_cipher,
+                "acme",
+                profile.id,
+                "Token scheduler",
+                {"organization": "org-1"},
+                "gpt-5.4",
+                None,
+                "ada",
+            )
+    database.engine.dispose()
+
+
+def test_provider_profile_form_normalizes_scheduler_configuration(admin_app):
+    """Scheduler controls accept JSON policies and serialize validated integers."""
+    from app.admin.views import _provider_settings
+
+    policy = (
+        '[{"scope_kind":"profile","scope_id":"profile-1",'
+        '"metric":"requests","limit":12,"window_seconds":60}]'
+    )
+    with admin_app.app_context():
+        form = ProviderProfileForm(
+            data={
+                "provider": "openai",
+                "display_name": "OpenAI scheduler",
+                "default_model": "",
+                "scheduler_limits": policy,
+                "token_reservation_estimate": "2048",
+            },
+            meta={"csrf": False},
+        )
+        form.provider.choices = [("openai", "OpenAI")]
+
+        assert form.validate()
+        settings = _provider_settings(form)
+
+    assert settings["scheduler_limits"] == [
+        {
+            "scope_kind": "profile",
+            "scope_id": "profile-1",
+            "metric": "requests",
+            "limit": 12,
+            "window_seconds": 60,
+        }
+    ]
+    assert settings["token_reservation_estimate"] == 2048
+
+
+@pytest.mark.parametrize(
+    "raw_limits",
+    [
+        "{not json}",
+        "{}",
+        '[{"scope_kind":"profile","scope_id":"p",'
+        '"metric":"requests","limit":true,"window_seconds":60}]',
+        '[{"scope_kind":"unknown","scope_id":"p",'
+        '"metric":"requests","limit":1,"window_seconds":60}]',
+    ],
+)
+def test_provider_profile_form_rejects_invalid_scheduler_configuration(
+    admin_app, raw_limits
+):
+    """Malformed JSON and unsupported or unsafe budget tuples are rejected."""
+    with admin_app.app_context():
+        form = ProviderProfileForm(
+            data={
+                "provider": "openai",
+                "display_name": "OpenAI scheduler",
+                "default_model": "",
+                "scheduler_limits": raw_limits,
+                "token_reservation_estimate": "1",
+            },
+            meta={"csrf": False},
+        )
+        form.provider.choices = [("openai", "OpenAI")]
+
+        assert not form.validate()
+        assert "scheduler_limits" in form.errors
 
 
 def test_provider_profile_form_requires_azure_base_url_but_not_for_openrouter(

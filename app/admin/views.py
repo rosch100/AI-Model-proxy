@@ -142,6 +142,7 @@ from app.providers.deepseek_balance import (
     fetch_deepseek_balance,
 )
 from app.providers.openai_admin import OpenAIProjectLookupError, list_openai_projects
+from app.providers.scheduler_config import parse_scheduler_limits
 
 admin_bp = Blueprint("admin", __name__, url_prefix="/admin")
 
@@ -1803,6 +1804,12 @@ def _profile_form(
         default_model=profile.default_model or "",
         organization=str(profile.settings.get("organization", "")),
         project=str(profile.settings.get("project", "")),
+        scheduler_limits=json.dumps(
+            parse_scheduler_limits(profile.settings.get("scheduler_limits", [])),
+            ensure_ascii=False,
+            indent=2,
+        ),
+        token_reservation_estimate=profile.settings.get("token_reservation_estimate"),
         api_key="",
     )
     _set_default_model_choices(form, profile, catalog_rows)
@@ -1827,20 +1834,30 @@ def _set_default_model_choices(
 
 
 def _provider_settings(form: ProviderProfileForm) -> dict[str, object]:
-    """Extract only fields belonging to the chosen provider."""
+    """Extract selected provider fields and shared scheduler settings."""
+    settings: dict[str, object] = {
+        "scheduler_limits": parse_scheduler_limits(form.scheduler_limits.data or "[]"),
+        "token_reservation_estimate": form.token_reservation_estimate.data,
+    }
     provider = form.provider.data
     if provider == "azure":
-        return {
-            "base_url": validate_azure_base_url(form.base_url.data),
-            "resume_streams": bool(form.resume_streams.data),
-        }
+        settings.update(
+            {
+                "base_url": validate_azure_base_url(form.base_url.data),
+                "resume_streams": bool(form.resume_streams.data),
+            }
+        )
+        return settings
     if provider == "openai":
-        return {
-            "organization": form.organization.data or "",
-            "project": form.project.data or "",
-        }
+        settings.update(
+            {
+                "organization": form.organization.data or "",
+                "project": form.project.data or "",
+            }
+        )
+        return settings
     if provider in {"openrouter", "deepseek"}:
-        return {}
+        return settings
     raise ValueError("Unsupported provider")
 
 

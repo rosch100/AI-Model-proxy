@@ -18,11 +18,17 @@ services:
       FLASK_DEBUG: "0"
       LOG_LEVEL: ${LOG_LEVEL:-warning}
       DATABASE_URL: ${DATABASE_URL:-}
+      BATCH_WORKER_ENABLED: ${BATCH_WORKER_ENABLED:-false}
       GUNICORN_WORKERS: ${GUNICORN_WORKERS:-1}
       TRUSTED_HOSTS: ${PUBLIC_HOSTNAMES:?Set PUBLIC_HOSTNAMES in .env},localhost,127.0.0.1
       TRUST_PROXY_HEADERS: "true"
     expose:
       - "5000"
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"
     networks:
       - proxy
     volumes:

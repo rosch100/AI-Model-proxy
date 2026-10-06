@@ -5,7 +5,7 @@ from datetime import datetime, timedelta, timezone
 
 import pytest
 import requests
-from flask import request
+from flask import Response, request
 from sqlalchemy import select
 
 from app.persistence.admin_ops import (
@@ -25,8 +25,29 @@ from app.persistence.provider_circuit_breaker import (
     ProviderCircuitBreakerStore,
     ProviderCircuitStoreError,
 )
+from app.persistence.provider_scheduler import (
+    BudgetLease,
+    ProviderBudgetScheduler,
+    ProviderConcurrencyController,
+    ProviderConcurrencyDecision,
+    ProviderConcurrencyLease,
+    ProviderSchedulerPolicyConflict,
+    ProviderSchedulerStoreError,
+    ReservationDecision,
+)
+from app.providers.error_classification import UpstreamErrorClassification
+from app.providers.failover_upstream import UpstreamError
 from app.providers.model_ids import qualified_model_id
-from app.providers.routing import forward_tenant_route
+from app.providers.routing import (
+    ProviderBudgetAttempt,
+    ProviderConcurrencyAttempt,
+    RouteAttemptState,
+    _final_route_failure,
+    _guard_concurrency_lease,
+    _scheduler_candidate,
+    _transient_retry_delay,
+    forward_tenant_route,
+)
 
 AUTH = {"Authorization": "Bearer cursor-key"}
 AZURE = "https://test-resource.openai.azure.com/openai/v1/responses"
@@ -40,6 +61,56 @@ def event(data, name=None):
     return (
         (f"event: {name}\n" if name else "") + f"data: {json.dumps(data)}\n\n"
     ).encode()
+
+
+@pytest.fixture(autouse=True)
+def isolate_sqlite_scheduler_calls(monkeypatch):
+    """Keep SQLite routing tests independent of PostgreSQL-only persistence."""
+    monkeypatch.setattr(
+        ProviderBudgetScheduler,
+        "reserve",
+        lambda _self, request, **_kwargs: ReservationDecision(
+            True,
+            (
+                BudgetLease(
+                    "test-lease", request.tenant_id, request.provider, "test-token"
+                )
+                if request.policies
+                else None
+            ),
+        ),
+    )
+    monkeypatch.setattr(
+        ProviderBudgetScheduler, "complete", lambda *_args, **_kwargs: True
+    )
+    monkeypatch.setattr(
+        ProviderBudgetScheduler, "failed", lambda *_args, **_kwargs: True
+    )
+    monkeypatch.setattr(
+        ProviderBudgetScheduler, "release", lambda *_args, **_kwargs: True
+    )
+    monkeypatch.setattr(
+        ProviderBudgetScheduler,
+        "apply_cooldown",
+        lambda _self, _scope, seconds, **_kwargs: datetime.now(timezone.utc)
+        + timedelta(seconds=seconds),
+    )
+    monkeypatch.setattr(
+        ProviderConcurrencyController,
+        "acquire",
+        lambda _self, tenant_id, provider, profile_id, **_kwargs: ProviderConcurrencyDecision(
+            True,
+            ProviderConcurrencyLease(
+                f"{tenant_id}-{profile_id}", 1, tenant_id, provider, "test-token"
+            ),
+        ),
+    )
+    monkeypatch.setattr(
+        ProviderConcurrencyController, "renew", lambda *_args, **_kwargs: True
+    )
+    monkeypatch.setattr(
+        ProviderConcurrencyController, "settle", lambda *_args, **_kwargs: True
+    )
 
 
 @pytest.fixture
@@ -116,6 +187,14 @@ def successful_chat(model):
         event({"model": model, "choices": [{"delta": {"content": "success"}}]})
         + b"data: [DONE]\n\n"
     )
+
+
+def set_scheduler_limits(app, profile_id, policies):
+    """Apply explicit scheduler policy tuples to one persisted provider profile."""
+    database = app.extensions["database"]
+    with database.sessions.begin() as session:
+        profile = session.get(ProviderProfile, profile_id)
+        profile.settings = {**profile.settings, "scheduler_limits": policies}
 
 
 @pytest.mark.parametrize("status", [408, 429, 500, 503])
@@ -198,13 +277,13 @@ def test_transient_rate_limit_retries_same_provider_before_returning_503(
         OPENAI,
         OPENAI,
     ]
-    sleep.assert_called_once_with(pytest.approx(1.0, abs=0.01))
+    sleep.assert_called_once_with(pytest.approx(1.05, abs=0.01))
 
 
-def test_transient_rate_limit_without_retry_after_uses_default_delay(
+def test_transient_rate_limit_without_retry_after_uses_full_jitter(
     routed_app, requests_mock, mocker
 ):
-    """Use a short default delay when a transient 429 omits Retry-After."""
+    """Use bounded full jitter when a transient 429 omits Retry-After."""
     with routed_app.extensions["database"].sessions.begin() as session:
         profiles = tuple(
             session.scalars(
@@ -230,12 +309,61 @@ def test_transient_rate_limit_without_retry_after_uses_default_delay(
         ],
     )
     sleep = mocker.patch("app.providers.routing.cooperative_sleep")
+    system_random = mocker.patch("app.providers.routing.SystemRandom")
+    system_random.return_value.uniform.return_value = 1.0
 
     response = post(routed_app)
 
     assert response.status_code == 200
     assert requests_mock.call_count == 2
-    sleep.assert_called_once_with(pytest.approx(1.0, abs=0.01))
+    sleep.assert_called_once_with(pytest.approx(1.05, abs=0.01))
+
+
+def test_transient_retry_waits_until_durable_provider_cooldown(
+    routed_app, requests_mock, mocker
+):
+    """A retry cannot run before the cooldown transaction has actually elapsed."""
+    with routed_app.extensions["database"].sessions.begin() as session:
+        profiles = tuple(
+            session.scalars(
+                select(ProviderProfile).where(ProviderProfile.tenant_id == "acme")
+            )
+        )
+        for profile in profiles:
+            profile.route_priority = None
+        session.flush()
+        openai_profile = next(
+            profile for profile in profiles if profile.provider == "openai"
+        )
+        openai_profile.route_priority = 1
+
+    durable_retry_at = datetime.now(timezone.utc) + timedelta(seconds=3)
+    mocker.patch.object(
+        ProviderBudgetScheduler,
+        "apply_cooldown",
+        return_value=durable_retry_at,
+    )
+    requests_mock.post(
+        OPENAI,
+        [
+            {
+                "status_code": 429,
+                "headers": {"Retry-After": "1"},
+                "json": {"error": {"code": "rate_limit_exceeded"}},
+            },
+            {
+                "content": successful_chat("gpt-5.4"),
+                "headers": {"Content-Type": "text/event-stream"},
+            },
+        ],
+    )
+    sleep = mocker.patch("app.providers.routing.cooperative_sleep")
+
+    response = post(routed_app)
+
+    assert response.status_code == 200
+    assert requests_mock.call_count == 2
+    assert sleep.call_args.args[0] >= 2.9
 
 
 def test_transient_rate_limit_retries_once_then_returns_temporary_unavailable(
@@ -271,6 +399,27 @@ def test_transient_rate_limit_retries_once_then_returns_temporary_unavailable(
     assert response.headers["Retry-After"] == "1"
     assert len(requests_mock.request_history) == 2
     sleep.assert_called_once()
+
+
+def test_transient_retry_jitter_uses_bounded_system_random(mocker):
+    """Untrusted provider errors only receive bounded OS-backed retry jitter."""
+    uniform = mocker.Mock(return_value=0.75)
+    mocker.patch(
+        "app.providers.routing.SystemRandom",
+        return_value=mocker.Mock(uniform=uniform),
+    )
+    error = UpstreamError(
+        status=429,
+        code="provider_rate_limited",
+        message="Rate limited",
+        retryable=True,
+        classification=UpstreamErrorClassification("transient"),
+    )
+
+    delay = _transient_retry_delay(error, is_retry=False, retry_count=1)
+
+    assert delay == 0.75
+    uniform.assert_called_once_with(0, 2.0)
 
 
 def test_rate_limit_retry_after_beyond_budget_does_not_hold_request(
@@ -508,6 +657,957 @@ def test_transient_error_retry_after_respects_blocked_profile_cooldown(
     assert [request.url for request in requests_mock.request_history] == [OPENAI]
 
 
+def test_preconnect_failure_releases_budget_and_concurrency_without_cooldown(mocker):
+    """A failure before an upstream connection does not consume a request slot."""
+    scheduler = mocker.Mock()
+    concurrency_attempt = mocker.Mock()
+    failure_handler = mocker.Mock()
+    budget_attempt = ProviderBudgetAttempt(
+        scheduler=scheduler,
+        lease=BudgetLease("lease", "acme", "openai", "token"),
+        failure_handler=failure_handler,
+        concurrency_attempt=concurrency_attempt,
+    )
+    error = UpstreamError(
+        502,
+        "upstream_connection_failed",
+        "Provider connection failed.",
+        True,
+        upstream_started=False,
+    )
+
+    budget_attempt.failed(error)
+
+    scheduler.release.assert_called_once_with(budget_attempt.lease)
+    scheduler.failed.assert_not_called()
+    concurrency_attempt.release.assert_called_once()
+    concurrency_attempt.failed.assert_not_called()
+    failure_handler.assert_not_called()
+
+
+def test_successful_budget_settlement_failure_is_not_released(mocker):
+    """A transient completion-store error retries charging instead of releasing."""
+    scheduler = mocker.Mock()
+    scheduler.complete.side_effect = [
+        ProviderSchedulerStoreError("temporary store failure"),
+        True,
+    ]
+    budget_attempt = ProviderBudgetAttempt(
+        scheduler=scheduler,
+        lease=BudgetLease("lease", "acme", "openai", "token"),
+        failure_handler=mocker.Mock(),
+    )
+
+    with pytest.raises(ProviderSchedulerStoreError, match="temporary store failure"):
+        budget_attempt.complete(15)
+    budget_attempt.release()
+
+    assert scheduler.complete.call_count == 2
+    scheduler.complete.assert_called_with(budget_attempt.lease, actual_tokens=15)
+    scheduler.release.assert_not_called()
+
+
+def test_transient_stream_failure_without_retry_after_persists_default_cooldown(
+    mocker,
+):
+    """Transient stream failures without provider guidance still cool the scope."""
+    scheduler = mocker.Mock()
+    failure_handler = mocker.Mock()
+    budget_attempt = ProviderBudgetAttempt(
+        scheduler=scheduler,
+        lease=BudgetLease("lease", "acme", "openai", "token"),
+        failure_handler=failure_handler,
+    )
+    error = UpstreamError(
+        503,
+        "server_error",
+        "Provider failed.",
+        True,
+        classification=UpstreamErrorClassification("transient"),
+    )
+
+    budget_attempt.failed(error)
+
+    failure_handler.assert_called_once_with(error, 1.0)
+
+
+def test_budget_release_error_still_settles_concurrency_attempt(mocker):
+    """A budget-store failure cannot leave the separate AIMD permit renewed."""
+    scheduler = mocker.Mock()
+    scheduler.failed.side_effect = ProviderSchedulerStoreError("store unavailable")
+    concurrency_attempt = mocker.Mock()
+    budget_attempt = ProviderBudgetAttempt(
+        scheduler=scheduler,
+        lease=BudgetLease("lease", "acme", "openai", "token"),
+        failure_handler=mocker.Mock(),
+        concurrency_attempt=concurrency_attempt,
+    )
+
+    with pytest.raises(ProviderSchedulerStoreError, match="store unavailable"):
+        budget_attempt.failed(mocker.Mock())
+
+    concurrency_attempt.failed.assert_called_once()
+    assert budget_attempt.settled
+
+
+def test_budget_release_settles_concurrency_even_when_store_release_fails(mocker):
+    """A failed budget release must still stop its separate AIMD permit."""
+    scheduler = mocker.Mock()
+    scheduler.release.side_effect = ProviderSchedulerStoreError("store unavailable")
+    concurrency_attempt = mocker.Mock()
+    budget_attempt = ProviderBudgetAttempt(
+        scheduler=scheduler,
+        lease=BudgetLease("lease", "acme", "openai", "token"),
+        failure_handler=mocker.Mock(),
+        concurrency_attempt=concurrency_attempt,
+    )
+
+    with pytest.raises(ProviderSchedulerStoreError, match="store unavailable"):
+        budget_attempt.release()
+
+    concurrency_attempt.release.assert_called_once()
+    assert budget_attempt.settled
+
+
+def test_concurrency_heartbeat_marks_lease_lost_after_ttl(monkeypatch):
+    """Renewal errors cannot leave an expired AIMD lease looking healthy."""
+    clock = [0.0]
+    monkeypatch.setattr("app.providers.routing.monotonic", lambda: clock[0])
+
+    class StoreUnavailable:
+        heartbeat_interval_seconds = 1
+        lease_ttl_seconds = 2.5
+
+        def renew(self, _lease):
+            raise ProviderSchedulerStoreError("store unavailable")
+
+    class AdvanceClock:
+        calls = 0
+
+        def wait(self, interval):
+            self.calls += 1
+            clock[0] += interval
+            return self.calls >= 4
+
+        def set(self):
+            pass
+
+    controller = StoreUnavailable()
+    attempt = ProviderConcurrencyAttempt(controller, None)
+    attempt.lease = ProviderConcurrencyLease("id", 1, "acme", "openai", "token")
+    attempt._stopping = AdvanceClock()
+
+    attempt._heartbeat()
+
+    assert attempt.lease_lost.is_set()
+
+
+def test_guarded_provider_stream_stops_after_lease_loss():
+    """A routed stream stops forwarding after losing its durable AIMD slot."""
+
+    class Controller:
+        heartbeat_interval_seconds = 1
+        lease_ttl_seconds = 90
+
+        def renew(self, _lease):
+            return True
+
+    attempt = ProviderConcurrencyAttempt(Controller(), None)
+    attempt.lease = ProviderConcurrencyLease("id", 1, "acme", "openai", "token")
+    response = Response([b"first", b"second"], mimetype="text/event-stream")
+
+    _guard_concurrency_lease(response, attempt)
+    stream = iter(response.response)
+
+    assert next(stream) == b"first"
+    attempt.lease_lost.set()
+    error = next(stream)
+
+    assert b"provider_concurrency_lease_lost" in error
+    with pytest.raises(StopIteration):
+        next(stream)
+    response.close()
+
+
+def test_concurrency_heartbeat_retries_after_a_transient_store_failure():
+    """A recoverable renewal failure does not permanently abandon the lease."""
+
+    class OneTransientFailure:
+        heartbeat_interval_seconds = 1
+        lease_ttl_seconds = 90
+
+        def __init__(self):
+            self.renew_calls = 0
+
+        def renew(self, _lease):
+            self.renew_calls += 1
+            if self.renew_calls == 1:
+                raise ProviderSchedulerStoreError("temporary store failure")
+            return True
+
+    class StopAfterRecovery:
+        def __init__(self):
+            self.wait_calls = 0
+
+        def wait(self, _interval):
+            self.wait_calls += 1
+            return self.wait_calls == 3
+
+        def set(self):
+            pass
+
+    controller = OneTransientFailure()
+    attempt = ProviderConcurrencyAttempt(controller, None)
+    attempt._stopping = StopAfterRecovery()
+    attempt.lease = ProviderConcurrencyLease("id", 1, "acme", "openai", "token")
+
+    attempt._heartbeat()
+
+    assert controller.renew_calls == 2
+
+
+def test_transient_failure_retry_after_includes_later_budget_block(
+    routed_app, requests_mock, monkeypatch
+):
+    """A shorter upstream Retry-After cannot hide a longer scheduler block."""
+    database = routed_app.extensions["database"]
+    with database.sessions.begin() as session:
+        profiles = tuple(
+            session.scalars(
+                select(ProviderProfile).where(ProviderProfile.tenant_id == "acme")
+            )
+        )
+        for profile in profiles:
+            profile.route_priority = None
+        session.flush()
+        for profile in profiles:
+            if profile.provider == "openai":
+                profile.route_priority = 1
+            elif profile.provider == "openrouter":
+                profile.route_priority = 2
+
+    def reserve(_scheduler, request, **_kwargs):
+        if request.provider == "openrouter":
+            return ReservationDecision(
+                False, retry_at=datetime.now(timezone.utc) + timedelta(seconds=120)
+            )
+        return ReservationDecision(True)
+
+    monkeypatch.setattr(ProviderBudgetScheduler, "reserve", reserve)
+    requests_mock.post(
+        OPENAI,
+        status_code=503,
+        json={"error": {"code": "server_error"}},
+        headers={"Retry-After": "2"},
+    )
+
+    response = post(routed_app)
+
+    assert response.status_code == 503
+    assert int(response.headers["Retry-After"]) >= 119
+    assert [request.url for request in requests_mock.request_history] == [OPENAI]
+
+
+def test_scheduler_budget_denial_retries_profile_when_eligible(
+    routed_app, requests_mock, monkeypatch
+):
+    """A temporary budget denial retries its profile within the route deadline."""
+    database = routed_app.extensions["database"]
+    snapshot = database.get_proxy_snapshot_by_api_key("cursor-key")
+    profile = next(item for item in snapshot.profiles if item.provider == "openai")
+    with database.sessions.begin() as session:
+        for item in session.scalars(
+            select(ProviderProfile).where(ProviderProfile.tenant_id == "acme")
+        ):
+            item.route_priority = None
+        session.flush()
+        session.get(ProviderProfile, profile.profile_id).route_priority = 1
+        session.get(ProviderProfile, profile.profile_id).settings = {
+            **profile.provider_settings,
+            "scheduler_limits": [
+                {
+                    "scope_kind": "profile",
+                    "scope_id": profile.profile_id,
+                    "metric": "requests",
+                    "limit": 12,
+                    "window_seconds": 60,
+                }
+            ],
+        }
+    decisions = []
+
+    def reserve(_scheduler, request, **_kwargs):
+        decisions.append(request)
+        if len(decisions) == 1:
+            return ReservationDecision(
+                False, retry_at=datetime.now(timezone.utc) - timedelta(seconds=1)
+            )
+        return ReservationDecision(
+            True, BudgetLease("retry-lease", "acme", "openai", "retry-token")
+        )
+
+    monkeypatch.setattr(ProviderBudgetScheduler, "reserve", reserve)
+    requests_mock.post(
+        OPENAI,
+        content=successful_chat("gpt-5.4"),
+        headers={"Content-Type": "text/event-stream"},
+    )
+
+    response = post(routed_app)
+
+    assert response.status_code == 200
+    assert len(decisions) == 2
+    assert [request.url for request in requests_mock.request_history] == [OPENAI]
+
+
+def test_all_budget_blocked_candidates_report_earliest_retry_after(routed_app):
+    """A route may retry when the first budgeted provider becomes available."""
+    now = datetime.now(timezone.utc)
+    response = _final_route_failure(
+        RouteAttemptState(
+            blocked_until=[],
+            budget_blocked_until=[
+                now + timedelta(seconds=3),
+                now + timedelta(seconds=20),
+            ],
+        )
+    )
+
+    assert response.status_code == 503
+    assert response.headers["Retry-After"] == "3"
+
+
+def test_scheduler_candidate_skips_model_policy_for_another_model(routed_app):
+    """A model budget applies only to its configured routed model."""
+    snapshot = routed_app.extensions["database"].get_proxy_snapshot_by_api_key(
+        "cursor-key"
+    )
+    profile = next(item for item in snapshot.profiles if item.provider == "openai")
+    with routed_app.extensions["database"].sessions.begin() as session:
+        persisted = session.get(ProviderProfile, profile.profile_id)
+        persisted.settings = {
+            **persisted.settings,
+            "organization": "org-openai",
+            "project": "project-openai",
+            "scheduler_limits": [
+                {
+                    "scope_kind": "model",
+                    "scope_id": "gpt-5.5",
+                    "metric": "requests",
+                    "limit": 12,
+                    "window_seconds": 60,
+                }
+            ],
+        }
+
+    refreshed = routed_app.extensions["database"].get_proxy_snapshot_by_api_key(
+        "cursor-key"
+    )
+    profile = next(item for item in refreshed.profiles if item.provider == "openai")
+    candidate = _scheduler_candidate(
+        refreshed, profile, "gpt-5.4", {"model": "cursor-acme-model"}
+    )
+
+    assert candidate.policies == ()
+    assert {
+        (scope.kind.value, scope.scope_id) for scope in candidate.cooldown_scopes
+    } == {
+        ("profile", profile.profile_id),
+        ("organization", "org-openai"),
+        ("project", "project-openai"),
+    }
+
+
+def test_transient_retry_after_does_not_prevent_same_provider_profile_failover(
+    routed_app, requests_mock, mocker
+):
+    """One OpenAI account's 429 cooldown leaves its sibling account available."""
+    database = routed_app.extensions["database"]
+    with database.sessions.begin() as session:
+        tenant = session.get(Tenant, "acme")
+        primary = session.scalar(
+            select(ProviderProfile).where(
+                ProviderProfile.tenant_id == "acme",
+                ProviderProfile.provider == "openai",
+            )
+        )
+        for profile in session.scalars(
+            select(ProviderProfile).where(ProviderProfile.tenant_id == "acme")
+        ):
+            profile.route_priority = None
+        session.flush()
+        primary.route_priority = 1
+        backup = create_provider_profile(
+            session,
+            database.secret_cipher,
+            "acme",
+            "openai",
+            "OpenAI backup",
+            {},
+            "gpt-5.4",
+            "openai-backup-secret",
+            "ada",
+        )
+        replace_catalog_entries(session, backup, [("gpt-5.4", None)], None)
+        activate_provider_profile(session, tenant, backup.id, "ada")
+
+    cooldown_scopes = []
+    original_apply_cooldown = ProviderBudgetScheduler.apply_cooldown
+
+    def record_cooldown(scheduler, scope, seconds, **kwargs):
+        cooldown_scopes.append(scope)
+        return original_apply_cooldown(scheduler, scope, seconds, **kwargs)
+
+    mocker.patch.object(ProviderBudgetScheduler, "apply_cooldown", record_cooldown)
+    requests_mock.post(
+        OPENAI,
+        [
+            {
+                "status_code": 429,
+                "headers": {"Retry-After": "1"},
+                "json": {"error": {"code": "rate_limit_exceeded"}},
+            },
+            {
+                "content": successful_chat("gpt-5.4"),
+                "headers": {"Content-Type": "text/event-stream"},
+            },
+        ],
+    )
+
+    response = post(routed_app)
+
+    assert response.status_code == 200
+    assert requests_mock.call_count == 2
+    assert {scope.kind.value for scope in cooldown_scopes} == {"profile"}
+
+
+def test_explicit_model_policy_is_also_a_cooldown_scope(routed_app):
+    """Explicit provider and model budgets add their scopes to cooldown tracking."""
+    snapshot = routed_app.extensions["database"].get_proxy_snapshot_by_api_key(
+        "cursor-key"
+    )
+    profile = next(item for item in snapshot.profiles if item.provider == "openai")
+    with routed_app.extensions["database"].sessions.begin() as session:
+        persisted = session.get(ProviderProfile, profile.profile_id)
+        persisted.settings = {
+            **persisted.settings,
+            "organization": "org-openai",
+            "project": "project-openai",
+            "scheduler_limits": [
+                {
+                    "scope_kind": "provider",
+                    "metric": "requests",
+                    "limit": 12,
+                    "window_seconds": 60,
+                },
+                {
+                    "scope_kind": "model",
+                    "metric": "requests",
+                    "limit": 12,
+                    "window_seconds": 60,
+                },
+                {
+                    "scope_kind": "organization",
+                    "metric": "requests",
+                    "limit": 12,
+                    "window_seconds": 60,
+                },
+                {
+                    "scope_kind": "project",
+                    "metric": "requests",
+                    "limit": 12,
+                    "window_seconds": 60,
+                },
+            ],
+        }
+
+    refreshed = routed_app.extensions["database"].get_proxy_snapshot_by_api_key(
+        "cursor-key"
+    )
+    profile = next(item for item in refreshed.profiles if item.provider == "openai")
+    candidate = _scheduler_candidate(
+        refreshed, profile, "gpt-5.4", {"model": "cursor-acme-model"}
+    )
+
+    assert {
+        (scope.kind.value, scope.scope_id) for scope in candidate.cooldown_scopes
+    } == {
+        ("profile", profile.profile_id),
+        ("provider", "openai"),
+        ("model", "gpt-5.4"),
+        ("organization", "org-openai"),
+        ("project", "project-openai"),
+    }
+    assert len(candidate.cooldown_scopes) == 5
+
+
+def test_scheduler_policy_resolves_omitted_profile_scope_id(routed_app):
+    """A profile policy resolves against its persisted profile identity."""
+    snapshot = routed_app.extensions["database"].get_proxy_snapshot_by_api_key(
+        "cursor-key"
+    )
+    profile = next(item for item in snapshot.profiles if item.provider == "openai")
+    with routed_app.extensions["database"].sessions.begin() as session:
+        persisted = session.get(ProviderProfile, profile.profile_id)
+        persisted.settings = {
+            **persisted.settings,
+            "scheduler_limits": [
+                {
+                    "scope_kind": "profile",
+                    "metric": "requests",
+                    "limit": 12,
+                    "window_seconds": 60,
+                }
+            ],
+        }
+
+    refreshed = routed_app.extensions["database"].get_proxy_snapshot_by_api_key(
+        "cursor-key"
+    )
+    profile = next(item for item in refreshed.profiles if item.provider == "openai")
+    candidate = _scheduler_candidate(
+        refreshed, profile, profile.default_model, {"model": "cursor-acme-model"}
+    )
+
+    assert candidate.policies[0].scope.scope_id == profile.profile_id
+    assert candidate.policies[0].limit_units == 12
+
+
+def test_scheduler_is_explicit_no_budget_without_profile_configuration(
+    routed_app, requests_mock, monkeypatch
+):
+    """An absent profile scheduler policy permits routing without invented limits."""
+    reservations = []
+    monkeypatch.setattr(
+        ProviderBudgetScheduler,
+        "reserve",
+        lambda _self, request, **_kwargs: reservations.append(request)
+        or ReservationDecision(True),
+    )
+    requests_mock.post(
+        AZURE,
+        content=successful_chat("gpt-5.4"),
+        headers={"Content-Type": "text/event-stream"},
+    )
+
+    response = post(routed_app)
+
+    assert response.status_code == 200
+    assert len(reservations) == 1
+    assert reservations[0].policies == ()
+    assert reservations[0].estimated_tokens is None
+    assert {
+        (scope.provider, scope.kind.value) for scope in reservations[0].cooldown_scopes
+    } == {("azure", "profile")}
+    assert [request.url for request in requests_mock.request_history] == [AZURE]
+
+
+def test_exhausted_scheduler_budget_skips_profile_before_attempt(
+    routed_app, requests_mock, monkeypatch
+):
+    """An exhausted explicit profile budget skips directly to the next candidate."""
+    from app.persistence.provider_scheduler import ProviderBudgetScheduler
+
+    snapshot = routed_app.extensions["database"].get_proxy_snapshot_by_api_key(
+        "cursor-key"
+    )
+    first_profile_id = snapshot.profiles[0].profile_id
+    for profile in snapshot.profiles:
+        set_scheduler_limits(
+            routed_app,
+            profile.profile_id,
+            [
+                {
+                    "scope_kind": "profile",
+                    "scope_id": profile.profile_id,
+                    "metric": "requests",
+                    "limit": 10,
+                    "window_seconds": 60,
+                }
+            ],
+        )
+    monkeypatch.setattr(
+        ProviderBudgetScheduler,
+        "reserve",
+        lambda *_args, **_kwargs: (
+            ReservationDecision(
+                False, retry_at=datetime.now(timezone.utc) + timedelta(seconds=12)
+            )
+            if _args[1].policies[0].scope.scope_id == first_profile_id
+            else ReservationDecision(
+                True,
+                BudgetLease(
+                    "lease", "acme", _args[1].policies[0].scope.provider, "token"
+                ),
+            )
+        ),
+    )
+    monkeypatch.setattr(ProviderBudgetScheduler, "release", lambda *_args: True)
+    monkeypatch.setattr(
+        ProviderBudgetScheduler, "complete", lambda *_args, **_kwargs: True
+    )
+    requests_mock.post(
+        OPENAI,
+        content=successful_chat("gpt-5.4"),
+        headers={"Content-Type": "text/event-stream"},
+    )
+    requests_mock.post(
+        AZURE,
+        content=successful_chat("gpt-5.4"),
+        headers={"Content-Type": "text/event-stream"},
+    )
+
+    response = post(routed_app)
+
+    assert response.status_code == 200
+    assert [request.url for request in requests_mock.request_history] == [OPENAI]
+    with routed_app.extensions["database"].sessions() as session:
+        attempts = tuple(session.scalars(select(ProviderAttemptEvent)))
+    assert [attempt.provider for attempt in attempts] == ["openai"]
+
+
+@pytest.mark.parametrize("payload_cap", [None, 1])
+def test_token_budget_without_estimate_is_rejected(
+    routed_app, requests_mock, payload_cap
+):
+    """An output cap alone does not estimate full prompt-plus-completion usage."""
+    database = routed_app.extensions["database"]
+    snapshot = database.get_proxy_snapshot_by_api_key("cursor-key")
+    profile = next(item for item in snapshot.profiles if item.provider == "openai")
+    with database.sessions.begin() as session:
+        for route_profile in session.scalars(
+            select(ProviderProfile).where(ProviderProfile.tenant_id == "acme")
+        ):
+            route_profile.route_priority = None
+        session.flush()
+        session.get(ProviderProfile, profile.profile_id).route_priority = 1
+    set_scheduler_limits(
+        routed_app,
+        profile.profile_id,
+        [
+            {
+                "scope_kind": "profile",
+                "scope_id": profile.profile_id,
+                "metric": "tokens",
+                "limit": 1000,
+                "window_seconds": 60,
+            }
+        ],
+    )
+
+    payload = {
+        "model": "cursor-acme-model",
+        "messages": [{"role": "user", "content": "Hi"}],
+    }
+    if payload_cap is not None:
+        payload["max_tokens"] = payload_cap
+    requests_mock.post(
+        OPENAI,
+        content=successful_chat("gpt-5.4"),
+        headers={"Content-Type": "text/event-stream"},
+    )
+    response = routed_app.test_client().post(
+        "/v1/chat/completions", headers=AUTH, json=payload, buffered=True
+    )
+
+    assert response.status_code == 400
+    assert "No provider candidate has a valid scheduler configuration." in (
+        response.get_data(as_text=True)
+    )
+    assert requests_mock.call_count == 0
+
+
+def test_stream_usage_settles_token_reservation_with_actual_total(
+    routed_app, requests_mock, monkeypatch
+):
+    """Successful streaming charges parsed actual usage rather than the estimate."""
+    from app.persistence.provider_scheduler import ProviderBudgetScheduler
+
+    database = routed_app.extensions["database"]
+    snapshot = database.get_proxy_snapshot_by_api_key("cursor-key")
+    profile = next(item for item in snapshot.profiles if item.provider == "openai")
+    with database.sessions.begin() as session:
+        profiles = tuple(
+            session.scalars(
+                select(ProviderProfile).where(ProviderProfile.tenant_id == "acme")
+            )
+        )
+        for route_profile in profiles:
+            route_profile.route_priority = None
+        session.flush()
+        persisted = session.get(ProviderProfile, profile.profile_id)
+        persisted.route_priority = 1
+        persisted.settings = {
+            **persisted.settings,
+            "scheduler_limits": [
+                {
+                    "scope_kind": "profile",
+                    "scope_id": profile.profile_id,
+                    "metric": "tokens",
+                    "limit": 1000,
+                    "window_seconds": 60,
+                }
+            ],
+            "token_reservation_estimate": 41,
+        }
+    settlements = []
+    monkeypatch.setattr(
+        ProviderBudgetScheduler,
+        "reserve",
+        lambda _self, request, **_kwargs: ReservationDecision(
+            True,
+            BudgetLease("usage-lease", request.tenant_id, request.provider, "token"),
+        ),
+    )
+    monkeypatch.setattr(
+        ProviderBudgetScheduler,
+        "complete",
+        lambda _self, _lease, *, actual_tokens: settlements.append(actual_tokens)
+        or True,
+    )
+    usage_event = event(
+        {
+            "model": "gpt-5.4",
+            "choices": [],
+            "usage": {"prompt_tokens": 10, "completion_tokens": 3, "total_tokens": 13},
+        }
+    )
+    requests_mock.post(
+        OPENAI,
+        content=usage_event + b"data: [DONE]\n\n",
+        headers={"Content-Type": "text/event-stream"},
+    )
+
+    response = post(routed_app)
+
+    assert response.status_code == 200
+    assert settlements == [13]
+
+
+def test_invalid_scheduler_configurations_fail_closed_when_no_candidate_is_valid(
+    routed_app, requests_mock
+):
+    """No candidate with an invalid scheduler profile may reach an upstream."""
+    snapshot = routed_app.extensions["database"].get_proxy_snapshot_by_api_key(
+        "cursor-key"
+    )
+    for profile in snapshot.profiles:
+        set_scheduler_limits(
+            routed_app,
+            profile.profile_id,
+            [
+                {
+                    "scope_kind": "profile",
+                    "scope_id": profile.profile_id,
+                    "metric": "requests",
+                    "limit": True,
+                    "window_seconds": 60,
+                }
+            ],
+        )
+
+    response = post(routed_app)
+
+    assert response.status_code == 400
+    assert "scheduler configuration" in response.get_data(as_text=True).lower()
+    assert requests_mock.call_count == 0
+
+
+def test_invalid_scheduler_candidate_is_diagnosed_and_skipped_in_cascade(
+    routed_app, requests_mock, mocker
+):
+    """One malformed candidate does not prevent another valid provider attempt."""
+    database = routed_app.extensions["database"]
+    snapshot = database.get_proxy_snapshot_by_api_key("cursor-key")
+    invalid_profile = snapshot.profiles[0]
+    set_scheduler_limits(
+        routed_app,
+        invalid_profile.profile_id,
+        [
+            {
+                "scope_kind": "profile",
+                "scope_id": invalid_profile.profile_id,
+                "metric": "requests",
+                "limit": True,
+                "window_seconds": 60,
+            }
+        ],
+    )
+    warning = mocker.patch.object(routed_app.logger, "warning")
+    requests_mock.post(
+        OPENAI,
+        content=successful_chat("gpt-5.4"),
+        headers={"Content-Type": "text/event-stream"},
+    )
+
+    response = post(routed_app)
+
+    assert response.status_code == 200
+    assert [request.url for request in requests_mock.request_history] == [OPENAI]
+    warning.assert_called()
+
+
+def test_local_organization_and_project_settings_remain_tenant_scoped(routed_app):
+    """Settings values without verified canonical IDs never create shared scopes."""
+    database = routed_app.extensions["database"]
+    with database.sessions.begin() as session:
+        profile = session.scalar(
+            select(ProviderProfile).where(
+                ProviderProfile.tenant_id == "acme",
+                ProviderProfile.provider == "openai",
+            )
+        )
+        profile.settings = {
+            **profile.settings,
+            "organization": " org-local-label ",
+            "project": " proj-local-label ",
+        }
+    snapshot = database.get_proxy_snapshot_by_api_key("cursor-key")
+    profile = next(item for item in snapshot.profiles if item.provider == "openai")
+
+    candidate = _scheduler_candidate(
+        snapshot, profile, "gpt-5.4", {"messages": [{"role": "user", "content": "x"}]}
+    )
+
+    shared_settings_scopes = [
+        scope
+        for scope in candidate.cooldown_scopes
+        if scope.kind.value in {"organization", "project"}
+    ]
+    assert len(shared_settings_scopes) == 2
+    assert {scope.scope_id for scope in shared_settings_scopes} == {
+        " org-local-label ",
+        " proj-local-label ",
+    }
+    assert all(scope.shared_identity is None for scope in shared_settings_scopes)
+
+
+def test_provider_budget_policy_conflict_fails_closed(
+    routed_app, requests_mock, monkeypatch
+):
+    """A durable shared-policy conflict is not treated as bad candidate settings."""
+    snapshot = routed_app.extensions["database"].get_proxy_snapshot_by_api_key(
+        "cursor-key"
+    )
+    profile = snapshot.profiles[0]
+    set_scheduler_limits(
+        routed_app,
+        profile.profile_id,
+        [
+            {
+                "scope_kind": "profile",
+                "scope_id": profile.profile_id,
+                "metric": "requests",
+                "limit": 10,
+                "window_seconds": 60,
+            }
+        ],
+    )
+
+    def conflict(*_args, **_kwargs):
+        raise ProviderSchedulerPolicyConflict("window policy conflicts")
+
+    monkeypatch.setattr(ProviderBudgetScheduler, "reserve", conflict)
+    response = post(routed_app)
+
+    assert response.status_code == 503
+    assert response.json["error"]["code"] == "provider_scheduler_unavailable"
+    assert requests_mock.call_count == 0
+
+
+def test_scheduler_store_failure_fails_closed_without_upstream(
+    routed_app, requests_mock, monkeypatch
+):
+    """Scheduler persistence errors return service unavailable before upstream I/O."""
+    from app.persistence.provider_scheduler import ProviderBudgetScheduler
+
+    snapshot = routed_app.extensions["database"].get_proxy_snapshot_by_api_key(
+        "cursor-key"
+    )
+    profile = snapshot.profiles[0]
+    set_scheduler_limits(
+        routed_app,
+        profile.profile_id,
+        [
+            {
+                "scope_kind": "profile",
+                "scope_id": profile.profile_id,
+                "metric": "requests",
+                "limit": 10,
+                "window_seconds": 60,
+            }
+        ],
+    )
+
+    def unavailable(*_args, **_kwargs):
+        raise ProviderSchedulerStoreError("database unavailable")
+
+    monkeypatch.setattr(ProviderBudgetScheduler, "reserve", unavailable)
+    response = post(routed_app)
+
+    assert response.status_code == 503
+    assert response.json["error"]["code"] == "provider_scheduler_unavailable"
+    assert requests_mock.call_count == 0
+
+
+def test_transient_retry_after_is_persisted_by_scheduler(
+    routed_app, requests_mock, monkeypatch
+):
+    """Valid transient Retry-After becomes a durable provider cooldown."""
+    from app.persistence.provider_scheduler import ProviderBudgetScheduler
+
+    cooldowns = []
+    monkeypatch.setattr(
+        ProviderBudgetScheduler,
+        "reserve",
+        lambda *_args, **_kwargs: ReservationDecision(
+            True, BudgetLease("lease", "acme", "openai", "token")
+        ),
+    )
+    monkeypatch.setattr(ProviderBudgetScheduler, "release", lambda *_args: True)
+    monkeypatch.setattr(
+        ProviderBudgetScheduler, "complete", lambda *_args, **_kwargs: True
+    )
+    monkeypatch.setattr(
+        ProviderBudgetScheduler,
+        "apply_cooldown",
+        lambda _self, scope, seconds, **kwargs: cooldowns.append(
+            (
+                scope.provider,
+                scope.kind.value,
+                scope.scope_id,
+                seconds,
+                kwargs["tenant_id"],
+            )
+        )
+        or datetime.now(timezone.utc) + timedelta(seconds=seconds),
+    )
+    requests_mock.post(
+        AZURE,
+        status_code=503,
+        headers={"Retry-After": "19"},
+        json={"error": {"code": "server_error"}},
+    )
+    requests_mock.post(
+        OPENAI,
+        content=successful_chat("gpt-5.4"),
+        headers={"Content-Type": "text/event-stream"},
+    )
+
+    response = post(routed_app)
+
+    assert response.status_code == 200
+    first_profile = (
+        routed_app.extensions["database"]
+        .get_proxy_snapshot_by_api_key("cursor-key")
+        .profiles[0]
+    )
+    assert cooldowns == [
+        ("azure", "profile", first_profile.profile_id, 19.0, "acme"),
+    ]
+    assert [request.url for request in requests_mock.request_history] == [AZURE, OPENAI]
+
+
 def test_circuit_store_failure_fails_closed_with_service_unavailable(
     routed_app, requests_mock, monkeypatch
 ):
@@ -660,6 +1760,75 @@ def test_deepseek_route_persists_attempt_activity_and_breaker(
         state = session.scalar(select(ProviderCircuitState))
     assert state.provider == "deepseek"
     assert state.failure_count == 1
+
+
+def test_aimd_increases_capacity_after_successful_route(
+    routed_app, requests_mock, monkeypatch
+):
+    """Successful provider completion settles an AIMD success outcome."""
+    database = routed_app.extensions["database"]
+    with database.sessions.begin() as session:
+        profiles = tuple(
+            session.scalars(
+                select(ProviderProfile).where(ProviderProfile.tenant_id == "acme")
+            )
+        )
+        for profile in profiles:
+            profile.route_priority = None
+        session.flush()
+        openai_profile = next(p for p in profiles if p.provider == "openai")
+        openai_profile.route_priority = 1
+
+    outcomes = []
+    monkeypatch.setattr(
+        ProviderConcurrencyController,
+        "settle",
+        lambda _self, _lease, *, outcome, **_kwargs: outcomes.append(outcome) or True,
+    )
+    requests_mock.post(
+        OPENAI,
+        content=successful_chat("gpt-5.4"),
+        headers={"Content-Type": "text/event-stream"},
+    )
+
+    response = post(routed_app)
+
+    assert response.status_code == 200
+    assert outcomes == ["success"]
+
+
+def test_aimd_decreases_capacity_after_transient_route_failure(
+    routed_app, requests_mock, monkeypatch
+):
+    """A transient provider failure settles a multiplicative AIMD decrease."""
+    database = routed_app.extensions["database"]
+    with database.sessions.begin() as session:
+        profiles = tuple(
+            session.scalars(
+                select(ProviderProfile).where(ProviderProfile.tenant_id == "acme")
+            )
+        )
+        for profile in profiles:
+            profile.route_priority = None
+        session.flush()
+        openai_profile = next(p for p in profiles if p.provider == "openai")
+        openai_profile.route_priority = 1
+
+    outcomes = []
+    monkeypatch.setattr(
+        ProviderConcurrencyController,
+        "settle",
+        lambda _self, _lease, *, outcome, **_kwargs: outcomes.append(outcome) or True,
+    )
+    monkeypatch.setattr(
+        "app.providers.routing._queue_transient_retry", lambda *_args: None
+    )
+    requests_mock.post(OPENAI, status_code=429, json={"error": {"code": "rate_limit"}})
+
+    response = post(routed_app)
+
+    assert response.status_code == 503
+    assert outcomes == ["transient_failure"]
 
 
 def test_late_openrouter_quota_error_pauses_following_request(

@@ -15,6 +15,13 @@ from app.azure.adapter import AzureAdapter
 from app.exceptions import ServiceConfigurationError
 from app.persistence.database import Database
 from app.persistence.models import Base, ProviderCatalogEntry, ProviderProfile, Tenant
+from app.persistence.provider_scheduler import (
+    ProviderBudgetScheduler,
+    ProviderConcurrencyController,
+    ProviderConcurrencyDecision,
+    ProviderConcurrencyLease,
+    ReservationDecision,
+)
 from app.persistence.secrets import SecretCipher
 from app.tenants import TenantConfig, hash_api_key
 
@@ -282,6 +289,27 @@ def test_database_tenant_without_active_profile_lists_no_models(monkeypatch):
 
 def test_database_openai_provider_forwards_to_openai_compatible(monkeypatch):
     """Active OpenAI profiles use the OpenAI-compatible forwarder, not Azure."""
+    monkeypatch.setattr(
+        ProviderBudgetScheduler,
+        "reserve",
+        lambda *_args, **_kwargs: ReservationDecision(True),
+    )
+    monkeypatch.setattr(
+        ProviderConcurrencyController,
+        "acquire",
+        lambda _self, tenant_id, provider, profile_id, **_kwargs: ProviderConcurrencyDecision(
+            True,
+            ProviderConcurrencyLease(
+                f"{tenant_id}-{profile_id}", 1, tenant_id, provider, "test-token"
+            ),
+        ),
+    )
+    monkeypatch.setattr(
+        ProviderConcurrencyController, "renew", lambda *_args, **_kwargs: True
+    )
+    monkeypatch.setattr(
+        ProviderConcurrencyController, "settle", lambda *_args, **_kwargs: True
+    )
     api_key = "openai-tenant-cleartext-key"
     database_config = type(
         "DatabaseOpenAIConfig",
@@ -348,7 +376,13 @@ def test_database_openai_provider_forwards_to_openai_compatible(monkeypatch):
     seen: dict[str, object] = {}
 
     def fake_forward(
-        req, snapshot, *, target_model, attempt_id=None, circuit_attempt=None
+        req,
+        snapshot,
+        *,
+        target_model,
+        attempt_id=None,
+        circuit_attempt=None,
+        budget_attempt=None,
     ):
         seen["provider"] = snapshot.provider
         seen["default_model"] = snapshot.default_model

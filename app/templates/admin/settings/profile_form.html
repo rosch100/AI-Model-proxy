@@ -36,6 +36,13 @@
     {% if not profile or profile.provider == "deepseek" %}
       <div data-provider-fields="deepseek"{% if not profile and form.provider.data != "deepseek" %} hidden{% endif %}><p class="hint">DeepSeek verwendet die Standard-API-Adresse.</p></div>
     {% endif %}
+    <fieldset>
+      <legend>Provider-Scheduler</legend>
+      <label>{{ form.scheduler_limits.label }}{{ form.scheduler_limits(rows=6, spellcheck="false", placeholder='[{"scope_kind":"profile","scope_id":"…","metric":"requests","limit":60,"window_seconds":60}]') }}</label>
+      <p class="hint">Optionales JSON-Array expliziter Request-/Token-Limits. Scope-Kennungen müssen zur Provider-, Profil-, Modell-, Organisations- oder Projektkennung dieses Kontos passen. Leeres Feld bedeutet keine zusätzlichen festen Fensterlimits.</p>
+      <label>{{ form.token_reservation_estimate.label }}{{ form.token_reservation_estimate(min=1, step=1) }}</label>
+      <p class="hint">Optionale positive Token-Schätzung pro Anfrage, die bei Token-Limits konservativ reserviert wird. Sie ist keine Tokenizer-Messung; gemeldete tatsächliche Nutzung korrigiert die Reservierung nach Abschluss.</p>
+    </fieldset>
     {% if not profile %}
         <p class="hint">Speichere zuerst das Konto. Lade danach unter „Anbieter und Konten“ die Modellliste und wähle hier dein Standardmodell aus. Bei Azure werden die bereitgestellten Modelle und Bereitstellungen angezeigt.</p>
     {% elif form.default_model.choices|length <= 1 %}

@@ -1,6 +1,7 @@
 """Tenant-scoped provider and model discovery API contracts."""
 
 from datetime import datetime, timezone
+from decimal import Decimal
 from io import StringIO
 from pathlib import Path
 from unittest.mock import patch
@@ -14,7 +15,10 @@ from alembic.script import ScriptDirectory
 
 from app.persistence.admin_ops import create_provider_profile, replace_catalog_entries
 from app.persistence.models import ProviderCatalogEntry, ProviderProfile, Tenant
-from app.providers.catalog import refresh_provider_catalog_with_pricing
+from app.providers.catalog import (
+    _complete_openrouter_pricing,
+    refresh_provider_catalog_with_pricing,
+)
 from app.tenants import hash_api_key
 
 
@@ -223,16 +227,22 @@ def test_discovery_hides_profiles_when_provider_switch_is_disabled(discovery_app
     )
 
 
-def test_discovery_requires_authentication_and_database_tenant_mode(discovery_app):
+@pytest.mark.parametrize(
+    "path",
+    [
+        "/v1/providers",
+        "/v1/providers/openrouter/models?profile=Research%2FTeam",
+    ],
+)
+def test_discovery_requires_authentication_and_database_tenant_mode(
+    discovery_app, path
+):
     """Require bearer auth and database-backed tenant mode."""
     client = discovery_app.test_client()
-    assert client.get("/v1/providers").status_code == 401
+    assert client.get(path).status_code == 401
 
     discovery_app.config.update(AUTH_MODE="single", TENANT_CONFIG_SOURCE="environment")
-    assert (
-        client.get("/v1/providers", headers=_auth("test-service-api-key")).status_code
-        == 400
-    )
+    assert client.get(path, headers=_auth("test-service-api-key")).status_code == 400
 
 
 def test_discovery_is_tenant_isolated_and_models_contract_is_unchanged(discovery_app):
@@ -341,10 +351,55 @@ def test_openrouter_catalog_parses_decimal_json_without_float_rounding(requests_
     assert pricing["precise"]["cache_per_1m_tokens"] == "0.5"
 
 
-def test_non_openrouter_catalog_refresh_has_no_pricing():
+@pytest.mark.parametrize("key", ["prompt", "completion", "input_cache_read"])
+@pytest.mark.parametrize(
+    "rate",
+    [
+        "1e1000000000",
+        "1e-1000000000",
+        "1e58",
+        "1e-69",
+        "1" * 59,
+        "1" * 64 + "e-7",
+    ],
+)
+def test_openrouter_pricing_rejects_oversized_rates_before_formatting(key, rate):
+    """Reject the whole price set before any potentially large allocation."""
+    rates = {"prompt": "0.000001", "completion": "0", "input_cache_read": "0"}
+    rates[key] = rate
+
+    with patch("app.providers.catalog._decimal_string") as formatter:
+        assert _complete_openrouter_pricing(rates) is None
+        formatter.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    ("rate", "expected"),
+    [
+        ("1e57", "1" + "0" * 63),
+        ("1e-68", "0." + "0" * 61 + "1"),
+        ("1" * 58, "1" * 58 + "0" * 6),
+        ("1" * 63 + "e-7", "1" * 62 + ".1"),
+        ("0.0000012500", "1.25"),
+        ("0e1000000000", "0"),
+        ("-0e-1000000000", "0"),
+    ],
+)
+def test_openrouter_pricing_accepts_bounded_rates_and_zero(rate, expected):
+    """Keep exact boundary values, decimal normalization, and compact zeros."""
+    result = _complete_openrouter_pricing(
+        {"prompt": Decimal(rate), "completion": "0", "input_cache_read": "0"}
+    )
+
+    assert result is not None
+    assert result["input_per_1m_tokens"] == expected
+
+
+@pytest.mark.parametrize("provider", ["azure", "openai", "deepseek"])
+def test_non_openrouter_catalog_refresh_has_no_pricing(provider):
     """Leave pricing empty for providers without a supported price source."""
     with patch("app.providers.catalog.refresh_provider_catalog", return_value=[]):
-        assert refresh_provider_catalog_with_pricing("openai", {}, "secret") == (
+        assert refresh_provider_catalog_with_pricing(provider, {}, "secret") == (
             [],
             {},
         )

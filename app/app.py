@@ -8,6 +8,9 @@ from . import commands
 from .admin.security import admin_secret_bytes, configure_admin_security
 from .admin.views import register_admin
 from .admin.webauthn_service import webauthn_config_from_app
+from .batch_api import batch_blueprint
+from .batch_config import DEFAULT_BATCH_MAX_QUEUED_JOBS
+from .batch_worker import register_batch_worker_command
 from .blueprint import blueprint
 from .exceptions import ServiceConfigurationError
 from .migrations import register_migration_commands
@@ -34,6 +37,8 @@ def create_app(config_object="app.settings"):
     """
     app = Flask(__name__.split(".")[0])
     app.config.from_object(config_object)
+    app.config.setdefault("BATCH_MAX_QUEUED_JOBS", DEFAULT_BATCH_MAX_QUEUED_JOBS)
+    _validate_batch_config(app)
     _configure_request_trust(app)
     _normalize_auth_config(app)
     _validate_auth_config(app)
@@ -60,6 +65,15 @@ def create_app(config_object="app.settings"):
     register_commands(app)
     register_blueprints(app)
     return app
+
+
+def _validate_batch_config(app: Flask) -> None:
+    """Require a positive integer capacity for each tenant batch queue."""
+    capacity = app.config.get("BATCH_MAX_QUEUED_JOBS")
+    if isinstance(capacity, bool) or not isinstance(capacity, int) or capacity <= 0:
+        raise ServiceConfigurationError(
+            "BATCH_MAX_QUEUED_JOBS must be a positive integer."
+        )
 
 
 def _configure_request_trust(app: Flask) -> None:
@@ -174,7 +188,8 @@ def _register_database_admin(app: Flask) -> None:
 
 
 def register_blueprints(app):
-    """Register Flask blueprints."""
+    """Register specific batch routes before the proxy catch-all."""
+    app.register_blueprint(batch_blueprint)
     app.register_blueprint(blueprint)
     return None
 
@@ -185,6 +200,7 @@ def register_commands(app):
     app.cli.add_command(commands.lint)
     register_migration_commands(app)
     register_tenant_commands(app)
+    register_batch_worker_command(app)
 
 
 def configure_logging(app):

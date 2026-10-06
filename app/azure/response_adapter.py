@@ -26,9 +26,11 @@ from ..persistence.inference_activity import (
     parse_provider_usage,
     record_inference_activity,
 )
+from ..persistence.provider_scheduler import ProviderSchedulerStoreError
 from ..providers.circuit_breaker import ProviderCircuitAttempt
 from ..providers.failover_upstream import (
     PreparedUpstream,
+    UpstreamError,
     _event_failure,
     _transport_error_details,
     sanitize_error_event,
@@ -743,7 +745,7 @@ class ResponseAdapter:
 
     def _prepare_stream_event(
         self, original_event: Any, state: _ResponseStreamState
-    ) -> tuple[Any, int | None, bool]:
+    ) -> tuple[Any, int | None, bool, UpstreamError | None]:
         """Classify one upstream event and update terminal attempt metadata."""
         event_data = original_event.json
         event_sequence_number = None
@@ -766,8 +768,6 @@ class ResponseAdapter:
             settings=getattr(self.adapter, "activity_settings", {}),
         )
         if classified_failure is not None:
-            if self._circuit_attempt is not None:
-                self._circuit_attempt.failed(classified_failure.classification)
             if state.has_emitted_output and has_request_context():
                 current_app.logger.warning(
                     "Provider stream failed after output: request_id=%s "
@@ -819,7 +819,7 @@ class ResponseAdapter:
                 )
                 if classified_failure is not None:
                     state.failure_details = {"error_code": classified_failure.code}
-        return original_event, event_sequence_number, is_terminal
+        return original_event, event_sequence_number, is_terminal, classified_failure
 
     def _sanitize_stream_event(self, event: Any, state: _ResponseStreamState) -> Any:
         """Sanitize provider errors only on routed or resumed streams."""
@@ -841,8 +841,8 @@ class ResponseAdapter:
         live: Live,
     ) -> Iterable[Dict[str, Any]]:
         """Apply retry policy and adapt one provider event to client chunks."""
-        event, sequence_number, terminal = self._prepare_stream_event(
-            original_event, state
+        event, sequence_number, terminal, classified_failure = (
+            self._prepare_stream_event(original_event, state)
         )
         attempt.terminal_event_seen = attempt.terminal_event_seen or terminal
         if self._absorb_empty_error_precursor(event, state, request_context):
@@ -861,6 +861,17 @@ class ResponseAdapter:
             raise
         if attempt.retry_response is not None:
             return
+        if classified_failure is not None:
+            if self._circuit_attempt is not None:
+                self._circuit_attempt.failed(classified_failure.classification)
+            if self._budget_attempt is not None:
+                try:
+                    self._budget_attempt.failed(classified_failure)
+                except ProviderSchedulerStoreError:
+                    if has_request_context():
+                        current_app.logger.exception(
+                            "Could not settle provider budget after stream failure"
+                        )
         event = self._sanitize_stream_event(event, state)
         event_data = event.json
         if raw_event == "error":
@@ -1234,6 +1245,7 @@ class ResponseAdapter:
         request_context: Any,
         activity_attempt_id: int | None = None,
         circuit_attempt: ProviderCircuitAttempt | None = None,
+        budget_attempt: Any = None,
         resume_stream: Callable[[str, int], Any] | None = None,
         cancel_response: Callable[[str], None] | None = None,
     ) -> Iterable[Dict[str, Any]]:
@@ -1247,6 +1259,7 @@ class ResponseAdapter:
             or resume_stream is not None,
         )
         self._circuit_attempt = circuit_attempt
+        self._budget_attempt = budget_attempt
         try:
             with Live(None, console=console, refresh_per_second=2) as live:
                 yield from self._stream_upstream_events(state, request_context, live)
@@ -1256,6 +1269,20 @@ class ResponseAdapter:
             raise
         finally:
             try:
+                if budget_attempt is not None:
+                    try:
+                        if state.completed_successfully and not state.aborted:
+                            usage = parse_provider_usage(self._usage)
+                            budget_attempt.complete(
+                                usage.total_tokens if usage is not None else None
+                            )
+                        else:
+                            budget_attempt.failed(None)
+                    except ProviderSchedulerStoreError:
+                        if has_request_context():
+                            current_app.logger.exception(
+                                "Could not settle provider budget at stream completion"
+                            )
                 complete_provider_attempt(
                     activity_attempt_id,
                     outcome=(
@@ -1294,6 +1321,7 @@ class ResponseAdapter:
         *,
         activity_attempt_id: int | None = None,
         circuit_attempt: ProviderCircuitAttempt | None = None,
+        budget_attempt: Any = None,
         resume_stream: Callable[[str, int], Any] | None = None,
         cancel_response: Callable[[str], None] | None = None,
     ) -> Response:
@@ -1319,6 +1347,7 @@ class ResponseAdapter:
                         request_context,
                         activity_attempt_id,
                         circuit_attempt,
+                        budget_attempt,
                         resume_stream,
                         cancel_response,
                     )

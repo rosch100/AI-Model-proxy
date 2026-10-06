@@ -228,10 +228,21 @@ def _complete_openrouter_pricing(value: object) -> dict[str, str] | None:
             return None
         if not rate.is_finite() or rate < 0:
             return None
-        rates.append(rate * Decimal(1_000_000))
+        sign, digits, exponent = rate.as_tuple()
+        rates.append(Decimal((sign, digits, exponent + 6)))
+    for rate in rates:
+        if not rate:
+            continue
+        sign, digits, exponent = rate.as_tuple()
+        # Bound the allocation for fixed-point formatting before creating strings.
+        length = (
+            len(digits) + exponent
+            if exponent >= 0
+            else max(len(digits) + 1, 2 - exponent)
+        )
+        if sign + length > 64:
+            return None
     formatted = [_decimal_string(rate) for rate in rates]
-    if any(len(text) > 64 for text in formatted):
-        return None
     return {
         "input_per_1m_tokens": formatted[0],
         "output_per_1m_tokens": formatted[1],

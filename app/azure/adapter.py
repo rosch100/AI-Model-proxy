@@ -111,6 +111,7 @@ class AzureAdapter:
         target_model: str | None = None,
         attempt_id: int | None = None,
         circuit_attempt: ProviderCircuitAttempt | None = None,
+        budget_attempt: Any = None,
     ) -> Response:
         """Make one routed attempt; do not wait or replay within this provider."""
         request_kwargs = self.request_adapter.adapt(
@@ -138,6 +139,7 @@ class AzureAdapter:
             prepared,
             activity_attempt_id=attempt_id,
             circuit_attempt=circuit_attempt,
+            budget_attempt=budget_attempt,
             resume_stream=(
                 partial(self._resume_azure_response, request_kwargs)
                 if self.resume_stream

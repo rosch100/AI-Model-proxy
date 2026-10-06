@@ -559,9 +559,13 @@ def test_new_connection_error_is_safe_but_wrapped_read_error_is_not():
     refused = requests.ConnectionError(
         MaxRetryError(None, "/", NewConnectionError(None, "refused"))
     )
-    assert failover_upstream.transport_failure(refused).retryable
+    refused_failure = failover_upstream.transport_failure(refused)
+    assert refused_failure.retryable
+    assert not refused_failure.upstream_started
     uncertain = requests.ConnectionError(ReadTimeoutError(None, "/", "interrupted"))
-    assert not failover_upstream.transport_failure(uncertain).retryable
+    uncertain_failure = failover_upstream.transport_failure(uncertain)
+    assert not uncertain_failure.retryable
+    assert uncertain_failure.upstream_started
     assert not failover_upstream.transport_failure(
         requests.ConnectionError("unknown outcome")
     ).retryable

@@ -176,6 +176,80 @@ def test_azure_billing_secret_cleanup_migration_is_explicit(monkeypatch):
     ) in generated_sql
 
 
+def test_provider_budget_migration_follows_catalog_pricing_and_is_postgresql_only(
+    monkeypatch,
+):
+    """The scheduler schema migration follows pricing and generates PostgreSQL DDL."""
+    project_root = Path(__file__).resolve().parents[1]
+    monkeypatch.setenv(
+        "DATABASE_URL", "postgresql+psycopg://user:password@localhost/proxy"
+    )
+    output = StringIO()
+    config = Config(str(project_root / "alembic.ini"), output_buffer=output)
+    config.set_main_option("script_location", str(project_root / "migrations"))
+    script = ScriptDirectory.from_config(config)
+    migration = script.get_revision("20261013_budget_sched").module
+    assert len(migration.revision) <= 32
+    assert migration.down_revision == "20261012_catalog_pricing"
+
+    migration_context = MigrationContext.configure(
+        dialect_name="postgresql", opts={"as_sql": True, "output_buffer": output}
+    )
+    with Operations.context(migration_context):
+        migration.upgrade()
+
+    generated_sql = output.getvalue()
+    for table in (
+        "provider_budget_scope_states",
+        "provider_budget_policies",
+        "provider_budget_windows",
+        "provider_budget_leases",
+        "provider_budget_lease_allocations",
+    ):
+        assert f"CREATE TABLE {table}" in generated_sql
+    assert "uq_budget_window_identity" in generated_sql
+    assert "uq_budget_policy_identity" in generated_sql
+
+    sqlite_context = MigrationContext.configure(dialect_name="sqlite")
+    with Operations.context(sqlite_context), pytest.raises(
+        RuntimeError, match="require PostgreSQL"
+    ):
+        migration.upgrade()
+
+
+def test_openai_batch_migration_follows_scheduler_and_is_postgresql_only(monkeypatch):
+    """Create tenant-scoped idempotency, state, payload, and lease schema."""
+    project_root = Path(__file__).resolve().parents[1]
+    output = StringIO()
+    config = Config(str(project_root / "alembic.ini"), output_buffer=output)
+    config.set_main_option("script_location", str(project_root / "migrations"))
+    migration = (
+        ScriptDirectory.from_config(config).get_revision("20261014_batch_jobs").module
+    )
+    assert len(migration.revision) <= 32
+    assert migration.down_revision == "20261013_budget_sched"
+    context = MigrationContext.configure(
+        dialect_name="postgresql", opts={"as_sql": True, "output_buffer": output}
+    )
+    with Operations.context(context):
+        migration.upgrade()
+    generated_sql = output.getvalue()
+    assert "CREATE TABLE batch_jobs" in generated_sql
+    assert "uq_batch_tenant_idempotency" in generated_sql
+    assert "ix_batch_jobs_queue" in generated_sql
+    assert "ix_batch_jobs_retention" in generated_sql
+    assert "request_json JSON NOT NULL" in generated_sql
+    assert "results_json JSON" in generated_sql
+    assert "provider_input_file_id" in generated_sql
+    assert "fencing_token" in generated_sql
+
+    sqlite_context = MigrationContext.configure(dialect_name="sqlite")
+    with Operations.context(sqlite_context), pytest.raises(
+        RuntimeError, match="require PostgreSQL"
+    ):
+        migration.upgrade()
+
+
 def test_provider_circuit_migration_is_postgresql_only_and_has_atomic_identity(
     monkeypatch,
 ):

@@ -16,6 +16,8 @@ from app.persistence.admin_auth import revoke_account_sessions
 from app.persistence.models import (
     AdminAccount,
     AuditEvent,
+    BatchJob,
+    ProviderBudgetPolicy,
     ProviderCatalogEntry,
     ProviderProfile,
     ProviderScopeBinding,
@@ -28,6 +30,7 @@ from app.persistence.secrets import SecretCipher
 from app.providers.azure_scope import canonical_cost_scopes
 from app.providers.azure_url import validate_azure_base_url
 from app.providers.catalog import selectable_catalog_models
+from app.providers.scheduler_config import parse_scheduler_limits
 from app.tenants import hash_api_key
 
 
@@ -139,6 +142,32 @@ def upsert_provider_profile(
     return profile
 
 
+def _validate_provider_settings(
+    provider: str, settings: dict[str, object]
+) -> dict[str, object]:
+    """Validate scheduler configuration before persisting profile settings."""
+    if not isinstance(settings, dict):
+        raise ValueError("Provider settings must be an object")
+    normalized = dict(settings)
+    if "scheduler_limits" in normalized:
+        normalized["scheduler_limits"] = parse_scheduler_limits(
+            normalized["scheduler_limits"]
+        )
+    estimate = normalized.get("token_reservation_estimate")
+    if estimate is not None and (
+        isinstance(estimate, bool) or not isinstance(estimate, int) or estimate <= 0
+    ):
+        raise ValueError("token_reservation_estimate must be a positive integer")
+    if estimate is None and any(
+        policy["metric"] == "tokens"
+        for policy in normalized.get("scheduler_limits", [])
+    ):
+        raise ValueError("Token scheduler limits require token_reservation_estimate")
+    if provider not in {"azure", "openai", "openrouter", "deepseek"}:
+        raise ValueError("Unsupported provider")
+    return normalized
+
+
 def _validate_profile_name(display_name: str) -> str:
     """Normalize and validate the account name shown in admin pages."""
     if not isinstance(display_name, str) or not display_name.strip():
@@ -188,9 +217,7 @@ def create_provider_profile(
         raise LookupError("Tenant was not found")
     name = _validate_profile_name(display_name)
     _ensure_profile_name_available(session, tenant_id, provider, name)
-    if not isinstance(settings, dict):
-        raise ValueError("Provider settings must be an object")
-    normalized_settings = dict(settings)
+    normalized_settings = _validate_provider_settings(provider, settings)
     if provider == "azure":
         normalized_settings["base_url"] = validate_azure_base_url(
             normalized_settings.get("base_url")
@@ -260,7 +287,77 @@ def update_provider_profile(
     )
     if not isinstance(settings, dict):
         raise ValueError("Provider settings must be an object")
-    normalized_settings = dict(settings)
+    merged_settings = dict(settings)
+    for key in ("scheduler_limits", "token_reservation_estimate"):
+        if key not in merged_settings and key in profile.settings:
+            merged_settings[key] = profile.settings[key]
+    normalized_settings = _validate_provider_settings(profile.provider, merged_settings)
+    if profile.provider == "openai":
+        has_retained_batch = session.scalar(
+            select(BatchJob.id)
+            .where(
+                BatchJob.tenant_id == tenant_id,
+                BatchJob.profile_id == profile.id,
+            )
+            .limit(1)
+        )
+        batch_credentials_changed = bool(inference_secret) or any(
+            (normalized_settings.get(key) or "") != (profile.settings.get(key) or "")
+            for key in ("organization", "project")
+        )
+        if has_retained_batch is not None and batch_credentials_changed:
+            raise ValueError(
+                "Cannot change OpenAI credentials or settings while batch jobs "
+                "are retained"
+            )
+    scheduler_limits = normalized_settings.get("scheduler_limits", [])
+    if scheduler_limits:
+        configured_scopes: dict[str, set[str]] = {
+            "provider": {profile.provider},
+            "profile": {profile.id},
+            "organization": set(),
+            "project": set(),
+            "model": set(),
+        }
+        for kind in ("organization", "project"):
+            scope_id = normalized_settings.get(kind)
+            if isinstance(scope_id, str) and scope_id.strip():
+                configured_scopes[kind].add(scope_id)
+        catalog_models = session.scalars(
+            select(ProviderCatalogEntry.model_id).where(
+                ProviderCatalogEntry.profile_id == profile.id
+            )
+        )
+        configured_scopes["model"].update(catalog_models)
+        for policy_config in scheduler_limits:
+            scope_kind = policy_config["scope_kind"]
+            configured_ids = configured_scopes[scope_kind]
+            explicit_scope_id = policy_config.get("scope_id")
+            if explicit_scope_id is not None:
+                configured_ids = {explicit_scope_id}
+            for scope_id in configured_ids:
+                fingerprint = cipher.provider_budget_fingerprint(
+                    profile.provider,
+                    scope_kind,
+                    scope_id,
+                    tenant_id=tenant_id,
+                )
+                registered_policy = session.scalar(
+                    select(ProviderBudgetPolicy).where(
+                        ProviderBudgetPolicy.provider == profile.provider,
+                        ProviderBudgetPolicy.scope_kind == scope_kind,
+                        ProviderBudgetPolicy.scope_fingerprint == fingerprint,
+                        ProviderBudgetPolicy.metric == policy_config["metric"],
+                    )
+                )
+                if (
+                    registered_policy is not None
+                    and registered_policy.window_seconds
+                    != policy_config["window_seconds"]
+                ):
+                    raise ValueError(
+                        "window_seconds for existing budget policies cannot be changed"
+                    )
     azure_endpoint_changed = False
     if profile.provider == "azure":
         normalized_settings["base_url"] = validate_azure_base_url(
@@ -368,6 +465,13 @@ def delete_provider_profile(
     )
     if has_scope_bindings is not None:
         raise ValueError("Account cannot be deleted while scopes are bound")
+    has_retained_batch = session.scalar(
+        select(BatchJob.id)
+        .where(BatchJob.tenant_id == tenant_id, BatchJob.profile_id == profile.id)
+        .limit(1)
+    )
+    if has_retained_batch is not None:
+        raise ValueError("Account cannot be deleted while batch jobs are retained")
     profile.inference_secret_ciphertext = None
     profile.billing_secret_ciphertext = None
     profile.deleted_at = datetime.now(timezone.utc)
@@ -595,7 +699,11 @@ def replace_catalog_entries(
         session.delete(row)
     session.flush()
     for model_id, deployment_id in entries:
-        rates = pricing.get(model_id) if pricing else None
+        rates = (
+            pricing.get(model_id)
+            if profile.provider == "openrouter" and pricing
+            else None
+        )
         has_complete_pricing = rates is not None and all(
             rates.get(key) is not None
             for key in (

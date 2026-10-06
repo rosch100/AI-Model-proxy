@@ -17,6 +17,7 @@ WEBAUTHN_ORIGINS = ("http://localhost", "http://127.0.0.1")
 
 ENABLE_AZURE = True
 ENABLE_CODEX = True
+BATCH_MAX_QUEUED_JOBS = 1000
 
 AZURE_BASE_URL = "https://test-resource.openai.azure.com"
 AZURE_API_KEY = "test-api-key"

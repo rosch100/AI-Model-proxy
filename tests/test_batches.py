@@ -109,6 +109,23 @@ def _create_job(client):
     return response.json["id"]
 
 
+def test_batch_validation_error_does_not_expose_exception_details(admin_app, mocker):
+    """Validation failures return a generic message even for unsafe exception text."""
+    client, _database = _prepare_batch_app(admin_app)
+    internal_detail = "database password and internal table name"
+    mocker.patch(
+        "app.batch_api.validate_idempotency_key",
+        side_effect=BatchValidationError(internal_detail),
+    )
+
+    response = client.post("/v1/batches", json=_payload(), headers=_headers())
+
+    assert response.status_code == 400
+    assert response.json["error"]["type"] == "invalid_request_error"
+    assert response.json["error"]["message"] == "The batch request is invalid."
+    assert internal_detail not in response.get_data(as_text=True)
+
+
 def test_batch_submit_is_unavailable_without_an_enabled_worker(admin_app):
     """Do not accept queued work when no configured worker can process it."""
     client, database = _prepare_batch_app(admin_app)

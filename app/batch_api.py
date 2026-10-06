@@ -123,9 +123,16 @@ def create_batch():
             submission,
             max_queued_jobs=current_app.config["BATCH_MAX_QUEUED_JOBS"],
         )
-    except BatchValidationError as exc:
+    except BatchValidationError:
         return (
-            jsonify({"error": {"message": str(exc), "type": "invalid_request_error"}}),
+            jsonify(
+                {
+                    "error": {
+                        "message": "The batch request is invalid.",
+                        "type": "invalid_request_error",
+                    }
+                }
+            ),
             400,
         )
     except BatchQueueFullError:

@@ -45,6 +45,7 @@ from app.providers.routing import (
     _final_route_failure,
     _guard_concurrency_lease,
     _scheduler_candidate,
+    _transient_retry_delay,
     forward_tenant_route,
 )
 
@@ -308,7 +309,8 @@ def test_transient_rate_limit_without_retry_after_uses_full_jitter(
         ],
     )
     sleep = mocker.patch("app.providers.routing.cooperative_sleep")
-    mocker.patch("app.providers.routing.random.uniform", return_value=1.0)
+    system_random = mocker.patch("app.providers.routing.SystemRandom")
+    system_random.return_value.uniform.return_value = 1.0
 
     response = post(routed_app)
 
@@ -397,6 +399,27 @@ def test_transient_rate_limit_retries_once_then_returns_temporary_unavailable(
     assert response.headers["Retry-After"] == "1"
     assert len(requests_mock.request_history) == 2
     sleep.assert_called_once()
+
+
+def test_transient_retry_jitter_uses_bounded_system_random(mocker):
+    """Untrusted provider errors only receive bounded OS-backed retry jitter."""
+    uniform = mocker.Mock(return_value=0.75)
+    mocker.patch(
+        "app.providers.routing.SystemRandom",
+        return_value=mocker.Mock(uniform=uniform),
+    )
+    error = UpstreamError(
+        status=429,
+        code="provider_rate_limited",
+        message="Rate limited",
+        retryable=True,
+        classification=UpstreamErrorClassification("transient"),
+    )
+
+    delay = _transient_retry_delay(error, is_retry=False, retry_count=1)
+
+    assert delay == 0.75
+    uniform.assert_called_once_with(0, 2.0)
 
 
 def test_rate_limit_retry_after_beyond_budget_does_not_hold_request(

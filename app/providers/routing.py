@@ -4,11 +4,11 @@ from __future__ import annotations
 
 import json
 import math
-import random
 from collections import deque
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+from random import SystemRandom
 from threading import Event, Lock, Thread
 from time import monotonic
 
@@ -780,7 +780,7 @@ def _transient_retry_delay(
             DEFAULT_TRANSIENT_RETRY_DELAY_SECONDS
             * (2 ** min(retry_count, max_exponent)),
         )
-        delay = random.uniform(0, ceiling)
+        delay = SystemRandom().uniform(0, ceiling)
     return max(delay, 0.1)
 
 

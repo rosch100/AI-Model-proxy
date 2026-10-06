@@ -547,7 +547,8 @@ When a complete published price is available, each model includes `pricing`
 with `input_per_1m_tokens`, `output_per_1m_tokens`, `cache_per_1m_tokens`,
 `currency`, `source`, and `updated_at`. Prices are decimal strings per million
 tokens; cache means cache-read pricing. The pricing object is omitted when any
-required rate is unavailable. Example:
+required rate is unavailable. For example, OpenRouter can publish all three
+rates, whereas an OpenAI or Azure catalog item has no `pricing` field:
 
 ```json
 {
@@ -572,6 +573,16 @@ required rate is unavailable. Example:
       ]
     }
   ]
+}
+```
+
+Without complete rates, the model item contains no `pricing` property:
+
+```json
+{
+  "provider": "openai",
+  "name": null,
+  "models": [{"id": "gpt-4.1"}]
 }
 ```
 

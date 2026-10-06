@@ -567,6 +567,318 @@ class ProviderAttemptEvent(Base):
     )
 
 
+class ProviderBudgetScopeState(Base):
+    """Persistent cooldown for one provider-neutral scheduling scope."""
+
+    __tablename__ = "provider_budget_scope_states"
+    __table_args__ = (
+        UniqueConstraint(
+            "provider",
+            "scope_kind",
+            "scope_fingerprint",
+            name="uq_budget_scope_identity",
+        ),
+        CheckConstraint(
+            "provider IN ('azure', 'openai', 'openrouter', 'deepseek')",
+            name="ck_budget_scope_provider",
+        ),
+        CheckConstraint(
+            "scope_kind IN ('provider', 'profile', 'model', 'organization', 'project')",
+            name="ck_budget_scope_kind",
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    provider: Mapped[str] = mapped_column(String(16), nullable=False)
+    scope_kind: Mapped[str] = mapped_column(String(32), nullable=False)
+    scope_fingerprint: Mapped[str] = mapped_column(String(64), nullable=False)
+    cooldown_until: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False
+    )
+
+
+class ProviderBudgetPolicy(Base):
+    """One immutable fixed-window duration per shared budget scope and metric."""
+
+    __tablename__ = "provider_budget_policies"
+    __table_args__ = (
+        UniqueConstraint(
+            "provider",
+            "scope_kind",
+            "scope_fingerprint",
+            "metric",
+            name="uq_budget_policy_identity",
+        ),
+        CheckConstraint("window_seconds > 0", name="ck_budget_policy_window_seconds"),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    provider: Mapped[str] = mapped_column(String(16), nullable=False)
+    scope_kind: Mapped[str] = mapped_column(String(32), nullable=False)
+    scope_fingerprint: Mapped[str] = mapped_column(String(64), nullable=False)
+    metric: Mapped[str] = mapped_column(String(16), nullable=False)
+    window_seconds: Mapped[int] = mapped_column(Integer, nullable=False)
+
+
+class ProviderBudgetWindow(Base):
+    """Fixed-window request/token counters shared by all app workers."""
+
+    __tablename__ = "provider_budget_windows"
+    __table_args__ = (
+        UniqueConstraint(
+            "provider",
+            "scope_kind",
+            "scope_fingerprint",
+            "metric",
+            "window_seconds",
+            "window_start",
+            name="uq_budget_window_identity",
+        ),
+        CheckConstraint(
+            "provider IN ('azure', 'openai', 'openrouter', 'deepseek')",
+            name="ck_budget_window_provider",
+        ),
+        CheckConstraint(
+            "scope_kind IN ('provider', 'profile', 'model', 'organization', 'project')",
+            name="ck_budget_window_scope",
+        ),
+        CheckConstraint(
+            "metric IN ('requests', 'tokens')", name="ck_budget_window_metric"
+        ),
+        CheckConstraint("window_seconds > 0", name="ck_budget_window_seconds"),
+        CheckConstraint("limit_units > 0", name="ck_budget_window_limit"),
+        CheckConstraint(
+            "used_units >= 0 AND reserved_units >= 0", name="ck_budget_window_units"
+        ),
+        Index("ix_budget_window_expiry", "window_start"),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    provider: Mapped[str] = mapped_column(String(16), nullable=False)
+    scope_kind: Mapped[str] = mapped_column(String(32), nullable=False)
+    scope_fingerprint: Mapped[str] = mapped_column(String(64), nullable=False)
+    metric: Mapped[str] = mapped_column(String(16), nullable=False)
+    window_seconds: Mapped[int] = mapped_column(Integer, nullable=False)
+    window_start: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False
+    )
+    limit_units: Mapped[int] = mapped_column(Integer, nullable=False)
+    used_units: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    reserved_units: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+
+
+class ProviderBudgetLease(Base):
+    """Opaque token-bound reservation lifecycle shared across workers."""
+
+    __tablename__ = "provider_budget_leases"
+    __table_args__ = (
+        UniqueConstraint("lease_token", name="uq_budget_lease_token"),
+        CheckConstraint(
+            "status IN ('active', 'completed', 'failed', 'released', 'expired')",
+            name="ck_budget_lease_status",
+        ),
+        Index("ix_budget_lease_tenant_status", "tenant_id", "status"),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    tenant_id: Mapped[str] = mapped_column(
+        ForeignKey("tenants.id", ondelete="CASCADE"), nullable=False
+    )
+    provider: Mapped[str] = mapped_column(String(16), nullable=False)
+    lease_token: Mapped[str] = mapped_column(String(36), nullable=False)
+    status: Mapped[str] = mapped_column(String(16), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False
+    )
+    completed_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+
+
+class ProviderBudgetLeaseAllocation(Base):
+    """Budget units held by a lease against one fixed-window row."""
+
+    __tablename__ = "provider_budget_lease_allocations"
+    __table_args__ = (
+        UniqueConstraint("lease_id", "window_id", name="uq_budget_lease_window"),
+        CheckConstraint("reserved_units >= 0", name="ck_budget_allocation_units"),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    lease_id: Mapped[str] = mapped_column(
+        ForeignKey("provider_budget_leases.id", ondelete="CASCADE"), nullable=False
+    )
+    window_id: Mapped[int] = mapped_column(
+        ForeignKey("provider_budget_windows.id", ondelete="RESTRICT"), nullable=False
+    )
+    reserved_units: Mapped[int] = mapped_column(Integer, nullable=False)
+
+
+class ProviderConcurrencyState(Base):
+    """Persistent AIMD concurrency bound for one tenant provider profile."""
+
+    __tablename__ = "provider_concurrency_states"
+    __table_args__ = (
+        UniqueConstraint(
+            "tenant_id", "provider", "scope_fingerprint", name="uq_concurrency_scope"
+        ),
+        CheckConstraint(
+            "provider IN ('azure', 'openai', 'openrouter', 'deepseek')",
+            name="ck_concurrency_provider",
+        ),
+        CheckConstraint(
+            "concurrency_limit BETWEEN 1 AND 64", name="ck_concurrency_limit"
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    tenant_id: Mapped[str] = mapped_column(
+        ForeignKey("tenants.id", ondelete="CASCADE"), nullable=False
+    )
+    provider: Mapped[str] = mapped_column(String(16), nullable=False)
+    scope_fingerprint: Mapped[str] = mapped_column(String(64), nullable=False)
+    concurrency_limit: Mapped[int] = mapped_column(Integer, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False
+    )
+
+
+class ProviderConcurrencyLease(Base):
+    """Durable expiring permit held by one in-flight provider request or stream."""
+
+    __tablename__ = "provider_concurrency_leases"
+    __table_args__ = (
+        UniqueConstraint("lease_token", name="uq_concurrency_lease_token"),
+        CheckConstraint(
+            "status IN ('active', 'completed', 'released', 'expired')",
+            name="ck_concurrency_lease_status",
+        ),
+        Index("ix_concurrency_lease_state_expiry", "state_id", "status", "expires_at"),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    state_id: Mapped[int] = mapped_column(
+        ForeignKey("provider_concurrency_states.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    lease_token: Mapped[str] = mapped_column(String(36), nullable=False)
+    status: Mapped[str] = mapped_column(String(16), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False
+    )
+    expires_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False
+    )
+    completed_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+
+
+class BatchJob(Base):
+    """Tenant-owned OpenAI batch request, state, and bounded result payload."""
+
+    __tablename__ = "batch_jobs"
+    __table_args__ = (
+        UniqueConstraint(
+            "tenant_id", "idempotency_key_hash", name="uq_batch_tenant_idempotency"
+        ),
+        ForeignKeyConstraint(
+            ["tenant_id", "profile_id"],
+            ["provider_profiles.tenant_id", "provider_profiles.id"],
+            name="fk_batch_profile_same_tenant",
+            ondelete="RESTRICT",
+        ),
+        CheckConstraint(
+            "status IN ('queued', 'uploading', 'submitting', 'retry_submit', "
+            "'submitted', 'polling', 'completed', 'failed', 'unknown_upload', "
+            "'unknown_submit', 'expired')",
+            name="ck_batch_status",
+        ),
+        CheckConstraint(
+            "idempotency_key_hash IS NULL OR length(idempotency_key_hash) = 64",
+            name="ck_batch_key_hash",
+        ),
+        CheckConstraint("length(payload_digest) = 64", name="ck_batch_payload_digest"),
+        CheckConstraint("fencing_token >= 0", name="ck_batch_fencing_token"),
+        CheckConstraint(
+            "upload_attempts BETWEEN 0 AND 5", name="ck_batch_upload_attempts"
+        ),
+        CheckConstraint(
+            "submit_attempts BETWEEN 0 AND 5", name="ck_batch_submit_attempts"
+        ),
+        CheckConstraint(
+            "(worker_owner IS NULL) = (lease_expires_at IS NULL)",
+            name="ck_batch_lease_pair",
+        ),
+        Index(
+            "ix_batch_jobs_queue",
+            "status",
+            "poll_after",
+            "created_at",
+            postgresql_where=text(
+                "status IN ('queued', 'uploading', 'retry_submit', 'submitted', 'polling')"
+            ),
+            sqlite_where=text(
+                "status IN ('queued', 'uploading', 'retry_submit', 'submitted', 'polling')"
+            ),
+        ),
+        Index("ix_batch_jobs_lease", "lease_expires_at"),
+        Index("ix_batch_jobs_retention", "expires_at"),
+    )
+
+    id: Mapped[str] = mapped_column(String(38), primary_key=True)
+    tenant_id: Mapped[str] = mapped_column(ForeignKey("tenants.id"), nullable=False)
+    profile_id: Mapped[str] = mapped_column(String(36), nullable=False)
+    model: Mapped[str] = mapped_column(String(256), nullable=False)
+    idempotency_key_hash: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    payload_digest: Mapped[str] = mapped_column(String(64), nullable=False)
+    request_json: Mapped[dict[str, object]] = mapped_column(JSON, nullable=False)
+    status: Mapped[str] = mapped_column(String(24), nullable=False)
+    provider_batch_id: Mapped[str | None] = mapped_column(String(256), nullable=True)
+    provider_input_file_id: Mapped[str | None] = mapped_column(
+        String(256), nullable=True
+    )
+    provider_output_file_id: Mapped[str | None] = mapped_column(
+        String(256), nullable=True
+    )
+    provider_error_file_id: Mapped[str | None] = mapped_column(
+        String(256), nullable=True
+    )
+    results_json: Mapped[list[dict[str, object]] | None] = mapped_column(
+        JSON, nullable=True
+    )
+    error_json: Mapped[dict[str, object] | None] = mapped_column(JSON, nullable=True)
+    worker_owner: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    lease_expires_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    fencing_token: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    upload_attempts: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0, server_default="0"
+    )
+    submit_attempts: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0, server_default="0"
+    )
+    poll_after: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+    completed_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    expires_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False
+    )
+
+
 class ProviderCircuitState(Base):
     """Persistent quota breaker state with an optional exclusive probe lease."""
 

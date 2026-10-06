@@ -58,10 +58,18 @@ def test_late_transport_failure_emits_error_without_replay():
         raise requests.ReadTimeout("secret-upstream-url")
 
     raw = upstream(chunks())
-    body = b"".join(chat_stream(prepare_upstream(raw), "cursor-model"))
+    budget_attempt = Mock()
+    body = b"".join(
+        chat_stream(
+            prepare_upstream(raw), "cursor-model", budget_attempt=budget_attempt
+        )
+    )
     assert b"partial" in body
     assert b"stream_interrupted" in body
     assert b"secret-upstream-url" not in body
+    budget_attempt.failed.assert_called_once()
+    assert isinstance(budget_attempt.failed.call_args.args[0], UpstreamError)
+    budget_attempt.release.assert_not_called()
     raw.close.assert_called_once()
 
 

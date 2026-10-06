@@ -24,6 +24,7 @@ from app.persistence.inference_activity import (
     parse_provider_usage,
     record_inference_activity,
 )
+from app.persistence.provider_scheduler import ProviderSchedulerStoreError
 from app.providers.error_classification import (
     UpstreamErrorClassification,
     classify_upstream_error,
@@ -384,6 +385,7 @@ class UpstreamError(Exception):
     provider_limit_source: str | None = None
     provider_request_id: str | None = None
     provider_diagnostics: dict[str, Any] = field(default_factory=dict, repr=False)
+    upstream_started: bool = True
 
     def response(self) -> Response:
         """Return a safe JSON error before any SSE headers have been committed."""
@@ -442,6 +444,7 @@ def transport_failure(exc: requests.RequestException) -> UpstreamError:
         safe_connection_failure,
         provider_error_type=type(exc).__name__,
         provider_diagnostics=_transport_error_details(exc),
+        upstream_started=not safe_connection_failure,
     )
 
 
@@ -527,10 +530,32 @@ def _event_failure(
     ) or isinstance(error.get("metadata"), dict)
     if not has_details and error.get("type") not in _ERROR_CODE_STATUSES:
         return None
+    retry_headers = dict(headers) if isinstance(headers, Mapping) else {}
+    retry_sources = [error, data]
+    response = data.get("response")
+    if isinstance(response, Mapping):
+        retry_sources.append(response)
+    for source in retry_sources:
+        for key in ("retry-after", "retry_after", "retry-after-ms", "retry_after_ms"):
+            raw_retry_after = source.get(key)
+            if raw_retry_after is None:
+                continue
+            if key.replace("_", "-").endswith("-ms"):
+                if isinstance(raw_retry_after, bool):
+                    continue
+                try:
+                    retry_seconds = float(raw_retry_after) / 1000
+                except (TypeError, ValueError):
+                    continue
+                if math.isfinite(retry_seconds) and retry_seconds >= 0:
+                    retry_headers["Retry-After"] = str(math.ceil(retry_seconds))
+            else:
+                retry_headers["Retry-After"] = raw_retry_after
+            break
     return _error_failure(
         error,
         provider=provider,
-        headers=headers,
+        headers=retry_headers,
         settings=settings,
     )
 
@@ -721,6 +746,7 @@ def chat_stream(
     provider: str | None = None,
     settings: Any = None,
     circuit_attempt: Any = None,
+    budget_attempt: Any = None,
 ) -> Iterator[bytes]:
     """Restore logical model identity while preserving choices and tool-call IDs."""
     decoder = SSEDecoder()
@@ -728,6 +754,7 @@ def chat_stream(
     completed_successfully = False
     status_code = None
     outcome = "failure"
+    budget_failure: UpstreamError | None = None
     try:
         for chunk in upstream.iter_content():
             # Clear the recording buffer: this decoder is not a traffic recorder.
@@ -757,6 +784,12 @@ def chat_stream(
                     ).json
                 except ValueError:
                     status_code = 502
+                    budget_failure = UpstreamError(
+                        502,
+                        "invalid_upstream_event",
+                        "Provider sent invalid SSE JSON.",
+                        False,
+                    )
                     yield (
                         b'data: {"error":{"code":"invalid_upstream_event",'
                         b'"message":"Provider sent invalid SSE JSON."}}\n\n'
@@ -764,8 +797,17 @@ def chat_stream(
                     return
                 if failure is not None:
                     status_code = failure.status
+                    budget_failure = failure
                     if circuit_attempt is not None:
                         circuit_attempt.failed(failure.classification)
+                    if budget_attempt is not None:
+                        try:
+                            budget_attempt.failed(failure)
+                        except ProviderSchedulerStoreError:
+                            if has_request_context():
+                                current_app.logger.exception(
+                                    "Could not settle provider budget after stream failure"
+                                )
                     if has_request_context():
                         current_app.logger.warning(
                             "Provider stream failed: request_id=%s provider=%s "
@@ -802,6 +844,7 @@ def chat_stream(
                 ).encode("utf-8")
     except requests.RequestException as exc:
         outcome = "failure"
+        budget_failure = transport_failure(exc)
         if has_request_context():
             current_app.logger.warning(
                 "Provider stream interrupted: request_id=%s provider=%s error_type=%s "
@@ -823,6 +866,21 @@ def chat_stream(
         outcome = "aborted"
         raise
     finally:
+        if budget_attempt is not None:
+            try:
+                if completed_successfully and outcome == "success":
+                    budget_attempt.complete(
+                        usage.total_tokens if usage is not None else None
+                    )
+                elif budget_failure is not None:
+                    budget_attempt.failed(budget_failure)
+                else:
+                    budget_attempt.failed(None)
+            except ProviderSchedulerStoreError:
+                if has_request_context():
+                    current_app.logger.exception(
+                        "Could not settle provider budget at stream completion"
+                    )
         if attempt_id is not None:
             complete_provider_attempt(
                 attempt_id,

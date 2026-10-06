@@ -2,6 +2,7 @@
 
 from environs import Env
 
+from .batch_config import DEFAULT_BATCH_MAX_QUEUED_JOBS
 from .codex.settings import (
     parse_codex_model_rewrites,
     parse_codex_supported_models,
@@ -42,6 +43,8 @@ TENANTS = () if TENANT_CONFIG_SOURCE == "database" else parse_tenants(_raw_tenan
 
 ENABLE_AZURE = env.bool("ENABLE_AZURE", True)
 ENABLE_CODEX = env.bool("ENABLE_CODEX", False)
+BATCH_WORKER_ENABLED = env.bool("BATCH_WORKER_ENABLED", False)
+BATCH_MAX_QUEUED_JOBS = env.int("BATCH_MAX_QUEUED_JOBS", DEFAULT_BATCH_MAX_QUEUED_JOBS)
 
 AZURE_BASE_URL = env.str("AZURE_BASE_URL", "change_me").rstrip("/")
 AZURE_API_KEY = env.str("AZURE_API_KEY", "change_me")

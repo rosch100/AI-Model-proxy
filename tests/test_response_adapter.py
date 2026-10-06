@@ -315,6 +315,67 @@ def test_terminal_event_prevents_resuming_after_later_transport_error(app):
     assert body.endswith(b"data: [DONE]\n\n")
 
 
+def test_stream_rate_limit_retry_settles_budget_only_for_successful_attempt(
+    app, monkeypatch
+):
+    """A retried SSE rate limit must charge the eventual successful response only."""
+    adapter = AzureAdapter()
+    adapter.inbound_model = "gpt-5.4"
+    adapter.include_usage = False
+    budget_attempt = Mock()
+    circuit_attempt = Mock()
+    monkeypatch.setattr(
+        adapter,
+        "_retry_stream_rate_limit",
+        lambda *_args: _FakeUpstreamResponse(
+            [
+                _sse(
+                    "response.completed",
+                    {
+                        "type": "response.completed",
+                        "response": {
+                            "id": "resp_retry",
+                            "usage": {
+                                "input_tokens": 10,
+                                "output_tokens": 5,
+                                "total_tokens": 15,
+                            },
+                        },
+                    },
+                )
+            ]
+        ),
+    )
+
+    response = adapter.response_adapter.adapt(
+        _FakeUpstreamResponse(
+            [
+                _sse(
+                    "response.failed",
+                    {
+                        "type": "response.failed",
+                        "response": {
+                            "id": "resp_limited",
+                            "error": {
+                                "code": "rate_limit_exceeded",
+                                "status": 429,
+                            },
+                        },
+                    },
+                )
+            ]
+        ),
+        request_context=object(),
+        budget_attempt=budget_attempt,
+        circuit_attempt=circuit_attempt,
+    )
+    b"".join(response.response)
+
+    budget_attempt.failed.assert_not_called()
+    budget_attempt.complete.assert_called_once_with(15)
+    circuit_attempt.failed.assert_not_called()
+
+
 def test_rate_limit_retry_resets_terminal_response_state(app, monkeypatch):
     """A later retry stream interruption is handled as its own attempt."""
     adapter = AzureAdapter()

@@ -223,16 +223,22 @@ def test_discovery_hides_profiles_when_provider_switch_is_disabled(discovery_app
     )
 
 
-def test_discovery_requires_authentication_and_database_tenant_mode(discovery_app):
+@pytest.mark.parametrize(
+    "path",
+    [
+        "/v1/providers",
+        "/v1/providers/openrouter/models?profile=Research%2FTeam",
+    ],
+)
+def test_discovery_requires_authentication_and_database_tenant_mode(
+    discovery_app, path
+):
     """Require bearer auth and database-backed tenant mode."""
     client = discovery_app.test_client()
-    assert client.get("/v1/providers").status_code == 401
+    assert client.get(path).status_code == 401
 
     discovery_app.config.update(AUTH_MODE="single", TENANT_CONFIG_SOURCE="environment")
-    assert (
-        client.get("/v1/providers", headers=_auth("test-service-api-key")).status_code
-        == 400
-    )
+    assert client.get(path, headers=_auth("test-service-api-key")).status_code == 400
 
 
 def test_discovery_is_tenant_isolated_and_models_contract_is_unchanged(discovery_app):
@@ -337,10 +343,11 @@ def test_openrouter_catalog_parses_decimal_json_without_float_rounding(requests_
     assert pricing["precise"]["cache_per_1m_tokens"] == "0.5"
 
 
-def test_non_openrouter_catalog_refresh_has_no_pricing():
+@pytest.mark.parametrize("provider", ["azure", "openai", "deepseek"])
+def test_non_openrouter_catalog_refresh_has_no_pricing(provider):
     """Leave pricing empty for providers without a supported price source."""
     with patch("app.providers.catalog.refresh_provider_catalog", return_value=[]):
-        assert refresh_provider_catalog_with_pricing("openai", {}, "secret") == (
+        assert refresh_provider_catalog_with_pricing(provider, {}, "secret") == (
             [],
             {},
         )

@@ -70,12 +70,14 @@ Betrieb in `.env` `AUTH_MODE=tenant`, `TENANT_CONFIG_SOURCE=database`,
 `DATABASE_URL=postgresql+psycopg://<POSTGRES_USER>:<POSTGRES_PASSWORD>@postgres:5432/<POSTGRES_DB>`
 setzen. Das Passwort muss URL-sicher sein oder in der URL korrekt percent-encodiert
 werden. PostgreSQL zuerst mit aktivem Profil starten und seine Healthcheck-Bereitschaft
-abwarten, danach den Proxy-/Caddy-Stack starten:
+abwarten, danach den Proxy-/Caddy-Stack starten. Für die separate OpenAI-Batch-Pipeline muss zusätzlich `BATCH_WORKER_ENABLED=true` gesetzt werden. Der Supervisor startet den Worker dann nur im Modus `AUTH_MODE=tenant` und `TENANT_CONFIG_SOURCE=database`; ist die Worker-Option aktiv, aber der Modus falsch, meldet der Wrapper einen Startfehler. Ohne diese explizite Einstellung bleibt der Worker deaktiviert:
 
 ```bash
 docker compose --profile database up -d --wait postgres
-docker compose up -d --build
+BATCH_WORKER_ENABLED=true docker compose up -d --build
 ```
+
+Der Batch-Worker benötigt dieselbe `DATABASE_URL` und `PROVIDER_ENCRYPTION_KEY` wie die Flask-App. Er liest Provider-Schlüssel bei jeder Joboperation entschlüsselt aus dem aktuellen OpenAI-Profil, persistiert keine Klartext-Credentials und nutzt ausschließlich PostgreSQL für Queue und Leases.
 
 Im Standardbetrieb (`TENANT_CONFIG_SOURCE=environment` oder Einzelmodus) bleibt
 das PostgreSQL-Profil deaktiviert; `docker compose up -d --build` startet den

@@ -2,12 +2,29 @@
 
 from __future__ import annotations
 
+import json
+
 from flask_wtf import FlaskForm
-from wtforms import BooleanField, PasswordField, SelectField, StringField
-from wtforms.validators import DataRequired, Length, Optional, Regexp, ValidationError
+from wtforms import (
+    BooleanField,
+    IntegerField,
+    PasswordField,
+    SelectField,
+    StringField,
+    TextAreaField,
+)
+from wtforms.validators import (
+    DataRequired,
+    Length,
+    NumberRange,
+    Optional,
+    Regexp,
+    ValidationError,
+)
 from wtforms.widgets import PasswordInput
 
 from app.providers.azure_url import validate_azure_base_url
+from app.providers.scheduler_config import parse_scheduler_limits
 
 
 class RevealablePasswordField(PasswordField):
@@ -120,6 +137,23 @@ class ProviderProfileForm(FlaskForm):
     )
     organization = StringField("Organisation (optional)", validators=[Optional()])
     project = StringField("Projekt (optional)", validators=[Optional()])
+    scheduler_limits = TextAreaField(
+        "Scheduler-Limits (optionales JSON-Array)",
+    )
+    token_reservation_estimate = IntegerField(
+        "Token-Reservierungsschätzung (optional)",
+        validators=[Optional(), NumberRange(min=1)],
+    )
+
+    def validate_scheduler_limits(self, field: TextAreaField) -> None:
+        """Validate and normalize scheduler tuples before persistence."""
+        try:
+            policies = parse_scheduler_limits(field.data or "[]")
+        except ValueError as exc:
+            raise ValidationError(
+                "Scheduler-Limits müssen ein gültiges JSON-Array positiver Limits sein."
+            ) from exc
+        field.data = json.dumps(policies, ensure_ascii=False, separators=(",", ":"))
 
     def validate_base_url(self, field: StringField) -> None:
         """Validate Azure endpoints only when Azure is the selected provider."""

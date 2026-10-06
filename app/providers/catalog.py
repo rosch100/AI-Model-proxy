@@ -228,7 +228,8 @@ def _complete_openrouter_pricing(value: object) -> dict[str, str] | None:
             return None
         if not rate.is_finite() or rate < 0:
             return None
-        rates.append(rate * Decimal(1_000_000))
+        sign, digits, exponent = rate.as_tuple()
+        rates.append(Decimal((sign, digits, exponent + 6)))
     return {
         "input_per_1m_tokens": _decimal_string(rates[0]),
         "output_per_1m_tokens": _decimal_string(rates[1]),

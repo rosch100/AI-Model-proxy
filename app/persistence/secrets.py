@@ -51,6 +51,29 @@ class SecretCipher:
         )
         return hmac.new(key, message, hashlib.sha256).hexdigest()
 
+    def provider_budget_fingerprint(
+        self,
+        provider: str,
+        scope_type: str,
+        scope_id: str,
+        *,
+        tenant_id: str | None = None,
+    ) -> str:
+        """HMAC a provider budget identity without persisting raw scope values."""
+        parts = (provider, scope_type, scope_id)
+        if any(not isinstance(part, str) or not part for part in parts):
+            raise ValueError(
+                "Provider budget scope components must be non-empty strings"
+            )
+        if tenant_id is not None and (not isinstance(tenant_id, str) or not tenant_id):
+            raise ValueError("Provider budget tenant identity must be non-empty")
+        identity = (tenant_id, *parts) if tenant_id is not None else parts
+        key = hmac.new(self._key, b"provider-budget-scope-v1", hashlib.sha256).digest()
+        message = json.dumps(
+            identity, ensure_ascii=False, separators=(",", ":")
+        ).encode("utf-8")
+        return hmac.new(key, message, hashlib.sha256).hexdigest()
+
     def encrypt(self, plaintext: str) -> str:
         """Return a base64-encoded nonce and authenticated ciphertext envelope."""
         nonce = os.urandom(12)

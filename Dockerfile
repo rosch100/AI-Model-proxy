@@ -27,6 +27,7 @@ RUN pip install --no-cache --user -r requirements/prod.txt
 
 COPY supervisord/supervisord.conf /etc/supervisor/supervisord.conf
 COPY supervisord/gunicorn.conf /etc/supervisor/conf.d/gunicorn.conf
+COPY supervisord/batch-worker.conf /etc/supervisor/conf.d/batch-worker.conf
 
 COPY . .
 

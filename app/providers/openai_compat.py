@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from typing import Any
 
 import requests
 from flask import Request, Response, stream_with_context
@@ -38,6 +39,7 @@ def forward_openai_compatible(
     target_model: str,
     attempt_id: int | None = None,
     circuit_attempt: ProviderCircuitAttempt | None = None,
+    budget_attempt: Any = None,
 ) -> Response:
     """Forward a Cursor request to an OpenAI-compatible Chat Completions API."""
     if snapshot.profile_id is None:
@@ -113,6 +115,7 @@ def forward_openai_compatible(
                 provider=snapshot.provider,
                 settings=snapshot.provider_settings,
                 circuit_attempt=circuit_attempt,
+                budget_attempt=budget_attempt,
             )
         ),
         content_type="text/event-stream",

@@ -14,6 +14,10 @@ from sqlalchemy.orm import Session
 from app.models import select_fallback_public_model
 from app.providers.azure_url import validate_azure_base_url
 from app.providers.catalog import selectable_catalog_models
+from app.providers.routing_config import (
+    parse_profile_routing_settings,
+    parse_tenant_routing_settings,
+)
 from app.tenants import (
     DatabaseTenantRoutingSnapshot,
     DatabaseTenantSnapshot,
@@ -68,6 +72,15 @@ def validate_routed_profile(
             value = profile.settings.get(key)
             if value is not None and not isinstance(value, str):
                 raise ValueError(f"Provider setting {key} must be a string")
+    catalog_model_ids = {
+        model_id
+        for model_id, _deployment_id in selectable_catalog_models(
+            profile.provider, entries
+        )
+    }
+    parse_profile_routing_settings(
+        profile.settings, catalog_model_ids=catalog_model_ids
+    )
 
 
 class TenantRepository:
@@ -152,6 +165,7 @@ class TenantRepository:
                 secret = cipher.decrypt(profile.inference_secret_ciphertext)
                 if not secret.strip():
                     continue
+                routing_settings = parse_profile_routing_settings(profile.settings)
             except (ValueError, InvalidTag):
                 # Invalid profiles cannot be used; never invent another model.
                 continue
@@ -167,6 +181,7 @@ class TenantRepository:
                 profile_name=profile.display_name,
                 history_generation=profile.history_generation,
                 profile_deleted=False,
+                route_priority=profile.route_priority,
                 catalog_model_ids=tuple(
                     model
                     for model, _ in selectable_catalog_models(
@@ -175,6 +190,7 @@ class TenantRepository:
                 ),
                 catalog_pricing=pricing.get(profile.id, {}),
                 catalog_refreshed_at=profile.catalog_refreshed_at,
+                routing_settings=routing_settings,
             )
             available_snapshots.append(snapshot)
             if profile.route_priority is not None:
@@ -185,6 +201,14 @@ class TenantRepository:
             custom_model_id=tenant.custom_model_id,
             profiles=tuple(snapshots),
             available_profiles=tuple(available_snapshots),
+            routing_settings=parse_tenant_routing_settings(
+                strategy=tenant.routing_strategy,
+                load_balancing_method=tenant.routing_load_balancing_method,
+                cost_policy=tenant.routing_cost_policy,
+                headroom_weight=tenant.routing_headroom_weight,
+                max_retry_wait_seconds=tenant.routing_max_retry_wait_seconds,
+                tie_breaker=tenant.routing_tie_breaker,
+            ),
         )
 
     def get_admin_snapshot(

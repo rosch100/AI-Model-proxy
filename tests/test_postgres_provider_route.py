@@ -145,10 +145,10 @@ def test_route_downgrade_fails_before_schema_changes_when_multiple_profiles_are_
         )
 
 
-def test_postgres_route_unique_constraint_allows_nulls_and_rejects_collisions(
+def test_postgres_capacity_routing_migration_allows_equal_priority_groups(
     postgres_test_databases,
 ):
-    """Enforce unique positive priorities while permitting inactive rows."""
+    """Drop legacy uniqueness while retaining positive priority validation."""
     databases = postgres_test_databases
     databases.upgrade("head")
     with databases.runtime_engine.begin() as connection:
@@ -165,13 +165,15 @@ def test_postgres_route_unique_constraint_allows_nulls_and_rejects_collisions(
                 "('three', 'tenant', 'openai', '{}', 'Three', NULL)"
             )
         )
-    with databases.runtime_engine.connect() as connection:
-        transaction = connection.begin()
+        connection.execute(
+            text("UPDATE provider_profiles SET route_priority = 1 WHERE id = 'two'")
+        )
         with pytest.raises(IntegrityError):
             connection.execute(
-                text("UPDATE provider_profiles SET route_priority = 1 WHERE id = 'two'")
+                text(
+                    "UPDATE provider_profiles SET route_priority = 0 WHERE id = 'three'"
+                )
             )
-        transaction.rollback()
 
 
 def test_concurrent_activations_use_tenant_lock_and_append_after_previous_commit(

@@ -12,6 +12,12 @@ from typing import Any, Mapping
 
 from .exceptions import ServiceConfigurationError
 from .models import parse_model_deployments
+from .providers.routing_config import (
+    ProfileRoutingSettings,
+    TenantRoutingSettings,
+    parse_profile_routing_settings,
+    parse_tenant_routing_settings,
+)
 
 AUTH_MODE_SINGLE = "single"
 AUTH_MODE_TENANT = "tenant"
@@ -55,9 +61,13 @@ class DatabaseTenantSnapshot:
     profile_name: str | None = None
     history_generation: int | None = None
     profile_deleted: bool = False
+    route_priority: int | None = None
     catalog_model_ids: tuple[str, ...] = ()
     catalog_pricing: Mapping[str, Mapping[str, str]] = field(default_factory=dict)
     catalog_refreshed_at: datetime | None = None
+    routing_settings: ProfileRoutingSettings = field(
+        default_factory=lambda: parse_profile_routing_settings({})
+    )
 
     @property
     def azure_base_url(self) -> str | None:
@@ -103,6 +113,9 @@ class DatabaseTenantRoutingSnapshot:
     custom_model_id: str
     profiles: tuple[DatabaseTenantSnapshot, ...]
     available_profiles: tuple[DatabaseTenantSnapshot, ...]
+    routing_settings: TenantRoutingSettings = field(
+        default_factory=parse_tenant_routing_settings
+    )
 
 
 def hash_api_key(api_key: str) -> str:

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import math
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -35,18 +36,92 @@ AIMD_LEASE_TTL = timedelta(seconds=90)
 MAX_POSTGRES_INTEGER = 2**31 - 1
 
 
-def _adjust_aimd_limit(current: int, *, outcome: str) -> int:
+def _capacity_score(
+    profile_active: int,
+    profile_limit: int,
+    model_active: int,
+    model_limit: int,
+    weight: float,
+    *,
+    budget_headroom: float = 1.0,
+    headroom_weight: float = 0.0,
+) -> float:
+    """Score the profile/model bottleneck and configured budget headroom."""
+    counts = (profile_active, profile_limit, model_active, model_limit)
+    if any(isinstance(value, bool) or not isinstance(value, int) for value in counts):
+        raise ValueError("AIMD capacity counts must be integers")
+    if profile_limit <= 0 or model_limit <= 0:
+        raise ValueError("AIMD capacity limits must be positive")
+    if not 0 <= profile_active <= profile_limit or not 0 <= model_active <= model_limit:
+        raise ValueError("AIMD active permits must fit within their capacity limits")
+    if (
+        isinstance(weight, bool)
+        or not isinstance(weight, (int, float))
+        or not math.isfinite(weight)
+        or weight <= 0
+    ):
+        raise ValueError("Load-balancing weight must be finite and positive")
+    if (
+        isinstance(budget_headroom, bool)
+        or not isinstance(budget_headroom, (int, float))
+        or not math.isfinite(budget_headroom)
+        or not 0 <= budget_headroom <= 1
+        or isinstance(headroom_weight, bool)
+        or not isinstance(headroom_weight, (int, float))
+        or not math.isfinite(headroom_weight)
+        or not 0 <= headroom_weight <= 1
+    ):
+        raise ValueError("Budget headroom inputs must be finite values between 0 and 1")
+    utilization = max(profile_active / profile_limit, model_active / model_limit)
+    budget_pressure = (1.0 - budget_headroom) * headroom_weight
+    return max(utilization, budget_pressure) / weight
+
+
+def _validate_aimd_bounds(
+    initial: int, minimum: int, maximum: int
+) -> tuple[int, int, int]:
+    """Validate one configured scope's initial and adaptive concurrency bounds."""
+    if any(
+        isinstance(value, bool) or not isinstance(value, int)
+        for value in (initial, minimum, maximum)
+    ):
+        raise ValueError("AIMD limits must be integers")
+    if (
+        not AIMD_MIN_CONCURRENCY
+        <= minimum
+        <= initial
+        <= maximum
+        <= AIMD_MAX_CONCURRENCY
+    ):
+        raise ValueError(
+            "AIMD limits must satisfy 1 <= minimum <= initial <= maximum <= 64"
+        )
+    return initial, minimum, maximum
+
+
+def _adjust_aimd_limit(
+    current: int,
+    *,
+    outcome: str,
+    minimum: int = AIMD_MIN_CONCURRENCY,
+    maximum: int = AIMD_MAX_CONCURRENCY,
+) -> int:
     """Apply additive increase or multiplicative decrease to one bounded limit."""
     if (
-        isinstance(current, bool)
+        isinstance(minimum, bool)
+        or not isinstance(minimum, int)
+        or isinstance(maximum, bool)
+        or not isinstance(maximum, int)
+        or not AIMD_MIN_CONCURRENCY <= minimum <= maximum <= AIMD_MAX_CONCURRENCY
+        or isinstance(current, bool)
         or not isinstance(current, int)
-        or not AIMD_MIN_CONCURRENCY <= current <= AIMD_MAX_CONCURRENCY
+        or not minimum <= current <= maximum
     ):
         raise ValueError("AIMD concurrency limit is outside its supported range")
     if outcome == "success":
-        return min(AIMD_MAX_CONCURRENCY, current + 1)
+        return min(maximum, current + 1)
     if outcome == "transient_failure":
-        return max(AIMD_MIN_CONCURRENCY, current // 2)
+        return max(minimum, current // 2)
     if outcome in {"terminal_failure", "released"}:
         return current
     raise ValueError("Unsupported AIMD outcome")
@@ -260,14 +335,50 @@ class BudgetLease:
 
 
 @dataclass(frozen=True)
+class ProviderConcurrencyPermit:
+    """Opaque token for one scope's persisted AIMD permit."""
+
+    id: str
+    state_id: int
+    token: str
+
+
+@dataclass(frozen=True)
 class ProviderConcurrencyLease:
-    """Opaque token for one durable provider concurrency permit."""
+    """Opaque tokens for all durable permits held by one provider request."""
 
     id: str
     state_id: int
     tenant_id: str
     provider: str
     token: str
+    additional_permits: tuple[ProviderConcurrencyPermit, ...] = ()
+
+    @property
+    def permits(self) -> tuple[ProviderConcurrencyPermit, ...]:
+        """Return all scope permits in deterministic state-lock order."""
+        return (
+            ProviderConcurrencyPermit(self.id, self.state_id, self.token),
+            *self.additional_permits,
+        )
+
+
+@dataclass(frozen=True)
+class ProviderConcurrencyCandidate:
+    """One routable candidate's profile/model bounds and scheduling weight."""
+
+    provider: str
+    profile_id: str
+    target_model: str | None
+    profile_initial_limit: int
+    profile_minimum_limit: int
+    profile_maximum_limit: int
+    model_initial_limit: int
+    model_minimum_limit: int
+    model_maximum_limit: int
+    weight: float = 1.0
+    budget_headroom: float = 1.0
+    headroom_weight: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -277,6 +388,8 @@ class ProviderConcurrencyDecision:
     allowed: bool
     lease: ProviderConcurrencyLease | None = None
     retry_at: datetime | None = None
+    capacity_score: float | None = None
+    profile_id: str | None = None
 
 
 @dataclass(frozen=True)
@@ -307,6 +420,56 @@ class ProviderBudgetScheduler:
         """Bind the PostgreSQL session factory and scope fingerprint cipher."""
         self._sessions = sessions
         self._cipher = cipher
+
+    def headroom(
+        self, request: ReservationRequest, *, now: datetime | None = None
+    ) -> float:
+        """Estimate the minimum remaining fraction across configured budget windows."""
+        if not isinstance(request, ReservationRequest):
+            raise ValueError("A typed provider budget request is required")
+        if not request.policies:
+            return 1.0
+        moment = _utc(now or datetime.now(timezone.utc))
+        try:
+            with self._sessions() as session:
+                _require_postgresql(session)
+                fingerprints = self._fingerprints(request.tenant_id, request.scopes)
+                fractions = []
+                for policy in request.policies:
+                    window_start = _window_start(moment, policy.window_seconds)
+                    window = session.scalar(
+                        select(ProviderBudgetWindow).where(
+                            ProviderBudgetWindow.provider == policy.scope.provider,
+                            ProviderBudgetWindow.scope_kind == policy.scope.kind.value,
+                            ProviderBudgetWindow.scope_fingerprint
+                            == fingerprints[policy.scope],
+                            ProviderBudgetWindow.metric == policy.metric.value,
+                            ProviderBudgetWindow.window_seconds
+                            == policy.window_seconds,
+                            ProviderBudgetWindow.window_start == window_start,
+                        )
+                    )
+                    if window is None:
+                        fractions.append(1.0)
+                        continue
+                    units = (
+                        1
+                        if policy.metric is BudgetMetric.REQUESTS
+                        else int(request.estimated_tokens or 0)
+                    )
+                    remaining = max(
+                        0,
+                        window.limit_units
+                        - window.used_units
+                        - window.reserved_units
+                        - units,
+                    )
+                    fractions.append(remaining / window.limit_units)
+                return min(fractions, default=1.0)
+        except SQLAlchemyError as exc:
+            raise ProviderSchedulerStoreError(
+                "Could not read provider budget headroom from PostgreSQL"
+            ) from exc
 
     def reserve(
         self, request: ReservationRequest, *, now: datetime | None = None
@@ -1036,6 +1199,8 @@ class ProviderConcurrencyController:
         *,
         initial_limit: int = AIMD_INITIAL_CONCURRENCY,
         lease_ttl: timedelta = AIMD_LEASE_TTL,
+        minimum_limit: int = AIMD_MIN_CONCURRENCY,
+        maximum_limit: int = AIMD_MAX_CONCURRENCY,
     ) -> None:
         """Bind PostgreSQL storage and bounded AIMD lease settings."""
         if not isinstance(cipher, SecretCipher):
@@ -1043,14 +1208,26 @@ class ProviderConcurrencyController:
         if (
             isinstance(initial_limit, bool)
             or not isinstance(initial_limit, int)
-            or not AIMD_MIN_CONCURRENCY <= initial_limit <= AIMD_MAX_CONCURRENCY
+            or isinstance(minimum_limit, bool)
+            or not isinstance(minimum_limit, int)
+            or isinstance(maximum_limit, bool)
+            or not isinstance(maximum_limit, int)
+            or not AIMD_MIN_CONCURRENCY
+            <= minimum_limit
+            <= initial_limit
+            <= maximum_limit
+            <= AIMD_MAX_CONCURRENCY
         ):
-            raise ValueError("initial_limit must be between 1 and 64")
+            raise ValueError(
+                "AIMD limits must satisfy 1 <= minimum <= initial <= maximum <= 64"
+            )
         if lease_ttl.total_seconds() <= 0:
             raise ValueError("lease_ttl must be positive")
         self._sessions = sessions
         self._cipher = cipher
         self._initial_limit = initial_limit
+        self._minimum_limit = minimum_limit
+        self._maximum_limit = maximum_limit
         self._lease_ttl = lease_ttl
 
     @property
@@ -1069,53 +1246,205 @@ class ProviderConcurrencyController:
         provider: str,
         profile_id: str,
         *,
+        target_model: str | None = None,
+        profile_initial_limit: int | None = None,
+        profile_minimum_limit: int | None = None,
+        profile_maximum_limit: int | None = None,
+        model_initial_limit: int | None = None,
+        model_minimum_limit: int | None = None,
+        model_maximum_limit: int | None = None,
         now: datetime | None = None,
     ) -> ProviderConcurrencyDecision:
-        """Atomically reserve capacity under a cross-worker PostgreSQL row lock."""
+        """Acquire profile and optional model capacity for one candidate."""
+        candidate = ProviderConcurrencyCandidate(
+            provider=provider,
+            profile_id=profile_id,
+            target_model=target_model,
+            profile_initial_limit=(
+                profile_initial_limit
+                if profile_initial_limit is not None
+                else self._initial_limit
+            ),
+            profile_minimum_limit=(
+                profile_minimum_limit
+                if profile_minimum_limit is not None
+                else self._minimum_limit
+            ),
+            profile_maximum_limit=(
+                profile_maximum_limit
+                if profile_maximum_limit is not None
+                else self._maximum_limit
+            ),
+            model_initial_limit=(
+                model_initial_limit
+                if model_initial_limit is not None
+                else self._initial_limit
+            ),
+            model_minimum_limit=(
+                model_minimum_limit
+                if model_minimum_limit is not None
+                else self._minimum_limit
+            ),
+            model_maximum_limit=(
+                model_maximum_limit
+                if model_maximum_limit is not None
+                else self._maximum_limit
+            ),
+        )
+        if target_model is None and any(
+            value is not None
+            for value in (model_initial_limit, model_minimum_limit, model_maximum_limit)
+        ):
+            raise ValueError("Model AIMD bounds require a target_model")
+        decision = self.acquire_best(tenant_id, (candidate,), now=now)
+        if target_model is None and decision.lease is not None:
+            return decision
+        return decision
+
+    def acquire_best(
+        self,
+        tenant_id: str,
+        candidates: tuple[ProviderConcurrencyCandidate, ...],
+        *,
+        now: datetime | None = None,
+    ) -> ProviderConcurrencyDecision:
+        """Lock a candidate group, score current utilization, and lease one winner."""
         if not isinstance(tenant_id, str) or not tenant_id.strip():
             raise ValueError("AIMD tenant identity must be non-empty")
-        scope = BudgetScope(provider, BudgetScopeKind.PROFILE, profile_id)
-        fingerprint = self._fingerprint(tenant_id, scope)
+        if not candidates or any(
+            not isinstance(candidate, ProviderConcurrencyCandidate)
+            for candidate in candidates
+        ):
+            raise ValueError("At least one typed AIMD candidate is required")
+        identities = [
+            (item.provider, item.profile_id, item.target_model) for item in candidates
+        ]
+        if len(set(identities)) != len(identities):
+            raise ValueError("AIMD candidate group contains duplicate identities")
+
+        candidate_scopes = {}
+        candidate_scope_roles = {}
+        bounds_by_scope = {}
+        for candidate in candidates:
+            if (
+                not isinstance(candidate.profile_id, str)
+                or not candidate.profile_id.strip()
+            ):
+                raise ValueError("AIMD profile identity must be non-empty")
+            profile_scope = BudgetScope(
+                candidate.provider, BudgetScopeKind.PROFILE, candidate.profile_id
+            )
+            model_scope = None
+            if candidate.target_model is not None:
+                if not candidate.target_model.strip():
+                    raise ValueError("AIMD target model must be non-empty")
+                model_scope = BudgetScope(
+                    candidate.provider,
+                    BudgetScopeKind.MODEL,
+                    json.dumps(
+                        [candidate.profile_id, candidate.target_model],
+                        ensure_ascii=False,
+                        separators=(",", ":"),
+                    ),
+                )
+            profile_bounds = _validate_aimd_bounds(
+                candidate.profile_initial_limit,
+                candidate.profile_minimum_limit,
+                candidate.profile_maximum_limit,
+            )
+            model_bounds = _validate_aimd_bounds(
+                candidate.model_initial_limit,
+                candidate.model_minimum_limit,
+                candidate.model_maximum_limit,
+            )
+            candidate_key = (
+                candidate.provider,
+                candidate.profile_id,
+                candidate.target_model,
+            )
+            candidate_scopes[candidate_key] = tuple(
+                sorted(
+                    (
+                        scope
+                        for scope in (profile_scope, model_scope)
+                        if scope is not None
+                    ),
+                    key=lambda scope: (
+                        scope.provider,
+                        scope.kind.value,
+                        scope.scope_id,
+                    ),
+                )
+            )
+            candidate_scope_roles[candidate_key] = (profile_scope, model_scope)
+            scoped_bounds = ((profile_scope, profile_bounds),)
+            if model_scope is not None:
+                scoped_bounds += ((model_scope, model_bounds),)
+            for scope, bounds in scoped_bounds:
+                existing = bounds_by_scope.setdefault(scope, bounds)
+                if existing != bounds:
+                    raise ValueError("AIMD bounds conflict for a shared scope")
+
+        ordered_scopes = sorted(
+            bounds_by_scope,
+            key=lambda scope: (scope.provider, scope.kind.value, scope.scope_id),
+        )
         moment = _utc(now or datetime.now(timezone.utc))
         try:
             with self._sessions.begin() as session:
                 _require_postgresql(session)
-                session.execute(
-                    postgresql_insert(ProviderConcurrencyState)
-                    .values(
-                        tenant_id=tenant_id,
-                        provider=provider,
-                        scope_fingerprint=fingerprint,
-                        concurrency_limit=self._initial_limit,
-                        updated_at=moment,
+                states_by_scope = {}
+                for scope in ordered_scopes:
+                    initial, minimum, maximum = bounds_by_scope[scope]
+                    fingerprint = self._fingerprint(tenant_id, scope)
+                    session.execute(
+                        postgresql_insert(ProviderConcurrencyState)
+                        .values(
+                            tenant_id=tenant_id,
+                            provider=scope.provider,
+                            scope_fingerprint=fingerprint,
+                            concurrency_limit=initial,
+                            minimum_limit=minimum,
+                            maximum_limit=maximum,
+                            updated_at=moment,
+                        )
+                        .on_conflict_do_nothing(constraint="uq_concurrency_scope")
                     )
-                    .on_conflict_do_nothing(constraint="uq_concurrency_scope")
-                )
-                state = session.scalar(
-                    select(ProviderConcurrencyState)
-                    .where(
-                        ProviderConcurrencyState.tenant_id == tenant_id,
-                        ProviderConcurrencyState.provider == provider,
-                        ProviderConcurrencyState.scope_fingerprint == fingerprint,
+                    state = session.scalar(
+                        select(ProviderConcurrencyState)
+                        .where(
+                            ProviderConcurrencyState.tenant_id == tenant_id,
+                            ProviderConcurrencyState.provider == scope.provider,
+                            ProviderConcurrencyState.scope_fingerprint == fingerprint,
+                        )
+                        .with_for_update()
                     )
-                    .with_for_update()
-                )
-                if state is None:
-                    raise ProviderSchedulerStoreError(
-                        "Could not create AIMD concurrency state"
+                    if state is None:
+                        raise ProviderSchedulerStoreError(
+                            "Could not create AIMD concurrency state"
+                        )
+                    state.minimum_limit = minimum
+                    state.maximum_limit = maximum
+                    state.concurrency_limit = min(
+                        maximum, max(minimum, state.concurrency_limit)
                     )
-                session.execute(
-                    update(ProviderConcurrencyLeaseRecord)
-                    .where(
-                        ProviderConcurrencyLeaseRecord.state_id == state.id,
-                        ProviderConcurrencyLeaseRecord.status == "active",
-                        ProviderConcurrencyLeaseRecord.expires_at <= moment,
+                    session.execute(
+                        update(ProviderConcurrencyLeaseRecord)
+                        .where(
+                            ProviderConcurrencyLeaseRecord.state_id == state.id,
+                            ProviderConcurrencyLeaseRecord.status == "active",
+                            ProviderConcurrencyLeaseRecord.expires_at <= moment,
+                        )
+                        .values(status="expired", completed_at=moment)
                     )
-                    .values(status="expired", completed_at=moment)
-                )
-                active_expiries = tuple(
-                    session.scalars(
-                        select(ProviderConcurrencyLeaseRecord.expires_at)
+                    states_by_scope[scope] = state
+
+                active_counts = {}
+                active_expiries = {}
+                for scope in ordered_scopes:
+                    state = states_by_scope[scope]
+                    active_rows = session.scalars(
+                        select(ProviderConcurrencyLeaseRecord)
                         .where(
                             ProviderConcurrencyLeaseRecord.state_id == state.id,
                             ProviderConcurrencyLeaseRecord.status == "active",
@@ -1123,29 +1452,103 @@ class ProviderConcurrencyController:
                         )
                         .order_by(ProviderConcurrencyLeaseRecord.expires_at)
                     ).all()
-                )
-                if len(active_expiries) >= state.concurrency_limit:
-                    return ProviderConcurrencyDecision(
-                        False, retry_at=min(active_expiries)
+                    active_counts[scope] = len(active_rows)
+                    active_expiries[scope] = tuple(
+                        row.expires_at for row in active_rows
                     )
-                lease_id = str(uuid4())
-                token = str(uuid4())
-                session.add(
-                    ProviderConcurrencyLeaseRecord(
-                        id=lease_id,
-                        state_id=state.id,
-                        lease_token=token,
-                        status="active",
-                        created_at=moment,
-                        expires_at=moment + self._lease_ttl,
+
+                eligible = []
+                blocked_expiries = []
+                for candidate in candidates:
+                    profile_scope, model_scope = candidate_scope_roles[
+                        (
+                            candidate.provider,
+                            candidate.profile_id,
+                            candidate.target_model,
+                        )
+                    ]
+                    profile_state = states_by_scope[profile_scope]
+                    profile_active = active_counts[profile_scope]
+                    model_state = (
+                        states_by_scope[model_scope]
+                        if model_scope is not None
+                        else None
                     )
+                    model_active = (
+                        active_counts[model_scope] if model_scope is not None else 0
+                    )
+                    if profile_active >= profile_state.concurrency_limit or (
+                        model_state is not None
+                        and model_active >= model_state.concurrency_limit
+                    ):
+                        profile_expiries = active_expiries[profile_scope]
+                        model_expiries = (
+                            active_expiries[model_scope]
+                            if model_scope is not None
+                            else ()
+                        )
+                        blocked_expiries.extend(
+                            expiry for expiry in (*profile_expiries, *model_expiries)
+                        )
+                        continue
+                    score = _capacity_score(
+                        profile_active,
+                        profile_state.concurrency_limit,
+                        model_active,
+                        model_state.concurrency_limit if model_state is not None else 1,
+                        candidate.weight,
+                        budget_headroom=candidate.budget_headroom,
+                        headroom_weight=candidate.headroom_weight,
+                    )
+                    eligible.append((score, candidate.profile_id, candidate))
+
+                if not eligible:
+                    retry_at = min(blocked_expiries) if blocked_expiries else None
+                    return ProviderConcurrencyDecision(False, retry_at=retry_at)
+
+                score, _profile_id, winner = min(
+                    eligible,
+                    key=lambda item: (
+                        item[0],
+                        item[1],
+                        item[2].target_model or "",
+                    ),
                 )
+                permits = []
+                winner_scopes = candidate_scopes[
+                    (winner.provider, winner.profile_id, winner.target_model)
+                ]
+                for scope in winner_scopes:
+                    state = states_by_scope[scope]
+                    permit_id = str(uuid4())
+                    token = str(uuid4())
+                    session.add(
+                        ProviderConcurrencyLeaseRecord(
+                            id=permit_id,
+                            state_id=state.id,
+                            lease_token=token,
+                            status="active",
+                            created_at=moment,
+                            expires_at=moment + self._lease_ttl,
+                        )
+                    )
+                    permits.append(
+                        ProviderConcurrencyPermit(permit_id, state.id, token)
+                    )
                 session.flush()
+                primary, *additional = permits
                 return ProviderConcurrencyDecision(
                     True,
                     ProviderConcurrencyLease(
-                        lease_id, state.id, tenant_id, provider, token
+                        primary.id,
+                        primary.state_id,
+                        tenant_id,
+                        winner.provider,
+                        primary.token,
+                        tuple(additional),
                     ),
+                    capacity_score=score,
+                    profile_id=winner.profile_id,
                 )
         except SQLAlchemyError as exc:
             raise ProviderSchedulerStoreError(
@@ -1155,36 +1558,22 @@ class ProviderConcurrencyController:
     def renew(
         self, lease: ProviderConcurrencyLease, *, now: datetime | None = None
     ) -> bool:
-        """Extend a still-live permit without reviving expired or settled work."""
+        """Renew every scope permit together or reject the whole lease."""
         moment = _utc(now or datetime.now(timezone.utc))
         try:
             with self._sessions.begin() as session:
                 _require_postgresql(session)
-                state = session.scalar(
-                    select(ProviderConcurrencyState)
-                    .where(
-                        ProviderConcurrencyState.id == lease.state_id,
-                        ProviderConcurrencyState.tenant_id == lease.tenant_id,
-                        ProviderConcurrencyState.provider == lease.provider,
-                    )
-                    .with_for_update()
-                )
-                if state is None:
+                states = self._lock_lease_states(session, lease)
+                if len(states) != len(lease.permits):
                     return False
-                record = session.scalar(
-                    select(ProviderConcurrencyLeaseRecord)
-                    .where(
-                        ProviderConcurrencyLeaseRecord.id == lease.id,
-                        ProviderConcurrencyLeaseRecord.state_id == lease.state_id,
-                        ProviderConcurrencyLeaseRecord.lease_token == lease.token,
-                        ProviderConcurrencyLeaseRecord.status == "active",
-                        ProviderConcurrencyLeaseRecord.expires_at > moment,
-                    )
-                    .with_for_update()
-                )
-                if record is None:
+                records = self._lock_lease_records(session, lease)
+                if len(records) != len(lease.permits) or any(
+                    record.status != "active" or record.expires_at <= moment
+                    for record in records
+                ):
                     return False
-                record.expires_at = moment + self._lease_ttl
+                for record in records:
+                    record.expires_at = moment + self._lease_ttl
                 return True
         except SQLAlchemyError as exc:
             raise ProviderSchedulerStoreError(
@@ -1198,7 +1587,7 @@ class ProviderConcurrencyController:
         outcome: str,
         now: datetime | None = None,
     ) -> bool:
-        """Release one permit and update the bound from its classified outcome."""
+        """Settle all scope permits and update each independent AIMD bound."""
         if outcome not in {
             "success",
             "transient_failure",
@@ -1210,44 +1599,83 @@ class ProviderConcurrencyController:
         try:
             with self._sessions.begin() as session:
                 _require_postgresql(session)
-                state = session.scalar(
-                    select(ProviderConcurrencyState)
-                    .where(
-                        ProviderConcurrencyState.id == lease.state_id,
-                        ProviderConcurrencyState.tenant_id == lease.tenant_id,
-                        ProviderConcurrencyState.provider == lease.provider,
-                    )
-                    .with_for_update()
-                )
-                if state is None:
+                states = self._lock_lease_states(session, lease)
+                if len(states) != len(lease.permits):
                     return False
-                record = session.scalar(
-                    select(ProviderConcurrencyLeaseRecord)
-                    .where(
-                        ProviderConcurrencyLeaseRecord.id == lease.id,
-                        ProviderConcurrencyLeaseRecord.state_id == lease.state_id,
-                        ProviderConcurrencyLeaseRecord.lease_token == lease.token,
-                        ProviderConcurrencyLeaseRecord.status == "active",
-                    )
-                    .with_for_update()
-                )
-                if record is None:
+                records = self._lock_lease_records(session, lease)
+                if len(records) != len(lease.permits):
+                    for record in records:
+                        if record.status == "active":
+                            record.status = "released"
+                            record.completed_at = moment
                     return False
-                if record.expires_at <= moment:
-                    record.status = "expired"
+                if any(record.status != "active" for record in records):
+                    for record in records:
+                        if record.status == "active":
+                            record.status = "released"
+                            record.completed_at = moment
+                    return False
+                if any(record.expires_at <= moment for record in records):
+                    for record in records:
+                        if record.expires_at <= moment:
+                            record.status = "expired"
+                            record.completed_at = moment
+                    return False
+                for state, record in zip(states, records):
+                    record.status = "released" if outcome == "released" else "completed"
                     record.completed_at = moment
-                    return False
-                record.status = "released" if outcome == "released" else "completed"
-                record.completed_at = moment
-                state.concurrency_limit = _adjust_aimd_limit(
-                    state.concurrency_limit, outcome=outcome
-                )
-                state.updated_at = moment
+                    state.concurrency_limit = _adjust_aimd_limit(
+                        state.concurrency_limit,
+                        outcome=outcome,
+                        minimum=state.minimum_limit,
+                        maximum=state.maximum_limit,
+                    )
+                    state.updated_at = moment
                 return True
         except SQLAlchemyError as exc:
             raise ProviderSchedulerStoreError(
                 "Could not settle AIMD provider concurrency lease"
             ) from exc
+
+    def _lock_lease_states(
+        self, session: Session, lease: ProviderConcurrencyLease
+    ) -> list[ProviderConcurrencyState]:
+        """Lock all lease scope states in ascending primary-key order."""
+        permits = lease.permits
+        states = []
+        for permit in permits:
+            state = session.scalar(
+                select(ProviderConcurrencyState)
+                .where(
+                    ProviderConcurrencyState.id == permit.state_id,
+                    ProviderConcurrencyState.tenant_id == lease.tenant_id,
+                    ProviderConcurrencyState.provider == lease.provider,
+                )
+                .with_for_update()
+            )
+            if state is not None:
+                states.append(state)
+        return states
+
+    def _lock_lease_records(
+        self,
+        session: Session,
+        lease: ProviderConcurrencyLease,
+    ) -> list[ProviderConcurrencyLeaseRecord]:
+        """Lock every permit row in the same deterministic state order."""
+        permits = lease.permits
+        records = []
+        for permit in permits:
+            statement = select(ProviderConcurrencyLeaseRecord).where(
+                ProviderConcurrencyLeaseRecord.id == permit.id,
+                ProviderConcurrencyLeaseRecord.state_id == permit.state_id,
+                ProviderConcurrencyLeaseRecord.lease_token == permit.token,
+                ProviderConcurrencyLeaseRecord.status == "active",
+            )
+            record = session.scalar(statement.with_for_update())
+            if record is not None:
+                records.append(record)
+        return records
 
     def cleanup(
         self,

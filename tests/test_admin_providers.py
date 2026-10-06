@@ -742,6 +742,85 @@ def test_azure_profile_editor_exposes_opt_in_and_persists_it(admin_app):
         assert saved_profile.settings["resume_streams"] is True
 
 
+def test_profile_update_rejects_model_capacity_for_unknown_catalog_model(admin_app):
+    """Reject model concurrency limits that do not match this profile catalog."""
+    database = admin_app.extensions["database"]
+    with database.sessions.begin() as session:
+        profile = create_provider_profile(
+            session,
+            database.secret_cipher,
+            "acme",
+            "openai",
+            "Catalog-bound routing",
+            {},
+            "gpt-5.4",
+            "sk-secret",
+            "ada",
+        )
+        replace_catalog_entries(session, profile, [("gpt-5.4", None)], None)
+        with pytest.raises(ValueError, match="outside the profile catalog"):
+            update_provider_profile(
+                session,
+                database.secret_cipher,
+                "acme",
+                profile.id,
+                profile.display_name,
+                {
+                    "routing": {
+                        "model_concurrency": {
+                            "removed-model": {"initial": 2, "min": 1, "max": 4}
+                        }
+                    }
+                },
+                profile.default_model,
+                None,
+                "ada",
+            )
+    database.engine.dispose()
+
+
+def test_profile_edit_round_trips_routing_and_capacity_configuration(admin_app):
+    """Profile editor validates and persists cost, weight, and AIMD settings."""
+    database = admin_app.extensions["database"]
+    routing = {
+        "cost_tier": 2,
+        "load_balancing_weight": 1.5,
+        "profile_concurrency": {"initial": 6, "min": 2, "max": 20},
+        "model_concurrency": {"gpt-5.4": {"initial": 3, "min": 1, "max": 8}},
+    }
+    with database.sessions.begin() as session:
+        profile = create_provider_profile(
+            session,
+            database.secret_cipher,
+            "acme",
+            "openai",
+            "Routing profile",
+            {"routing": routing},
+            "gpt-5.4",
+            "sk-secret",
+            "ada",
+        )
+        profile_id = profile.id
+
+    with database.sessions() as session:
+        profile = session.get(ProviderProfile, profile_id)
+        form = _profile_form(profile, ())
+        assert json.loads(form.routing.data) == routing
+        form.provider.data = "openai"
+        settings = _provider_settings(form)
+    assert settings["routing"] == routing
+
+    invalid = ProviderProfileForm(
+        provider="openai",
+        display_name="Invalid routing profile",
+        default_model="gpt-5.4",
+        routing='{"load_balancing_weight": 0}',
+    )
+    assert not invalid.validate()
+    assert "routing" in invalid.errors
+    database.engine.dispose()
+
+
 def test_profile_edit_round_trips_scheduler_configuration(admin_app):
     """Existing scheduler settings render as editable values without loss."""
     database = admin_app.extensions["database"]

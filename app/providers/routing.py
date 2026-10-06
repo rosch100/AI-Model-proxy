@@ -4,10 +4,10 @@ from __future__ import annotations
 
 import json
 import math
-from collections import deque
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+from decimal import Decimal, InvalidOperation
 from random import SystemRandom
 from threading import Event, Lock, Thread
 from time import monotonic
@@ -34,6 +34,7 @@ from app.persistence.provider_scheduler import (
     BudgetScope,
     BudgetScopeKind,
     ProviderBudgetScheduler,
+    ProviderConcurrencyCandidate,
     ProviderConcurrencyController,
     ProviderConcurrencyLease,
     ProviderSchedulerPolicyConflict,
@@ -49,7 +50,7 @@ from app.providers.model_ids import account_model_id, qualified_model_id
 from app.providers.openai_compat import forward_openai_compatible
 from app.tenants import DatabaseTenantRoutingSnapshot, DatabaseTenantSnapshot
 
-MAX_TRANSIENT_RETRY_WAIT_SECONDS = 30.0
+MAX_TRANSIENT_RETRY_WAIT_SECONDS = 300.0
 DEFAULT_TRANSIENT_RETRY_DELAY_SECONDS = 1.0
 RETRY_COOLDOWN_GRACE_SECONDS = 0.05
 
@@ -270,6 +271,97 @@ class RouteReservationResult:
     response: Response | None = None
 
 
+@dataclass(frozen=True)
+class RouteCandidate:
+    """Validated settings needed to compare and attempt one route target."""
+
+    profile: DatabaseTenantSnapshot
+    target_model: str
+    scheduler: SchedulerCandidate
+    budget_headroom: float = 1.0
+
+
+def _route_candidate_groups(
+    route_targets: tuple[tuple[DatabaseTenantSnapshot, str], ...],
+    snapshot: DatabaseTenantRoutingSnapshot,
+) -> tuple[tuple[tuple[DatabaseTenantSnapshot, str], ...], ...]:
+    """Group candidates by priority and applicable cost policy, stably."""
+    priority_groups: dict[int, list[tuple[DatabaseTenantSnapshot, str]]] = {}
+    for profile, model in route_targets:
+        priority = (
+            profile.route_priority if profile.route_priority is not None else 2**31
+        )
+        priority_groups.setdefault(priority, []).append((profile, model))
+
+    groups = []
+    for priority in sorted(priority_groups):
+        candidates = sorted(
+            priority_groups[priority], key=lambda target: target[0].profile_id or ""
+        )
+        policy = snapshot.routing_settings.cost_policy
+        if policy == "ignore":
+            groups.append(tuple(candidates))
+            continue
+        if policy == "cost_tiers":
+            by_tier: dict[int, list[tuple[DatabaseTenantSnapshot, str]]] = {}
+            for candidate in candidates:
+                by_tier.setdefault(candidate[0].routing_settings.cost_tier, []).append(
+                    candidate
+                )
+            groups.extend(tuple(by_tier[tier]) for tier in sorted(by_tier))
+            continue
+
+        comparable = _comparable_cost_groups(candidates)
+        groups.extend(comparable)
+    return tuple(groups)
+
+
+def _comparable_cost_groups(
+    candidates: list[tuple[DatabaseTenantSnapshot, str]],
+) -> tuple[tuple[tuple[DatabaseTenantSnapshot, str], ...], ...]:
+    """Sort complete same-model, same-currency prices; never infer unknown cost."""
+    if len({model for _profile, model in candidates}) > 1:
+        return (tuple(candidates),)
+
+    pricing_fields = (
+        "input_per_1m_tokens",
+        "output_per_1m_tokens",
+        "cache_per_1m_tokens",
+        "currency",
+    )
+    fully_priced = [
+        (profile, model, profile.catalog_pricing[model])
+        for profile, model in candidates
+        if model in profile.catalog_pricing
+        and all(key in profile.catalog_pricing[model] for key in pricing_fields)
+    ]
+    currencies = {price["currency"] for _profile, _model, price in fully_priced}
+    if len(currencies) != 1 or len(fully_priced) != len(candidates):
+        return (tuple(candidates),)
+
+    def total_price(
+        item: tuple[DatabaseTenantSnapshot, str, Mapping[str, str]],
+    ) -> Decimal:
+        values = [Decimal(item[2][key]) for key in pricing_fields[:-1]]
+        if any(not value.is_finite() or value < 0 for value in values):
+            raise InvalidOperation
+        return sum(values)
+
+    try:
+        ranked = sorted(
+            fully_priced,
+            key=lambda item: (total_price(item), item[0].profile_id or ""),
+        )
+        by_cost: dict[Decimal, list[tuple[DatabaseTenantSnapshot, str]]] = {}
+        for profile, model, price in ranked:
+            by_cost.setdefault(total_price((profile, model, price)), []).append(
+                (profile, model)
+            )
+    except (InvalidOperation, ValueError):
+        return (tuple(candidates),)
+    return tuple(tuple(by_cost[cost]) for cost in sorted(by_cost))
+
+
 def _forward_azure(
     req: Request,
     profile: DatabaseTenantSnapshot,
@@ -333,7 +425,7 @@ def catalog_profiles(
 def _eligible_profiles(
     profiles: tuple[DatabaseTenantSnapshot, ...], *, azure_only: bool
 ) -> tuple[DatabaseTenantSnapshot, ...]:
-    """Apply provider switches without borrowing global credentials."""
+    """Apply provider switches while preserving the database snapshot order."""
     return tuple(
         profile
         for profile in profiles
@@ -618,6 +710,18 @@ def _scheduler_failure_handler(
     return persist
 
 
+def _reservation_request(
+    snapshot: DatabaseTenantRoutingSnapshot, candidate: SchedulerCandidate
+) -> ReservationRequest:
+    """Bind one validated candidate's budgets to its authenticated tenant."""
+    return ReservationRequest(
+        tenant_id=snapshot.id,
+        policies=candidate.policies,
+        estimated_tokens=candidate.token_estimate,
+        cooldown_scopes=candidate.cooldown_scopes,
+    )
+
+
 def _budget_attempt(
     scheduler: ProviderBudgetScheduler,
     snapshot: DatabaseTenantRoutingSnapshot,
@@ -625,12 +729,7 @@ def _budget_attempt(
     concurrency_attempt: ProviderConcurrencyAttempt | None,
 ) -> ProviderBudgetAttempt:
     """Check durable cooldowns and reserve explicit budgets before upstream I/O."""
-    request = ReservationRequest(
-        tenant_id=snapshot.id,
-        policies=candidate.policies,
-        estimated_tokens=candidate.token_estimate,
-        cooldown_scopes=candidate.cooldown_scopes,
-    )
+    request = _reservation_request(snapshot, candidate)
     decision = scheduler.reserve(request)
     if not decision.allowed:
         raise BudgetUnavailableError(decision.retry_at)
@@ -741,6 +840,17 @@ def _acquire_route_permit(
         return None
     if not permit.allowed:
         state.record_blocked(permit.retry_at, lease_blocked=permit.lease_blocked)
+        current_app.logger.info(
+            "Provider route candidate skipped: request_id=%s tenant=%s "
+            "provider=%s profile=%s model=%s fallback_reason=%s retry_at=%s",
+            getattr(g, "proxy_request_id", "unavailable"),
+            snapshot.id,
+            profile.provider,
+            profile.profile_id,
+            target_model,
+            ("probe_lease_contention" if permit.lease_blocked else "circuit_cooldown"),
+            (permit.retry_at.isoformat() if permit.retry_at is not None else "unknown"),
+        )
         if permit.lease_blocked:
             if not is_retry and permit.retry_at is not None:
                 lease_remaining = max(
@@ -755,9 +865,12 @@ def _acquire_route_permit(
 
 
 def _transient_retry_delay(
-    error: UpstreamError, is_retry: bool, retry_count: int
+    error: UpstreamError,
+    is_retry: bool,
+    retry_count: int,
+    max_retry_wait_seconds: int = int(MAX_TRANSIENT_RETRY_WAIT_SECONDS),
 ) -> float | None:
-    """Calculate one bounded same-candidate retry delay, if policy allows it."""
+    """Calculate a same-candidate delay bounded by validated routing policy."""
     retry_after = error.classification.retry_after_seconds
     if (
         error.classification.category != "transient"
@@ -766,17 +879,15 @@ def _transient_retry_delay(
     ):
         return None
     if retry_after is not None:
-        if retry_after > MAX_TRANSIENT_RETRY_WAIT_SECONDS:
+        if retry_after > max_retry_wait_seconds:
             return None
         delay = retry_after
     else:
         max_exponent = math.ceil(
-            math.log2(
-                MAX_TRANSIENT_RETRY_WAIT_SECONDS / DEFAULT_TRANSIENT_RETRY_DELAY_SECONDS
-            )
+            math.log2(max_retry_wait_seconds / DEFAULT_TRANSIENT_RETRY_DELAY_SECONDS)
         )
         ceiling = min(
-            MAX_TRANSIENT_RETRY_WAIT_SECONDS,
+            max_retry_wait_seconds,
             DEFAULT_TRANSIENT_RETRY_DELAY_SECONDS
             * (2 ** min(retry_count, max_exponent)),
         )
@@ -814,7 +925,8 @@ def _log_provider_failure(
         "provider=%s status=%s retryable=%s error_code=%s "
         "error_category=%s provider_error_code=%s provider_error_type=%s "
         "provider_error_param=%s provider_limit_source=%s "
-        "provider_request_id=%s provider_diagnostics=%s",
+        "provider_request_id=%s provider_diagnostics=%s routing_strategy=%s "
+        "route_priority=%s cost_tier=%s fallback_reason=%s provider_429=%s",
         getattr(g, "proxy_request_id", "unavailable"),
         snapshot.id,
         profile.profile_id,
@@ -829,6 +941,15 @@ def _log_provider_failure(
         error.provider_limit_source or "unknown",
         error.provider_request_id or "unknown",
         json.dumps(error.provider_diagnostics, sort_keys=True, ensure_ascii=False),
+        snapshot.routing_settings.strategy,
+        profile.route_priority if profile.route_priority is not None else "unset",
+        profile.routing_settings.cost_tier,
+        (
+            "provider_transient_failure"
+            if error.classification.category == "transient"
+            else "provider_failure"
+        ),
+        error.status == 429,
     )
 
 
@@ -882,7 +1003,12 @@ def _record_provider_failure(
         failure_details=_provider_failure_details(error),
     )
     state.record_error(error)
-    retry_delay = _transient_retry_delay(error, is_retry, state.retry_count)
+    retry_delay = _transient_retry_delay(
+        error,
+        is_retry,
+        state.retry_count,
+        snapshot.routing_settings.max_retry_wait_seconds,
+    )
     retry_at = None
     try:
         if budget_attempt is not None:
@@ -957,15 +1083,42 @@ def _acquire_route_reservations(
     state: RouteAttemptState,
     retry_targets: list,
     deadline: float,
+    pre_acquired_concurrency: ProviderConcurrencyAttempt | None = None,
 ) -> RouteReservationResult:
     """Acquire concurrency and budget leases before any provider network request."""
-    concurrency_attempt = None
-    if concurrency_controller is not None:
+    concurrency_attempt = pre_acquired_concurrency
+    if concurrency_controller is not None and concurrency_attempt is None:
         try:
+            profile_bounds = profile.routing_settings.profile_concurrency
+            model_bounds = profile.routing_settings.concurrency_for_model(target_model)
             decision = concurrency_controller.acquire(
-                snapshot.id, profile.provider, profile.profile_id
+                snapshot.id,
+                profile.provider,
+                profile.profile_id,
+                target_model=target_model,
+                profile_initial_limit=profile_bounds.initial,
+                profile_minimum_limit=profile_bounds.minimum,
+                profile_maximum_limit=profile_bounds.maximum,
+                model_initial_limit=model_bounds.initial,
+                model_minimum_limit=model_bounds.minimum,
+                model_maximum_limit=model_bounds.maximum,
             )
             if not decision.allowed:
+                current_app.logger.info(
+                    "Provider route candidate skipped: request_id=%s tenant=%s "
+                    "provider=%s profile=%s model=%s fallback_reason=concurrency_limit "
+                    "retry_at=%s",
+                    getattr(g, "proxy_request_id", "unavailable"),
+                    snapshot.id,
+                    profile.provider,
+                    profile.profile_id,
+                    target_model,
+                    (
+                        decision.retry_at.isoformat()
+                        if decision.retry_at is not None
+                        else "unknown"
+                    ),
+                )
                 if decision.retry_at is not None:
                     state.concurrency_blocked_until.append(decision.retry_at)
                 _queue_scheduler_retry(
@@ -1008,6 +1161,17 @@ def _acquire_route_reservations(
             scheduler, snapshot, candidate, concurrency_attempt
         )
     except BudgetUnavailableError as blocked:
+        current_app.logger.info(
+            "Provider route candidate skipped: request_id=%s tenant=%s "
+            "provider=%s profile=%s model=%s fallback_reason=budget_exhausted "
+            "retry_at=%s",
+            getattr(g, "proxy_request_id", "unavailable"),
+            snapshot.id,
+            profile.provider,
+            profile.profile_id,
+            target_model,
+            blocked.retry_at.isoformat() if blocked.retry_at is not None else "unknown",
+        )
         if blocked.retry_at is not None:
             state.budget_blocked_until.append(blocked.retry_at)
         _queue_scheduler_retry(
@@ -1156,10 +1320,12 @@ def _attempt_route_target(
     state: RouteAttemptState,
     retry_targets: list,
     deadline: float,
+    prevalidated_candidate: SchedulerCandidate | None = None,
+    pre_acquired_concurrency: ProviderConcurrencyAttempt | None = None,
 ) -> Response | None:
     """Run one candidate after validation, availability, and capacity checks."""
     try:
-        candidate = _scheduler_candidate(
+        candidate = prevalidated_candidate or _scheduler_candidate(
             snapshot, profile, target_model, req.get_json(silent=True) or {}
         )
     except ServiceConfigurationError as exc:
@@ -1186,6 +1352,8 @@ def _attempt_route_target(
         deadline,
     )
     if permit is None:
+        if pre_acquired_concurrency is not None:
+            pre_acquired_concurrency.release()
         return None
     circuit_attempt = (
         ProviderCircuitAttempt(
@@ -1211,6 +1379,7 @@ def _attempt_route_target(
         state,
         retry_targets,
         deadline,
+        pre_acquired_concurrency=pre_acquired_concurrency,
     )
     if reservations.response is not None:
         return reservations.response
@@ -1329,7 +1498,7 @@ def _retry_route_target(
 def forward_tenant_route(
     req: Request, snapshot: DatabaseTenantRoutingSnapshot, *, azure_only: bool = False
 ) -> Response:
-    """Try each configured candidate, then eligible bounded transient retries."""
+    """Try priority/cost tiers, then eligible bounded transient retries."""
     route_profiles = routed_profiles(snapshot, azure_only=azure_only)
     catalog_candidates = catalog_profiles(snapshot, azure_only=azure_only)
     payload = req.get_json(silent=True)
@@ -1345,7 +1514,7 @@ def forward_tenant_route(
         catalog_candidates,
         azure_only=azure_only,
     )
-    attempts = deque((profile, model, False, 0.0) for profile, model in route_targets)
+    candidate_groups = _route_candidate_groups(route_targets, snapshot)
     database = current_app.extensions.get("database")
     if not isinstance(database, Database):
         return _service_unavailable(
@@ -1362,16 +1531,251 @@ def forward_tenant_route(
     )
     state = RouteAttemptState(blocked_until=[])
     retry_targets = []
-    deadline = monotonic() + MAX_TRANSIENT_RETRY_WAIT_SECONDS
-    while attempts or retry_targets:
-        if not attempts:
-            attempts.extend(sorted(retry_targets, key=lambda target: target[3]))
-            retry_targets.clear()
-        profile, target_model, is_retry, _ = attempts.popleft()
-        if is_retry and not _retry_route_target(
-            (profile, target_model, is_retry, _), deadline
-        ):
+    deadline = monotonic() + min(
+        MAX_TRANSIENT_RETRY_WAIT_SECONDS,
+        snapshot.routing_settings.max_retry_wait_seconds,
+    )
+    for group_index, route_group in enumerate(candidate_groups):
+        remaining = list(route_group)
+        while remaining:
+            validated = []
+            for profile, target_model in remaining:
+                try:
+                    candidate = _scheduler_candidate(
+                        snapshot, profile, target_model, payload
+                    )
+                except ServiceConfigurationError as exc:
+                    state.candidate_configuration_errors.append(
+                        (profile.profile_id or "unknown", str(exc))
+                    )
+                    current_app.logger.warning(
+                        "Skipping provider candidate with invalid scheduler configuration: "
+                        "tenant=%s profile=%s reason=%s",
+                        snapshot.id,
+                        profile.profile_id or "unknown",
+                        str(exc),
+                    )
+                    continue
+                budget_headroom = 1.0
+                if scheduler is not None and candidate.policies:
+                    try:
+                        budget_headroom = scheduler.headroom(
+                            _reservation_request(snapshot, candidate)
+                        )
+                    except ProviderSchedulerStoreError:
+                        state.scheduler_state_unavailable = True
+                        current_app.logger.exception(
+                            "Provider budget headroom unavailable for profile=%s",
+                            profile.profile_id,
+                        )
+                        return _service_unavailable(
+                            "provider_scheduler_unavailable",
+                            "Provider budget state could not be verified; retry shortly.",
+                            "30",
+                        )
+                validated.append(
+                    RouteCandidate(profile, target_model, candidate, budget_headroom)
+                )
+            remaining.clear()
+            if not validated:
+                break
+
+            selected = validated[0]
+            pre_acquired = None
+            capacity_score = None
+            if (
+                snapshot.routing_settings.strategy == "load_balanced"
+                and len(validated) > 1
+            ):
+                if concurrency_controller is None:
+                    selected_group = sorted(
+                        validated, key=lambda item: item.profile.profile_id or ""
+                    )
+                    selected = selected_group[0]
+                    remaining.extend(
+                        (item.profile, item.target_model) for item in selected_group[1:]
+                    )
+                else:
+                    concurrency_candidates = tuple(
+                        ProviderConcurrencyCandidate(
+                            provider=item.profile.provider,
+                            profile_id=item.profile.profile_id,
+                            target_model=item.target_model,
+                            profile_initial_limit=item.profile.routing_settings.profile_concurrency.initial,
+                            profile_minimum_limit=item.profile.routing_settings.profile_concurrency.minimum,
+                            profile_maximum_limit=item.profile.routing_settings.profile_concurrency.maximum,
+                            model_initial_limit=(
+                                item.profile.routing_settings.concurrency_for_model(
+                                    item.target_model
+                                ).initial
+                            ),
+                            model_minimum_limit=(
+                                item.profile.routing_settings.concurrency_for_model(
+                                    item.target_model
+                                ).minimum
+                            ),
+                            model_maximum_limit=(
+                                item.profile.routing_settings.concurrency_for_model(
+                                    item.target_model
+                                ).maximum
+                            ),
+                            weight=item.profile.routing_settings.load_balancing_weight,
+                            budget_headroom=item.budget_headroom,
+                            headroom_weight=snapshot.routing_settings.headroom_weight,
+                        )
+                        for item in validated
+                    )
+                    try:
+                        decision = concurrency_controller.acquire_best(
+                            snapshot.id, concurrency_candidates
+                        )
+                    except ProviderSchedulerStoreError:
+                        state.scheduler_state_unavailable = True
+                        current_app.logger.exception(
+                            "Provider AIMD controller unavailable for tenant=%s",
+                            snapshot.id,
+                        )
+                        return _service_unavailable(
+                            "provider_scheduler_unavailable",
+                            "Provider concurrency state could not be verified; retry shortly.",
+                            "30",
+                        )
+                    if not decision.allowed:
+                        if decision.retry_at is not None:
+                            state.concurrency_blocked_until.append(decision.retry_at)
+                        for item in validated:
+                            _queue_scheduler_retry(
+                                decision.retry_at,
+                                item.profile,
+                                item.target_model,
+                                False,
+                                retry_targets,
+                                deadline,
+                            )
+                        break
+                    selected = next(
+                        item
+                        for item in validated
+                        if item.profile.profile_id == decision.profile_id
+                    )
+                    if decision.lease is None:
+                        raise ProviderSchedulerStoreError(
+                            "AIMD group selection allowed a request without issuing a lease"
+                        )
+                    pre_acquired = ProviderConcurrencyAttempt(
+                        concurrency_controller, decision.lease
+                    )
+                    capacity_score = decision.capacity_score
+                    remaining.extend(
+                        (item.profile, item.target_model)
+                        for item in validated
+                        if item is not selected
+                    )
+            else:
+                remaining.extend(
+                    (item.profile, item.target_model) for item in validated[1:]
+                )
+
+            profile = selected.profile
+            target_model = selected.target_model
+            permit = _acquire_route_permit(
+                snapshot,
+                profile,
+                target_model,
+                False,
+                breaker_store,
+                state,
+                retry_targets,
+                deadline,
+            )
+            if permit is None:
+                if pre_acquired is not None:
+                    pre_acquired.release()
+                continue
+            circuit_attempt = (
+                ProviderCircuitAttempt(
+                    breaker_store,
+                    permit,
+                    snapshot.id,
+                    profile.provider,
+                    profile.profile_id,
+                    profile.provider_settings,
+                )
+                if breaker_store is not None
+                else None
+            )
+            reservations = _acquire_route_reservations(
+                snapshot,
+                profile,
+                target_model,
+                False,
+                selected.scheduler,
+                scheduler,
+                concurrency_controller,
+                circuit_attempt,
+                state,
+                retry_targets,
+                deadline,
+                pre_acquired_concurrency=pre_acquired,
+            )
+            if reservations.response is not None:
+                return reservations.response
+            if reservations.skip_candidate:
+                remaining = [
+                    target for target in remaining if target != (profile, target_model)
+                ]
+                continue
+            current_app.logger.info(
+                "Provider route candidate selected: request_id=%s tenant=%s "
+                "provider=%s profile=%s model=%s routing_strategy=%s "
+                "route_priority=%s cost_policy=%s cost_tier=%s weight=%s "
+                "budget_headroom=%s capacity_score=%s fallback=%s",
+                getattr(g, "proxy_request_id", "unavailable"),
+                snapshot.id,
+                profile.provider,
+                profile.profile_id,
+                target_model,
+                snapshot.routing_settings.strategy,
+                (
+                    profile.route_priority
+                    if profile.route_priority is not None
+                    else "unset"
+                ),
+                snapshot.routing_settings.cost_policy,
+                profile.routing_settings.cost_tier,
+                profile.routing_settings.load_balancing_weight,
+                selected.budget_headroom,
+                capacity_score if capacity_score is not None else "unmeasured",
+                group_index > 0 or state.attempts_started > 0,
+            )
+            attempt_id = start_provider_attempt(
+                tenant_id=snapshot.id,
+                provider=profile.provider,
+                profile_id=profile.profile_id,
+                inbound_model=inbound_model,
+                routed_model=target_model,
+            )
+            state.attempts_started += 1
+            response = _forward_route_attempt(
+                req,
+                snapshot,
+                profile,
+                target_model,
+                attempt_id,
+                circuit_attempt,
+                reservations,
+                state,
+                False,
+                retry_targets,
+                deadline,
+            )
+            if response is not None:
+                return response
+
+    for retry in sorted(retry_targets, key=lambda target: target[3]):
+        if not _retry_route_target(retry, deadline):
             continue
+        profile, target_model, is_retry, _retry_at = retry
         response = _attempt_route_target(
             req,
             snapshot,
@@ -1383,7 +1787,7 @@ def forward_tenant_route(
             scheduler,
             concurrency_controller,
             state,
-            retry_targets,
+            [],
             deadline,
         )
         if response is not None:

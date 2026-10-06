@@ -18,6 +18,7 @@ from app.persistence.models import (
     ProviderBudgetLease,
     ProviderBudgetLeaseAllocation,
     ProviderBudgetWindow,
+    ProviderConcurrencyState,
     Tenant,
 )
 from app.persistence.provider_scheduler import (
@@ -31,6 +32,8 @@ from app.persistence.provider_scheduler import (
     ReservationRequest,
     SharedBudgetIdentity,
     _adjust_aimd_limit,
+    _capacity_score,
+    _validate_aimd_bounds,
     _WindowClaim,
 )
 from app.persistence.secrets import SecretCipher
@@ -76,6 +79,70 @@ def test_scheduler_policy_can_resolve_scope_id_from_runtime_context():
     ]
 
 
+@pytest.mark.parametrize(
+    ("initial", "minimum", "maximum"),
+    [(4, 1, 64), (1, 1, 1), (64, 1, 64), (12, 8, 16)],
+)
+def test_aimd_scope_bounds_accept_valid_limits(initial, minimum, maximum):
+    """A profile or target-model scope can configure inclusive AIMD bounds."""
+    assert _validate_aimd_bounds(initial, minimum, maximum) == (
+        initial,
+        minimum,
+        maximum,
+    )
+
+
+@pytest.mark.parametrize(
+    ("initial", "minimum", "maximum"),
+    [(4, 0, 4), (4, 5, 8), (9, 1, 8), (True, 1, 8), (4, 1, 65)],
+)
+def test_aimd_scope_bounds_reject_invalid_limits(initial, minimum, maximum):
+    """Invalid or inconsistent concurrency bounds cannot reach persistence."""
+    with pytest.raises(ValueError):
+        _validate_aimd_bounds(initial, minimum, maximum)
+
+
+@pytest.mark.parametrize(
+    (
+        "profile_active",
+        "profile_limit",
+        "model_active",
+        "model_limit",
+        "weight",
+        "budget_headroom",
+        "expected",
+    ),
+    [
+        (0, 4, 0, 4, 1.0, 0.5, 0.25),
+        (2, 4, 1, 4, 1.0, 1.0, 0.5),
+        (0, 4, 2, 4, 2.0, 1.0, 0.25),
+        (1, 4, 0, 4, 2.0, 1.0, 0.125),
+    ],
+)
+def test_capacity_score_accounts_for_profile_model_weight_and_headroom(
+    profile_active,
+    profile_limit,
+    model_active,
+    model_limit,
+    weight,
+    budget_headroom,
+    expected,
+):
+    """Capacity score combines active ratios, weight, and budget headroom."""
+    assert (
+        _capacity_score(
+            profile_active,
+            profile_limit,
+            model_active,
+            model_limit,
+            weight,
+            budget_headroom=budget_headroom,
+            headroom_weight=0.5,
+        )
+        == expected
+    )
+
+
 def test_aimd_limit_increases_additively_and_decreases_multiplicatively():
     """AIMD advances one slot on success and halves transiently on overload."""
     assert _adjust_aimd_limit(4, outcome="success") == 5
@@ -85,9 +152,49 @@ def test_aimd_limit_increases_additively_and_decreases_multiplicatively():
     assert _adjust_aimd_limit(4, outcome="terminal_failure") == 4
 
 
+@pytest.mark.parametrize(
+    ("current", "outcome", "minimum", "maximum", "expected"),
+    [
+        (4, "success", 2, 5, 5),
+        (4, "success", 2, 4, 4),
+        (3, "transient_failure", 3, 8, 3),
+        (7, "transient_failure", 2, 8, 3),
+    ],
+)
+def test_aimd_limit_respects_configured_scope_bounds(
+    current, outcome, minimum, maximum, expected
+):
+    """Each profile/model AIMD learner stays within its configured bounds."""
+    assert (
+        _adjust_aimd_limit(
+            current,
+            outcome=outcome,
+            minimum=minimum,
+            maximum=maximum,
+        )
+        == expected
+    )
+
+
+def test_aimd_limit_rejects_current_value_outside_configured_bounds():
+    """Persisted bounds cannot silently legitimize an out-of-range capacity."""
+    with pytest.raises(ValueError, match="supported range"):
+        _adjust_aimd_limit(4, outcome="success", minimum=5, maximum=8)
+
+
 def test_aimd_release_keeps_limit_unchanged():
     """Releasing a permit without upstream I/O must not change capacity."""
     assert _adjust_aimd_limit(4, outcome="released") == 4
+
+
+def test_aimd_state_schema_persists_configured_minimum_and_maximum():
+    """Persisted adaptive states retain their distinct configured bounds."""
+    assert ProviderConcurrencyState.__table__.columns["minimum_limit"].nullable is False
+    assert ProviderConcurrencyState.__table__.columns["maximum_limit"].nullable is False
+    assert any(
+        constraint.name == "ck_concurrency_bounds"
+        for constraint in ProviderConcurrencyState.__table__.constraints
+    )
 
 
 def test_new_persistent_migration_revisions_fit_alembic_version_column():

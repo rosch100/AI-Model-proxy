@@ -284,6 +284,43 @@ def test_provider_circuit_migration_is_postgresql_only_and_has_atomic_identity(
     assert "scope_id" not in generated_sql
 
 
+def test_capacity_aware_routing_migration_persists_tenant_policy_and_allows_groups(
+    monkeypatch,
+):
+    """Persist safe tenant routing defaults and remove unique route grouping."""
+    project_root = Path(__file__).resolve().parents[1]
+    config = Config(str(project_root / "alembic.ini"))
+    config.set_main_option("script_location", str(project_root / "migrations"))
+    migration = (
+        ScriptDirectory.from_config(config)
+        .get_revision("20261016_capacity_route")
+        .module
+    )
+    output = StringIO()
+    migration_context = MigrationContext.configure(
+        dialect_name="postgresql",
+        opts={"as_sql": True, "output_buffer": output},
+    )
+
+    assert migration.down_revision == "20261015_aimd"
+    with Operations.context(migration_context):
+        migration.upgrade()
+
+    generated_sql = output.getvalue()
+    assert "DROP CONSTRAINT uq_profile_tenant_route_priority" in generated_sql
+    for column in (
+        "routing_strategy",
+        "routing_load_balancing_method",
+        "routing_cost_policy",
+        "routing_headroom_weight",
+        "routing_max_retry_wait_seconds",
+        "routing_tie_breaker",
+    ):
+        assert f"ADD COLUMN {column} " in generated_sql
+    assert "DROP CONSTRAINT ck_profile_route_priority_positive" not in generated_sql
+    assert "ck_tenant_routing_strategy" in generated_sql
+
+
 def test_provider_catalog_pricing_migration_adds_nullable_columns(monkeypatch):
     """Add normalized optional prices to provider catalog rows."""
     project_root = Path(__file__).resolve().parents[1]

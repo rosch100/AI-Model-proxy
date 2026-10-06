@@ -1,6 +1,7 @@
 """Root inference failover using real adapters and tenant-owned model targets."""
 
 import json
+from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 
 import pytest
@@ -42,8 +43,10 @@ from app.providers.routing import (
     ProviderBudgetAttempt,
     ProviderConcurrencyAttempt,
     RouteAttemptState,
+    _comparable_cost_groups,
     _final_route_failure,
     _guard_concurrency_lease,
+    _route_candidate_groups,
     _scheduler_candidate,
     _transient_retry_delay,
     forward_tenant_route,
@@ -79,6 +82,9 @@ def isolate_sqlite_scheduler_calls(monkeypatch):
                 else None
             ),
         ),
+    )
+    monkeypatch.setattr(
+        ProviderBudgetScheduler, "headroom", lambda *_args, **_kwargs: 1.0
     )
     monkeypatch.setattr(
         ProviderBudgetScheduler, "complete", lambda *_args, **_kwargs: True
@@ -187,6 +193,244 @@ def successful_chat(model):
         event({"model": model, "choices": [{"delta": {"content": "success"}}]})
         + b"data: [DONE]\n\n"
     )
+
+
+def test_equal_priority_candidates_have_stable_profile_id_order(routed_app):
+    """Equal-priority route candidates use deterministic profile-id ordering."""
+    database = routed_app.extensions["database"]
+    with database.sessions.begin() as session:
+        profiles = tuple(
+            session.scalars(
+                select(ProviderProfile).where(
+                    ProviderProfile.tenant_id == "acme",
+                    ProviderProfile.provider.in_(("openai", "openrouter")),
+                )
+            )
+        )
+        for profile in profiles:
+            profile.route_priority = 1
+    snapshot = database.get_proxy_snapshot_by_api_key("cursor-key")
+
+    groups = _route_candidate_groups(
+        tuple((profile, profile.default_model) for profile in snapshot.profiles),
+        snapshot,
+    )
+
+    assert len(groups) >= 1
+    first_group = groups[0]
+    openai_openrouter = tuple(
+        profile.profile_id
+        for profile, _model in first_group
+        if profile.provider in {"openai", "openrouter"}
+    )
+    assert openai_openrouter == tuple(sorted(openai_openrouter))
+
+
+def test_equal_priority_failure_tries_peer_before_lower_priority(
+    routed_app, requests_mock
+):
+    """A peer at the same priority is tried before lower-priority routes."""
+    database = routed_app.extensions["database"]
+    with database.sessions.begin() as session:
+        profiles = tuple(
+            session.scalars(
+                select(ProviderProfile).where(
+                    ProviderProfile.tenant_id == "acme",
+                    ProviderProfile.provider.in_(("azure", "openai", "openrouter")),
+                )
+            )
+        )
+        for profile in profiles:
+            profile.route_priority = None
+        session.flush()
+        for profile in profiles:
+            profile.route_priority = (
+                1 if profile.provider in {"openai", "openrouter"} else 2
+            )
+
+    snapshot = database.get_proxy_snapshot_by_api_key("cursor-key")
+    equal_priority_targets = _route_candidate_groups(
+        tuple((profile, profile.default_model) for profile in snapshot.profiles),
+        snapshot,
+    )[0]
+    peer_targets = tuple(
+        target
+        for target in equal_priority_targets
+        if target[0].provider in {"openai", "openrouter"}
+    )
+    first_peer, first_model = peer_targets[0]
+    second_peer, second_model = peer_targets[1]
+    urls = {
+        "openai": OPENAI,
+        "openrouter": OPENROUTER,
+        "azure": AZURE,
+    }
+    assert {first_peer.provider, second_peer.provider} == {"openai", "openrouter"}
+    requests_mock.post(
+        urls[first_peer.provider],
+        status_code=503,
+        json={"error": {"code": "server_error"}},
+    )
+    requests_mock.post(
+        urls[second_peer.provider],
+        content=successful_chat(second_model),
+        headers={"Content-Type": "text/event-stream"},
+    )
+
+    response = post(routed_app)
+
+    assert response.status_code == 200
+    assert [request.url for request in requests_mock.request_history] == [
+        urls[first_peer.provider],
+        urls[second_peer.provider],
+    ]
+
+
+def test_route_candidate_groups_apply_manual_cost_tiers_inside_priority(routed_app):
+    """Manual cost tiers order candidates within, not across, priorities."""
+    database = routed_app.extensions["database"]
+    with database.sessions.begin() as session:
+        profiles = tuple(
+            session.scalars(
+                select(ProviderProfile).where(
+                    ProviderProfile.tenant_id == "acme",
+                    ProviderProfile.provider.in_(("azure", "openai", "openrouter")),
+                )
+            )
+        )
+        tenant = session.get(Tenant, "acme")
+        tenant.routing_cost_policy = "cost_tiers"
+        for profile in profiles:
+            profile.route_priority = 1 if profile.provider != "azure" else 2
+            if profile.provider == "azure":
+                continue
+            tier = 0 if profile.provider == "openai" else 2
+            profile.settings = {
+                **profile.settings,
+                "routing": {"cost_tier": tier},
+            }
+    snapshot = database.get_proxy_snapshot_by_api_key("cursor-key")
+
+    groups = _route_candidate_groups(
+        tuple((profile, profile.default_model) for profile in snapshot.profiles),
+        snapshot,
+    )
+
+    assert [
+        {profile.provider for profile, _model in group}
+        for group in groups
+        if any(profile.provider in {"openai", "openrouter"} for profile, _ in group)
+    ][:2] == [{"openai"}, {"openrouter"}]
+
+
+def test_prefer_lower_cost_requires_complete_comparable_prices(routed_app):
+    """Price ordering requires complete rates with a shared currency and model."""
+    database = routed_app.extensions["database"]
+    with database.sessions.begin() as session:
+        tenant = session.get(Tenant, "acme")
+        tenant.routing_cost_policy = "prefer_lower_cost"
+    snapshot = database.get_proxy_snapshot_by_api_key("cursor-key")
+    candidates = []
+    for profile in snapshot.profiles:
+        if profile.provider not in {"openai", "openrouter"}:
+            continue
+        amount = "0.1" if profile.provider == "openai" else "1.0"
+        candidates.append(
+            (
+                replace(
+                    profile,
+                    catalog_pricing={
+                        profile.default_model: {
+                            "input_per_1m_tokens": amount,
+                            "output_per_1m_tokens": amount,
+                            "cache_per_1m_tokens": amount,
+                            "currency": "USD",
+                        }
+                    },
+                ),
+                profile.default_model,
+            )
+        )
+
+    groups = _comparable_cost_groups(candidates)
+    assert [profile.provider for group in groups for profile, _ in group] == [
+        "openai",
+        "openrouter",
+    ]
+
+    incomplete = [(profile, model) for profile, model in candidates]
+    incomplete[0] = (replace(incomplete[0][0], catalog_pricing={}), incomplete[0][1])
+    assert len(_comparable_cost_groups(incomplete)) == 1
+
+    different_models = [(profile, "different-model") for profile, _model in candidates]
+    assert len(_comparable_cost_groups(different_models)) == 1
+
+
+def test_load_balanced_route_uses_capacity_selected_profile(
+    routed_app, requests_mock, monkeypatch
+):
+    """Load balancing forwards the profile selected by capacity scoring."""
+    database = routed_app.extensions["database"]
+    with database.sessions.begin() as session:
+        tenant = session.get(Tenant, "acme")
+        tenant.routing_strategy = "load_balanced"
+        profiles = tuple(
+            session.scalars(
+                select(ProviderProfile).where(
+                    ProviderProfile.tenant_id == "acme",
+                    ProviderProfile.route_priority.is_not(None),
+                )
+            )
+        )
+        for profile in profiles:
+            profile.route_priority = 1
+            profile.settings = {
+                **profile.settings,
+                "routing": {"profile_concurrency": {"initial": 8, "min": 2, "max": 16}},
+            }
+    snapshot = database.get_proxy_snapshot_by_api_key("cursor-key")
+    assert all(
+        profile.routing_settings.profile_concurrency.initial == 8
+        for profile in snapshot.profiles
+        if profile.route_priority == 1
+    )
+    selected = next(
+        profile for profile in snapshot.profiles if profile.provider == "openai"
+    )
+    seen_candidates = []
+
+    def select_openai(_self, tenant_id, candidates, **_kwargs):
+        seen_candidates.extend(candidates)
+        return ProviderConcurrencyDecision(
+            True,
+            ProviderConcurrencyLease(
+                "balanced-lease", 1, tenant_id, "openai", "balanced-token"
+            ),
+            profile_id=selected.profile_id,
+        )
+
+    monkeypatch.setattr(ProviderConcurrencyController, "acquire_best", select_openai)
+    requests_mock.post(
+        OPENAI,
+        content=successful_chat("gpt-5.4"),
+        headers={"Content-Type": "text/event-stream"},
+    )
+
+    response = post(routed_app)
+
+    assert response.status_code == 200
+    assert [request.url for request in requests_mock.request_history] == [OPENAI]
+    assert {candidate.profile_id for candidate in seen_candidates} == {
+        profile.profile_id
+        for profile in snapshot.profiles
+        if profile.route_priority == 1
+    }
+    assert all(candidate.profile_initial_limit == 8 for candidate in seen_candidates)
+    assert all(candidate.profile_minimum_limit == 2 for candidate in seen_candidates)
+    assert all(candidate.profile_maximum_limit == 16 for candidate in seen_candidates)
+    assert all(candidate.model_initial_limit == 8 for candidate in seen_candidates)
+    assert all(candidate.model_minimum_limit == 2 for candidate in seen_candidates)
+    assert all(candidate.model_maximum_limit == 16 for candidate in seen_candidates)
 
 
 def set_scheduler_limits(app, profile_id, policies):

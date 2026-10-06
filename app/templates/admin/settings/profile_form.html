@@ -37,6 +37,11 @@
       <div data-provider-fields="deepseek"{% if not profile and form.provider.data != "deepseek" %} hidden{% endif %}><p class="hint">DeepSeek verwendet die Standard-API-Adresse.</p></div>
     {% endif %}
     <fieldset>
+      <legend>Routing und Kapazität</legend>
+      <label>{{ form.routing.label }}{{ form.routing(rows=7, spellcheck="false", placeholder='{"cost_tier":0,"load_balancing_weight":1,"profile_concurrency":{"initial":4,"min":1,"max":64},"model_concurrency":{"gpt-5.4":{"initial":2,"min":1,"max":8}}}') }}</label>
+      <p class="hint">Optionale JSON-Einstellungen je Profil: Kostenstufe (kleiner = günstiger), positives Balancing-Gewicht sowie AIMD-Start-, Mindest- und Höchstparallelität. Modellgrenzen gelten je geroutetem Katalogmodell zusätzlich zum gemeinsamen Profil-Limit. Leeres Objekt nutzt sichere Defaults.</p>
+    </fieldset>
+    <fieldset>
       <legend>Provider-Scheduler</legend>
       <label>{{ form.scheduler_limits.label }}{{ form.scheduler_limits(rows=6, spellcheck="false", placeholder='[{"scope_kind":"profile","scope_id":"…","metric":"requests","limit":60,"window_seconds":60}]') }}</label>
       <p class="hint">Optionales JSON-Array expliziter Request-/Token-Limits. Scope-Kennungen müssen zur Provider-, Profil-, Modell-, Organisations- oder Projektkennung dieses Kontos passen. Leeres Feld bedeutet keine zusätzlichen festen Fensterlimits.</p>

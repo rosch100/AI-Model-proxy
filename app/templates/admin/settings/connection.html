@@ -6,6 +6,20 @@
   {% set labels = {"azure": "Azure", "openai": "OpenAI", "openrouter": "OpenRouter", "deepseek": "DeepSeek"} %}
   <h1>Anbieter und Konten</h1>
   <p class="lede">Mehrere Konten können gemeinsam eine priorisierte Failover-Reihenfolge bilden. Bereite Konten sind auch außerhalb dieser Reihenfolge direkt über ihre Modellkennung nutzbar; nur Konten in der Reihenfolge dienen als Standard- und Failover-Ziele.</p>
+  <details>
+    <summary>Routingstrategie</summary>
+    <form method="post" action="{{ url_for('admin.save_routing_settings') }}" class="stack">
+      {{ routing_form.csrf_token }}
+      <label>{{ routing_form.strategy.label }}{{ routing_form.strategy() }}</label>
+      <label>{{ routing_form.load_balancing_method.label }}{{ routing_form.load_balancing_method() }}</label>
+      <label>{{ routing_form.cost_policy.label }}{{ routing_form.cost_policy() }}</label>
+      <label>{{ routing_form.headroom_weight.label }}{{ routing_form.headroom_weight(min=0, max=1, step="any") }}</label>
+      <label>{{ routing_form.max_retry_wait_seconds.label }}{{ routing_form.max_retry_wait_seconds(min=1, max=300) }}</label>
+      <label>{{ routing_form.tie_breaker.label }}{{ routing_form.tie_breaker() }}</label>
+      <p class="hint">Priorität bleibt die äußere Ordnung. Kostenpolitik und gewichtete geringste Auslastung wirken innerhalb gleicher Priorität. Lokale Scheduler-Limits bleiben verbindlich.</p>
+      <button type="submit">Routing speichern</button>
+    </form>
+  </details>
   <h2>Bevorzugte Reihenfolge</h2>
   <p>Cursor verwendet die Modellkennung <code>{{ cursor_model_id }}</code>; der Proxy leitet sie an das Standardmodell des jeweiligen Kontos weiter.</p>
   <p>Nur bei HTTP 408/429/5xx oder einem sicheren Verbindungsfehler vor der Antwort versucht der Proxy das nächste Konto. Andere 4xx und Fehler nach Beginn einer Antwort werden nicht erneut gesendet.</p>
@@ -23,11 +37,17 @@
           <button type="submit" name="direction" value="up" aria-label="{{ profile.display_name }} nach oben" {% if loop.first %}disabled{% endif %}>Nach oben</button>
           <button type="submit" name="direction" value="down" aria-label="{{ profile.display_name }} nach unten" {% if loop.last %}disabled{% endif %}>Nach unten</button>
         </form>
-        <form method="post" action="{{ url_for('admin.deactivate_connection_profile', profile_id=profile.id) }}">
-          <input type="hidden" name="csrf_token" value="{{ csrf_token() }}" />
-          <input type="hidden" name="profile_id" value="{{ profile.id }}" />
-          <button type="submit">Aus Reihenfolge entfernen</button>
-        </form>
+          <form method="post" action="{{ url_for('admin.deactivate_connection_profile', profile_id=profile.id) }}">
+            <input type="hidden" name="csrf_token" value="{{ csrf_token() }}" />
+            <input type="hidden" name="profile_id" value="{{ profile.id }}" />
+            <button type="submit">Aus Reihenfolge entfernen</button>
+          </form>
+          <form method="post" action="{{ url_for('admin.set_connection_priority', profile_id=profile.id) }}">
+            <input type="hidden" name="csrf_token" value="{{ csrf_token() }}" />
+            <input type="hidden" name="profile_id" value="{{ profile.id }}" />
+            <label>Prioritätsgruppe <input type="number" name="priority" min="1" value="{{ profile.route_priority }}" required /></label>
+            <button type="submit">Gruppe setzen</button>
+          </form>
       </li>
     {% endfor %}
     </ol>

@@ -24,7 +24,7 @@ packaging>=26.3
 environs==15.2.0
 
 # Tenant persistence and secret encryption
-SQLAlchemy==2.1.1
+SQLAlchemy==2.1.2
 alembic==1.20.0
 psycopg[binary]==3.3.6
 cryptography==50.0.2
